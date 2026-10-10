@@ -1,6 +1,6 @@
 use crate::autopush;
 use crate::config::{AutoPushSession, WebPushKeys};
-use crate::error::{Result, AngelicAngelError};
+use crate::error::{AngelicAngelError, Result};
 use p256::SecretKey;
 use rand::RngCore;
 

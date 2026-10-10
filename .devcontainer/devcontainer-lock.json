@@ -1,0 +1,54 @@
+{
+  "features": {
+    "ghcr.io/devcontainers-community/features/direnv:1": {
+      "version": "1.0.0",
+      "resolved": "ghcr.io/devcontainers-community/features/direnv@sha256:e0266877bb3935f243eaf70b3192182170f4f8c5cd86108e2509de2eff082ef5",
+      "integrity": "sha256:e0266877bb3935f243eaf70b3192182170f4f8c5cd86108e2509de2eff082ef5"
+    },
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "version": "2.7.1",
+      "resolved": "ghcr.io/devcontainers/features/common-utils@sha256:e76a6a8a35d1ad824daad1540725e0ec9f8ed2dc00d2850e990a9830013c7d08",
+      "integrity": "sha256:e76a6a8a35d1ad824daad1540725e0ec9f8ed2dc00d2850e990a9830013c7d08"
+    },
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "version": "1.10.1",
+      "resolved": "ghcr.io/devcontainers/features/docker-outside-of-docker@sha256:698f5900fac471e046c6e9d4333fec88c0e8d952c713494fa0712dce80baeca0",
+      "integrity": "sha256:698f5900fac471e046c6e9d4333fec88c0e8d952c713494fa0712dce80baeca0"
+    },
+    "ghcr.io/devcontainers/features/github-cli:1": {
+      "version": "1.1.3",
+      "resolved": "ghcr.io/devcontainers/features/github-cli@sha256:bd7ab48a832228f633239277552c30b353867fef2e5b037e064b4e64f0b843f2",
+      "integrity": "sha256:bd7ab48a832228f633239277552c30b353867fef2e5b037e064b4e64f0b843f2"
+    },
+    "ghcr.io/devcontainers/features/rust:1": {
+      "version": "1.6.0",
+      "resolved": "ghcr.io/devcontainers/features/rust@sha256:846c949f52c9dea98d4f90a11957cbf152fb3f6e8a70ddd7cb83014a7d1d0c98",
+      "integrity": "sha256:846c949f52c9dea98d4f90a11957cbf152fb3f6e8a70ddd7cb83014a7d1d0c98"
+    },
+    "ghcr.io/dhoeric/features/act:1": {
+      "version": "1.0.0",
+      "resolved": "ghcr.io/dhoeric/features/act@sha256:2e99eed677768dff36de20e856f2f6fd285a30ea868dae229e848a2871c4462d",
+      "integrity": "sha256:2e99eed677768dff36de20e856f2f6fd285a30ea868dae229e848a2871c4462d"
+    },
+    "ghcr.io/rocker-org/devcontainer-features/apt-packages:1": {
+      "version": "1.0.2",
+      "resolved": "ghcr.io/rocker-org/devcontainer-features/apt-packages@sha256:87a4d7750a596a5db034ba8508782f31aebdc2ffe955c66aaecb33d9de2ecdae",
+      "integrity": "sha256:87a4d7750a596a5db034ba8508782f31aebdc2ffe955c66aaecb33d9de2ecdae"
+    },
+    "ghcr.io/shyim/devcontainers-features/bun:0": {
+      "version": "0.0.1",
+      "resolved": "ghcr.io/shyim/devcontainers-features/bun@sha256:689eae681aa08981175829a59953ba67a7d311f6a05c15d1bbbcb2da2839827e",
+      "integrity": "sha256:689eae681aa08981175829a59953ba67a7d311f6a05c15d1bbbcb2da2839827e"
+    },
+    "ghcr.io/stu-bell/devcontainer-features/claude-code:0": {
+      "version": "0.1.0",
+      "resolved": "ghcr.io/stu-bell/devcontainer-features/claude-code@sha256:f87b4da3f8648db9111cb25c6bd3817d096018d81f3fb596340f7ffdba14409a",
+      "integrity": "sha256:f87b4da3f8648db9111cb25c6bd3817d096018d81f3fb596340f7ffdba14409a"
+    },
+    "ghcr.io/thamaji/devcontainer-features/codex-cli:1": {
+      "version": "1.2.5",
+      "resolved": "ghcr.io/thamaji/devcontainer-features/codex-cli@sha256:06c222cde6ec9d57486a2aadf6603ff872bb1f031f599b11a7be74e69965672f",
+      "integrity": "sha256:06c222cde6ec9d57486a2aadf6603ff872bb1f031f599b11a7be74e69965672f"
+    }
+  }
+}

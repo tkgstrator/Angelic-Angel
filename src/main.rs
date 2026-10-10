@@ -6,7 +6,7 @@ mod listener;
 mod push;
 mod twitter;
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use clap::Parser;
 use cli::{Cli, Commands};
@@ -75,16 +75,16 @@ where
         Ok(v) => {
             sp.finish_with_message(format!("{} {}", style("done").green(), done_msg));
             Ok(v)
-        }
+        },
         Err(e) => {
             sp.finish_with_message(format!("{} {}", style("fail").red(), msg));
             Err(e)
-        }
+        },
     }
 }
 
 async fn cmd_init(
-    config_path: &PathBuf,
+    config_path: &Path,
     arg_auth_token: Option<String>,
     arg_ct0: Option<String>,
 ) -> Result<()> {
@@ -122,7 +122,7 @@ async fn cmd_init(
     Ok(())
 }
 
-async fn cmd_register(config_path: &PathBuf) -> Result<()> {
+async fn cmd_register(config_path: &Path) -> Result<()> {
     eprintln!("{}", style("Registering push subscription").bold());
     eprintln!();
 
@@ -159,12 +159,10 @@ async fn cmd_register(config_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_listen(config_path: &PathBuf) -> Result<()> {
+async fn cmd_listen(config_path: &Path) -> Result<()> {
     let config = Config::load(config_path)?;
     let registration = config.registration.ok_or_else(|| {
-        error::AngelicAngelError::Config(
-            "No registration found. Run `register` first.".to_string(),
-        )
+        error::AngelicAngelError::Config("No registration found. Run `register` first.".to_string())
     })?;
 
     tracing::info!(config = %config_path.display(), "config loaded, starting listener");
@@ -174,16 +172,28 @@ async fn cmd_listen(config_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_status(config_path: &PathBuf) -> Result<()> {
+async fn cmd_status(config_path: &Path) -> Result<()> {
     eprintln!("{}", style("Status").bold());
     eprintln!();
 
     match Config::load(config_path) {
         Ok(config) => {
-            eprintln!("{}  {}", style("Config").cyan().bold(), style(config_path.display()).dim());
+            eprintln!(
+                "{}  {}",
+                style("Config").cyan().bold(),
+                style(config_path.display()).dim()
+            );
             eprintln!(
                 "  auth_token  {}...",
-                style(&config.twitter.auth_token.chars().take(20).collect::<String>()).dim()
+                style(
+                    &config
+                        .twitter
+                        .auth_token
+                        .chars()
+                        .take(20)
+                        .collect::<String>()
+                )
+                .dim()
             );
             eprintln!(
                 "  ct0         {}...",
@@ -194,14 +204,18 @@ async fn cmd_status(config_path: &PathBuf) -> Result<()> {
 
             match config.registration {
                 Some(reg) => {
-                    eprintln!("{}  {}", style("Registration").cyan().bold(), style("active").green());
+                    eprintln!(
+                        "{}  {}",
+                        style("Registration").cyan().bold(),
+                        style("active").green()
+                    );
                     eprintln!(
                         "  endpoint    {}...",
                         style(&reg.endpoint.chars().take(50).collect::<String>()).dim()
                     );
                     eprintln!("  uaid        {}", style(&reg.autopush.uaid).dim());
                     eprintln!("  channel_id  {}", style(&reg.autopush.channel_id).dim());
-                }
+                },
                 None => {
                     eprintln!(
                         "{}  {}",
@@ -212,9 +226,9 @@ async fn cmd_status(config_path: &PathBuf) -> Result<()> {
                         "  Run {} to register.",
                         style("angelic-angel register").bold()
                     );
-                }
+                },
             }
-        }
+        },
         Err(_) => {
             eprintln!(
                 "{}  {}",
@@ -225,20 +239,21 @@ async fn cmd_status(config_path: &PathBuf) -> Result<()> {
                 "  Run {} to initialize.",
                 style("angelic-angel init").bold()
             );
-        }
+        },
     }
 
     Ok(())
 }
 
-async fn cmd_unregister(config_path: &PathBuf) -> Result<()> {
+async fn cmd_unregister(config_path: &Path) -> Result<()> {
     eprintln!("{}", style("Unregistering").bold());
     eprintln!();
 
     let mut config = Config::load(config_path)?;
-    let reg = config.registration.as_ref().ok_or_else(|| {
-        error::AngelicAngelError::Config("No registration found.".to_string())
-    })?;
+    let reg = config
+        .registration
+        .as_ref()
+        .ok_or_else(|| error::AngelicAngelError::Config("No registration found.".to_string()))?;
 
     spin(
         "Unregistering from AutoPush...",

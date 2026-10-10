@@ -1,5 +1,5 @@
 use crate::config::{AutoPushSession, WebPushKeys};
-use crate::error::{Result, AngelicAngelError};
+use crate::error::{AngelicAngelError, Result};
 use crate::push;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
@@ -187,10 +187,10 @@ enum PongWaitResult {
 ///
 /// Firefox treats an empty JSON object `{}` or any JSON without a `messageType` field as a pong.
 fn is_pong(text: &str) -> bool {
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-        if let Some(obj) = value.as_object() {
-            return obj.is_empty() || !obj.contains_key("messageType");
-        }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+        && let Some(obj) = value.as_object()
+    {
+        return obj.is_empty() || !obj.contains_key("messageType");
     }
     false
 }
@@ -203,7 +203,7 @@ fn is_backoff_close(frame: &Option<tokio_tungstenite::tungstenite::protocol::Clo
                 == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(
                     BACKOFF_WS_STATUS_CODE,
                 )
-        }
+        },
         None => false,
     }
 }
@@ -235,9 +235,9 @@ async fn connect_ws(url: &str) -> Result<WsStream> {
     let port = uri.port_u16().unwrap_or(443);
     let addr = format!("{}:{}", host, port);
 
-    let tcp_stream = TcpStream::connect(&addr)
-        .await
-        .map_err(|e| AngelicAngelError::AutoPush(format!("TCP connect failed ({}): {}", addr, e)))?;
+    let tcp_stream = TcpStream::connect(&addr).await.map_err(|e| {
+        AngelicAngelError::AutoPush(format!("TCP connect failed ({}): {}", addr, e))
+    })?;
 
     let sock_ref = SockRef::from(&tcp_stream);
     let keepalive = TcpKeepalive::new().with_time(Duration::from_secs(TCP_KEEPALIVE_SECS));
@@ -295,38 +295,34 @@ pub async fn register_new(_keys: &WebPushKeys) -> Result<AutoPushRegistration> {
                             status
                         )));
                     }
-                    debug!(
-                        ?use_webpush,
-                        ?broadcasts,
-                        "hello response extra fields"
-                    );
+                    debug!(?use_webpush, ?broadcasts, "hello response extra fields");
                     info!("hello succeeded: uaid={}", uaid);
                     uaid
-                }
+                },
                 _ => {
                     return Err(AngelicAngelError::AutoPush(
                         "unexpected response: expected hello".to_string(),
                     ));
-                }
+                },
             }
-        }
+        },
         Ok(Some(Ok(msg))) => {
             return Err(AngelicAngelError::AutoPush(format!(
                 "unexpected message type: {:?}",
                 msg
             )));
-        }
+        },
         Ok(Some(Err(e))) => return Err(e.into()),
         Ok(None) => {
             return Err(AngelicAngelError::AutoPush(
                 "connection closed by server".to_string(),
             ));
-        }
+        },
         Err(_) => {
             return Err(AngelicAngelError::AutoPush(
                 "hello response timed out (10s)".to_string(),
             ));
-        }
+        },
     };
 
     // 3. Send register
@@ -359,31 +355,31 @@ pub async fn register_new(_keys: &WebPushKeys) -> Result<AutoPushRegistration> {
                         }
                         info!("register succeeded: endpoint={}", push_endpoint);
                         push_endpoint
-                    }
+                    },
                     _ => {
                         return Err(AngelicAngelError::AutoPush(
                             "unexpected response: expected register".to_string(),
                         ));
-                    }
+                    },
                 }
-            }
+            },
             Ok(Some(Ok(msg))) => {
                 return Err(AngelicAngelError::AutoPush(format!(
                     "unexpected message type: {:?}",
                     msg
                 )));
-            }
+            },
             Ok(Some(Err(e))) => return Err(e.into()),
             Ok(None) => {
                 return Err(AngelicAngelError::AutoPush(
                     "connection closed by server".to_string(),
                 ));
-            }
+            },
             Err(_) => {
                 return Err(AngelicAngelError::AutoPush(
                     "register response timed out (10s)".to_string(),
                 ));
-            }
+            },
         };
 
     // 5. Disconnect
@@ -399,7 +395,7 @@ pub async fn register_new(_keys: &WebPushKeys) -> Result<AutoPushRegistration> {
 /// Result of a reconnect attempt.
 pub enum ConnectResult {
     /// Connected successfully with the existing session.
-    Connected(AutoPushClient),
+    Connected(Box<AutoPushClient>),
     /// UAID was invalidated; includes fresh keys and a new registration for the caller
     /// to propagate to Twitter API and persist.
     NeedsReregistration(ReregistrationInfo),
@@ -448,11 +444,7 @@ pub async fn connect_and_listen(
                             status
                         )));
                     }
-                    debug!(
-                        ?use_webpush,
-                        ?broadcasts,
-                        "hello response extra fields"
-                    );
+                    debug!(?use_webpush, ?broadcasts, "hello response extra fields");
                     if uaid != session.uaid {
                         warn!(
                             old_uaid = %session.uaid,
@@ -476,40 +468,40 @@ pub async fn connect_and_listen(
                         }));
                     }
                     info!("hello succeeded (reconnect): uaid={}", uaid);
-                }
+                },
                 _ => {
                     return Err(AngelicAngelError::AutoPush(
                         "unexpected response: expected hello (reconnect)".to_string(),
                     ));
-                }
+                },
             }
-        }
+        },
         Ok(Some(Ok(msg))) => {
             return Err(AngelicAngelError::AutoPush(format!(
                 "unexpected message type: {:?}",
                 msg
             )));
-        }
+        },
         Ok(Some(Err(e))) => return Err(e.into()),
         Ok(None) => {
             return Err(AngelicAngelError::AutoPush(
                 "connection closed by server".to_string(),
             ));
-        }
+        },
         Err(_) => {
             return Err(AngelicAngelError::AutoPush(
                 "hello response timed out (10s)".to_string(),
             ));
-        }
+        },
     }
 
-    Ok(ConnectResult::Connected(AutoPushClient {
+    Ok(ConnectResult::Connected(Box::new(AutoPushClient {
         ws,
         uaid: session.uaid.clone(),
         channel_id: session.channel_id.clone(),
         recent_message_ids: std::collections::VecDeque::new(),
         recent_message_ids_set: HashSet::new(),
-    }))
+    })))
 }
 
 impl AutoPushClient {
@@ -562,10 +554,10 @@ impl AutoPushClient {
                                         .await?;
                                         continue;
                                     }
-                                    if self.recent_message_ids.len() >= MAX_RECENT_MESSAGE_IDS {
-                                        if let Some(old) = self.recent_message_ids.pop_front() {
-                                            self.recent_message_ids_set.remove(&old);
-                                        }
+                                    if self.recent_message_ids.len() >= MAX_RECENT_MESSAGE_IDS
+                                        && let Some(old) = self.recent_message_ids.pop_front()
+                                    {
+                                        self.recent_message_ids_set.remove(&old);
                                     }
                                     self.recent_message_ids.push_back(version.clone());
                                     self.recent_message_ids_set.insert(version.clone());
@@ -581,22 +573,22 @@ impl AutoPushClient {
                                         data,
                                         headers,
                                     }));
-                                }
+                                },
                                 other => {
                                     debug!(?other, "non-notification message received");
                                     continue;
-                                }
+                                },
                             }
-                        }
+                        },
                         Some(Ok(Message::Ping(data))) => {
                             debug!("WebSocket ping received, sending pong");
                             self.ws.send(Message::Pong(data)).await?;
                             continue;
-                        }
+                        },
                         Some(Ok(Message::Pong(_))) => {
                             debug!("WebSocket pong received");
                             continue;
-                        }
+                        },
                         Some(Ok(Message::Close(frame))) => {
                             if is_backoff_close(&frame) {
                                 warn!("server backoff request received (close code 4774)");
@@ -606,20 +598,20 @@ impl AutoPushClient {
                             }
                             info!("WebSocket closed by server");
                             return Ok(None);
-                        }
+                        },
                         Some(Ok(msg)) => {
                             debug!(?msg, "unexpected message type");
                             continue;
-                        }
+                        },
                         Some(Err(e)) => {
                             return Err(e.into());
-                        }
+                        },
                         None => {
                             info!("WebSocket stream ended");
                             return Ok(None);
-                        }
+                        },
                     }
-                }
+                },
                 // Timer expired: determine which ping timer fired.
                 Err(_) => {
                     let now = Instant::now();
@@ -638,14 +630,14 @@ impl AutoPushClient {
                                     Instant::now() + Duration::from_secs(PING_INTERVAL_SECS);
                                 next_ws_ping =
                                     Instant::now() + Duration::from_secs(WS_PING_INTERVAL_SECS);
-                            }
+                            },
                             PongWaitResult::NotificationReceived(notification) => {
                                 return Ok(Some(notification));
-                            }
+                            },
                             PongWaitResult::ConnectionClosed => {
                                 info!("connection closed while waiting for pong");
                                 return Ok(None);
-                            }
+                            },
                             PongWaitResult::Timeout => {
                                 warn!(
                                     timeout_secs = PONG_TIMEOUT_SECS,
@@ -654,15 +646,18 @@ impl AutoPushClient {
                                 return Err(AngelicAngelError::AutoPush(
                                     "pong timed out, reconnection needed".to_string(),
                                 ));
-                            }
+                            },
                         }
                     } else {
                         // WebSocket Ping frame timer (RFC 6455 Section 5.5.2).
-                        debug!(interval_secs = WS_PING_INTERVAL_SECS, "sending WebSocket ping frame");
+                        debug!(
+                            interval_secs = WS_PING_INTERVAL_SECS,
+                            "sending WebSocket ping frame"
+                        );
                         self.ws.send(Message::Ping(vec![].into())).await?;
                         next_ws_ping = Instant::now() + Duration::from_secs(WS_PING_INTERVAL_SECS);
                     }
-                }
+                },
             }
         }
     }
@@ -703,31 +698,33 @@ impl AutoPushClient {
                                 data,
                                 headers,
                             }));
-                        }
+                        },
                         Ok(other) => {
                             debug!(?other, "non-notification message while waiting for pong");
                             continue;
-                        }
+                        },
                         Err(e) => return Err(e.into()),
                     }
-                }
+                },
                 Ok(Some(Ok(Message::Ping(data)))) => {
                     debug!("WebSocket ping received while waiting for pong, sending pong");
                     self.ws.send(Message::Pong(data)).await?;
                     continue;
-                }
+                },
                 Ok(Some(Ok(Message::Close(frame)))) => {
                     if is_backoff_close(&frame) {
-                        warn!("server backoff request received while waiting for pong (close code 4774)");
+                        warn!(
+                            "server backoff request received while waiting for pong (close code 4774)"
+                        );
                         return Err(AngelicAngelError::AutoPush(
                             "BACKOFF: server requested backoff".to_string(),
                         ));
                     }
                     return Ok(PongWaitResult::ConnectionClosed);
-                }
+                },
                 Ok(None) => {
                     return Ok(PongWaitResult::ConnectionClosed);
-                }
+                },
                 Ok(Some(Ok(_))) => continue,
                 Ok(Some(Err(e))) => return Err(e.into()),
                 Err(_) => return Ok(PongWaitResult::Timeout),
@@ -801,31 +798,31 @@ pub async fn unregister(session: &AutoPushSession) -> Result<()> {
                         )));
                     }
                     info!("hello succeeded (unregister): uaid={}", uaid);
-                }
+                },
                 _ => {
                     return Err(AngelicAngelError::AutoPush(
                         "unexpected response: expected hello (unregister)".to_string(),
                     ));
-                }
+                },
             }
-        }
+        },
         Ok(Some(Ok(msg))) => {
             return Err(AngelicAngelError::AutoPush(format!(
                 "unexpected message type: {:?}",
                 msg
             )));
-        }
+        },
         Ok(Some(Err(e))) => return Err(e.into()),
         Ok(None) => {
             return Err(AngelicAngelError::AutoPush(
                 "connection closed by server".to_string(),
             ));
-        }
+        },
         Err(_) => {
             return Err(AngelicAngelError::AutoPush(
                 "hello response timed out (10s)".to_string(),
             ));
-        }
+        },
     }
 
     // 3. Send unregister.

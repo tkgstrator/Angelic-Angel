@@ -1,4 +1,4 @@
-use crate::error::{Result, AngelicAngelError};
+use crate::error::{AngelicAngelError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 

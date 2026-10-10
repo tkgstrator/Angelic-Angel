@@ -1,0 +1,17 @@
+services:
+  angelic-angel:
+    build: .
+    image: angelic-angel:local
+    restart: unless-stopped
+    stop_signal: SIGINT
+    # Optional; requires Docker Compose 2.24+ for `required: false`.
+    env_file:
+      - path: .env
+        required: false
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - angelic-angel-data:/data
+
+volumes:
+  angelic-angel-data:

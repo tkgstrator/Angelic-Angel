@@ -1,6 +1,6 @@
 use crate::autopush::{self, ConnectResult};
 use crate::config::{self, Registration};
-use crate::error::{Result, AngelicAngelError};
+use crate::error::{AngelicAngelError, Result};
 use crate::twitter;
 use reqwest::Client;
 use std::path::Path;
@@ -56,7 +56,7 @@ pub async fn listen(mut registration: Registration, config_path: &Path) -> Resul
                 retry_count = 0;
                 tracing::info!("WebSocket connection closed, reconnecting");
                 tokio::time::sleep(Duration::from_secs(1)).await;
-            }
+            },
             SessionOutcome::DisconnectedAfterConnect(e) => {
                 if e.to_string().contains("BACKOFF:") {
                     tracing::warn!("server requested backoff, delaying reconnect for 30 minutes");
@@ -66,7 +66,7 @@ pub async fn listen(mut registration: Registration, config_path: &Path) -> Resul
                     tracing::info!(error = %e, "disconnected after connect, reconnecting");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
-            }
+            },
             SessionOutcome::ConnectionFailed(e) => {
                 retry_count += 1;
                 let delay = calc_backoff(retry_count);
@@ -77,11 +77,11 @@ pub async fn listen(mut registration: Registration, config_path: &Path) -> Resul
                     "WebSocket connection failed, retrying"
                 );
                 tokio::time::sleep(Duration::from_secs(delay)).await;
-            }
+            },
             SessionOutcome::Fatal(e) => {
                 tracing::error!(error = %e, "fatal error, re-registration required");
                 return Err(e);
-            }
+            },
         }
     }
 }
@@ -97,7 +97,7 @@ async fn listen_once(registration: &mut Registration, config_path: &Path) -> Ses
                 return SessionOutcome::Fatal(e);
             }
             return SessionOutcome::ConnectionFailed(e);
-        }
+        },
     };
 
     tracing::info!("WebSocket connection established, listening for notifications");
@@ -109,15 +109,18 @@ async fn listen_once(registration: &mut Registration, config_path: &Path) -> Ses
 }
 
 /// Establishes a connection to AutoPush, handling UAID invalidation transparently.
-async fn try_connect(registration: &mut Registration, config_path: &Path) -> Result<autopush::AutoPushClient> {
+async fn try_connect(
+    registration: &mut Registration,
+    config_path: &Path,
+) -> Result<autopush::AutoPushClient> {
     let connect_result =
         autopush::connect_and_listen(&registration.autopush, &registration.keys).await?;
 
     match connect_result {
         ConnectResult::Connected(client) => {
             tracing::info!("connected with existing session");
-            Ok(client)
-        }
+            Ok(*client)
+        },
         ConnectResult::NeedsReregistration(reregistration_info) => {
             let new_reg = &reregistration_info.registration;
             let new_keys = reregistration_info.keys;
@@ -152,12 +155,12 @@ async fn try_connect(registration: &mut Registration, config_path: &Path) -> Res
             tracing::info!("saved updated registration");
 
             match autopush::connect_and_listen(&registration.autopush, &registration.keys).await? {
-                ConnectResult::Connected(client) => Ok(client),
+                ConnectResult::Connected(client) => Ok(*client),
                 ConnectResult::NeedsReregistration(_) => Err(AngelicAngelError::AutoPush(
                     "still failed after re-registration".to_string(),
                 )),
             }
-        }
+        },
     }
 }
 
@@ -179,11 +182,11 @@ async fn run_notification_loop(
                 Err(ref e) if is_decryption_error(e) => {
                     tracing::warn!(error = %e, "decryption error, sending ACK with decryption_error");
                     autopush::AckCode::DecryptionError
-                }
+                },
                 Err(ref e) => {
                     tracing::warn!(error = %e, "notification processing error, sending ACK with not_delivered");
                     autopush::AckCode::NotDelivered
-                }
+                },
             }
         } else {
             tracing::info!("empty notification (no data)");
@@ -219,7 +222,10 @@ async fn handle_notification_data(
     let encrypted = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, data)
         .map_err(|e| AngelicAngelError::Decryption(format!("base64 decode failed: {}", e)))?;
 
-    tracing::debug!(encrypted_size = encrypted.len(), "decoding encrypted message");
+    tracing::debug!(
+        encrypted_size = encrypted.len(),
+        "decoding encrypted message"
+    );
 
     if let Some(hdrs) = headers {
         tracing::debug!(?hdrs, "notification headers");
@@ -229,7 +235,7 @@ async fn handle_notification_data(
         Ok(decrypted) => {
             tracing::debug!(decrypted_size = decrypted.len(), "ECE decryption succeeded");
             decrypted
-        }
+        },
         Err(e) => {
             tracing::error!(
                 error = %e,
@@ -237,7 +243,7 @@ async fn handle_notification_data(
                 "ECE decryption failed"
             );
             return Err(e);
-        }
+        },
     };
 
     let text = String::from_utf8(decrypted)
@@ -300,7 +306,7 @@ fn decrypt_ece(
         Some("aesgcm") => {
             tracing::debug!("decrypting with aesgcm encoding");
             decrypt_aesgcm(encrypted, headers, &key_pair, &keys.auth_secret)
-        }
+        },
         Some("aes128gcm") | None => {
             tracing::debug!("decrypting with aes128gcm encoding");
             let decrypted = ece::decrypt(&key_pair, &keys.auth_secret, encrypted).map_err(|e| {
@@ -308,9 +314,12 @@ fn decrypt_ece(
                 AngelicAngelError::Decryption(format!("aes128gcm decryption failed: {}", e))
             })?;
 
-            tracing::debug!(decrypted_len = decrypted.len(), "aes128gcm decryption succeeded");
+            tracing::debug!(
+                decrypted_len = decrypted.len(),
+                "aes128gcm decryption succeeded"
+            );
             Ok(decrypted)
-        }
+        },
         Some(other) => Err(AngelicAngelError::Decryption(format!(
             "unsupported encoding: {}",
             other
@@ -325,38 +334,52 @@ fn decrypt_aesgcm(
     auth_secret: &[u8],
 ) -> Result<Vec<u8>> {
     let headers = headers.as_ref().ok_or_else(|| {
-        AngelicAngelError::Decryption("aesgcm encoding requires headers but none were provided".to_string())
+        AngelicAngelError::Decryption(
+            "aesgcm encoding requires headers but none were provided".to_string(),
+        )
     })?;
 
     let dh_b64 = parse_header_param(headers.get("crypto_key"), "dh")?;
     let sender_public_key =
         base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &dh_b64)
             .map_err(|e| {
-                AngelicAngelError::Decryption(format!("failed to base64-decode sender public key: {}", e))
+                AngelicAngelError::Decryption(format!(
+                    "failed to base64-decode sender public key: {}",
+                    e
+                ))
             })?;
 
-    tracing::debug!(sender_public_key_len = sender_public_key.len(), "parsed sender public key");
+    tracing::debug!(
+        sender_public_key_len = sender_public_key.len(),
+        "parsed sender public key"
+    );
 
     let salt_b64 = parse_header_param(headers.get("encryption"), "salt")?;
     let salt = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &salt_b64)
-        .map_err(|e| AngelicAngelError::Decryption(format!("failed to base64-decode salt: {}", e)))?;
+        .map_err(|e| {
+            AngelicAngelError::Decryption(format!("failed to base64-decode salt: {}", e))
+        })?;
 
     tracing::debug!(salt_len = salt.len(), "parsed salt");
 
-    let block = ece::legacy::AesGcmEncryptedBlock::new(
-        &sender_public_key,
-        &salt,
-        4096,
-        encrypted.to_vec(),
-    )
-    .map_err(|e| AngelicAngelError::Decryption(format!("failed to construct AesGcmEncryptedBlock: {}", e)))?;
+    let block =
+        ece::legacy::AesGcmEncryptedBlock::new(&sender_public_key, &salt, 4096, encrypted.to_vec())
+            .map_err(|e| {
+                AngelicAngelError::Decryption(format!(
+                    "failed to construct AesGcmEncryptedBlock: {}",
+                    e
+                ))
+            })?;
 
     let decrypted = ece::legacy::decrypt_aesgcm(key_pair, auth_secret, &block).map_err(|e| {
         tracing::debug!(error = %e, "aesgcm decryption error");
         AngelicAngelError::Decryption(format!("aesgcm decryption failed: {}", e))
     })?;
 
-    tracing::debug!(decrypted_len = decrypted.len(), "aesgcm decryption succeeded");
+    tracing::debug!(
+        decrypted_len = decrypted.len(),
+        "aesgcm decryption succeeded"
+    );
     Ok(decrypted)
 }
 
@@ -365,7 +388,10 @@ fn decrypt_aesgcm(
 /// Example: given `"dh=abc123;p256ecdsa=xyz"` and param `"dh"`, returns `"abc123"`.
 fn parse_header_param(header_value: Option<&String>, param_name: &str) -> Result<String> {
     let header = header_value.ok_or_else(|| {
-        AngelicAngelError::Decryption(format!("missing required header for param '{}'", param_name))
+        AngelicAngelError::Decryption(format!(
+            "missing required header for param '{}'",
+            param_name
+        ))
     })?;
 
     for part in header.split(';') {

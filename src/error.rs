@@ -12,7 +12,7 @@ pub enum AngelicAngelError {
     TwitterApi(String),
 
     #[error("WebSocket error: {0}")]
-    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    WebSocket(#[source] Box<tokio_tungstenite::tungstenite::Error>),
 
     #[error("decryption error: {0}")]
     Decryption(String),
@@ -35,6 +35,12 @@ pub enum AngelicAngelError {
 
     #[error("base64 decode error: {0}")]
     Base64Decode(#[from] base64::DecodeError),
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for AngelicAngelError {
+    fn from(error: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::WebSocket(Box::new(error))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, AngelicAngelError>;

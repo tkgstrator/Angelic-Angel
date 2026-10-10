@@ -1,5 +1,5 @@
 use crate::config::TwitterConfig;
-use crate::error::{Result, AngelicAngelError};
+use crate::error::{AngelicAngelError, Result};
 use crate::push::PushSubscription;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::Client;

@@ -1,0 +1,119 @@
+name: Integration
+on:
+  push:
+    branches-ignore:
+      - main
+    tags-ignore:
+      - "**"
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.90.0
+
+jobs:
+  commitlint:
+    name: Commit Lint
+    runs-on: ubuntu-latest
+    # Skip main, tags, manual and reusable (release) runs.
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/main')
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Install commitlint
+        run: npm install --no-save --no-package-lock --prefix "$RUNNER_TEMP/commitlint" @commitlint/cli@19.8.1 @commitlint/config-conventional@19.8.1
+      - name: Validate commits
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            from=$PR_BASE_SHA
+            to=$PR_HEAD_SHA
+          else
+            to=$PUSH_HEAD
+            from=$PUSH_BEFORE
+            if [ -z "$from" ] || [ "$from" = "0000000000000000000000000000000000000000" ] \
+              || ! git cat-file -e "$from^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin main
+              from=$(git merge-base origin/main "$to")
+            fi
+          fi
+          export NODE_PATH="$RUNNER_TEMP/commitlint/node_modules"
+          "$RUNNER_TEMP/commitlint/node_modules/.bin/commitlint" \
+            --config .commitlintrc.yaml --from "$from" --to "$to" --verbose
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+          components: rustfmt
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --locked --all-targets --all-features
+
+  docker:
+    name: Docker Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: angelic-angel:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test
+        run: scripts/docker-smoke.sh angelic-angel:ci

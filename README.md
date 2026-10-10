@@ -95,6 +95,59 @@ angelic-angel unregister
 | `-c, --config <PATH>` | Configuration file path (default: `angelic-angel.toml`) |
 | `-v, --verbose` | Enable debug logging |
 
+## Docker
+
+Requires Docker Compose 2.24+.
+
+```sh
+docker compose build
+cp .env.example .env   # then edit .env and set your actual webhook URL
+
+# Prompts for credentials, avoiding secrets in shell history
+docker compose run --rm -it angelic-angel init
+docker compose run --rm angelic-angel register
+docker compose run --rm angelic-angel status
+
+docker compose up -d
+docker compose logs -f
+docker compose stop
+```
+
+- The container uses `/data/angelic-angel.toml` for credentials and registration. `docker compose down` keeps the named volume; `docker compose down -v` deletes it.
+- `WEBHOOK_ENDPOINT` is required for forwarding, but `init` and `status` do not need `.env`.
+- Inside a container, `localhost` is the container itself. For a webhook on the host, use a URL such as `http://host.docker.internal:8080/endpoint`. On Linux, the host service must listen on an address reachable from Docker, such as the bridge IP or `0.0.0.0`.
+- After editing `.env`, run `docker compose up -d` to recreate the container with the new values; `restart` alone does not reload them.
+- The default command is `listen`; other commands replace it, e.g. `docker compose run --rm angelic-angel unregister`.
+- Do not run `up` before `init` and `register`, or the restart policy will loop on failure.
+
+## Development
+
+Rust is pinned to 1.90.0 (`rust-toolchain.toml`, CI, Docker and the Dev Container).
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features   # currently 0 tests
+docker build -t angelic-angel:local .
+scripts/docker-smoke.sh angelic-angel:local        # offline, dummy credentials only
+```
+
+The runtime uses Distroless with a stripped binary, without a shell, sources or build caches. `scripts/docker-smoke.sh` verifies configuration persistence, permissions, expected errors and SIGINT shutdown with dummy credentials and networking disabled. It pulls a separate BusyBox helper if needed and removes its own test resources.
+
+To debug the image, use `docker logs` and run CLI subcommands (e.g. `docker run --rm IMAGE status`) rather than `exec`ing a shell. Published images can be pulled from GHCR: `docker pull ghcr.io/<owner>/<repo>:latest`.
+
+### Dev Container
+
+`.devcontainer/` provides an Ubuntu 24.04 Rust environment (GitHub CLI, Claude Code, Codex CLI, Bun, Docker outside of Docker, act, direnv). Create the host directories it bind-mounts before opening it: `mkdir -p ~/.claude ~/.codex`. Build artifacts and Cargo caches live in named volumes. Host `gh` is not mounted, so run `gh auth login` inside the Dev Container if needed; no host AWS/SSH/gh config is mounted.
+
+On first create, `.codex/config.toml` (git-ignored) is seeded with the reference Codex gateway template for `https://ai.qleap.jp/v1`, authenticated through `OPENAI_API_KEY`; an existing file is never overwritten. Edit or delete it to use the default routing.
+
+### CI/CD
+
+- `.github/workflows/integration.yaml` runs on pull requests, non-`main` branch pushes and as a reusable workflow: commitlint over the new commit range, rustfmt, Clippy (warnings denied), `cargo test --locked`, and a Docker build plus `scripts/docker-smoke.sh`. Permissions are `contents: read`.
+- `.github/workflows/deployment.yaml` runs on `main` pushes, `v*` tags and manual dispatch (`main` only). It calls the integration workflow first, then publishes a multi-arch (`linux/amd64`, `linux/arm64`) image to `ghcr.io/<owner>/<repo>` tagged `sha-<short>`; `latest` on `main`; and `<version>` only for a `v<version>` tag in `main` history that matches `Cargo.toml`. Only the publish job has `packages: write`.
+- Commit messages follow Conventional Commits (`.commitlintrc.yaml`; types: build, chore, ci, docs, feat, fix, perf, refactor, revert, test).
+
 ## Reconnection
 
 Angelic Angel implements a Firefox-compatible reconnection strategy:

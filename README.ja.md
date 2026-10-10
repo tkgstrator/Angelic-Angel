@@ -95,6 +95,59 @@ angelic-angel unregister
 | `-c, --config <PATH>` | 設定ファイルのパス (デフォルト: `angelic-angel.toml`) |
 | `-v, --verbose` | デバッグログを有効化 |
 
+## Docker
+
+Docker Compose 2.24 以上が必要です。
+
+```sh
+docker compose build
+cp .env.example .env   # 編集して実際の Webhook URL を設定
+
+# 認証情報は対話入力（シェル履歴に秘密情報を残さないため）
+docker compose run --rm -it angelic-angel init
+docker compose run --rm angelic-angel register
+docker compose run --rm angelic-angel status
+
+docker compose up -d
+docker compose logs -f
+docker compose stop
+```
+
+- コンテナは `/data/angelic-angel.toml` に認証情報と登録情報を保存します。名前付きボリュームは `docker compose down` では保持され、`docker compose down -v` で削除されます。
+- 通知の転送には `WEBHOOK_ENDPOINT` が必要ですが、`init` と `status` に `.env` は不要です。
+- コンテナ内の `localhost` はコンテナ自身を指します。ホスト上の Webhook には `http://host.docker.internal:8080/endpoint` のような URL を使ってください。Linux では、ホスト側のサービスをブリッジ IP や `0.0.0.0` など、Docker から到達できるアドレスで待ち受ける必要があります。
+- `.env` を編集したら `docker compose up -d` でコンテナを再作成してください。`restart` だけでは新しい値は反映されません。
+- デフォルトのコマンドは `listen` です。他のコマンドで置き換えられます（例: `docker compose run --rm angelic-angel unregister`）。
+- `init` と `register` の前に `up` を実行しないでください。失敗して再起動ポリシーによりループします。
+
+## 開発
+
+Rust は 1.90.0 に固定されています（`rust-toolchain.toml`、CI、Docker、Dev Container）。
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features   # 現在テストは 0 件
+docker build -t angelic-angel:local .
+scripts/docker-smoke.sh angelic-angel:local        # オフライン・ダミー認証情報のみ
+```
+
+ランタイムは strip 済みバイナリを載せた Distroless で、シェル・ソース・ビルドキャッシュを含みません。`scripts/docker-smoke.sh` はダミーの認証情報とネットワーク無効化を使い、設定の永続化、権限、エラー時の終了コード、SIGINT による停止を検証します。必要に応じて別の BusyBox ヘルパーを pull し、作成したテスト用リソースを削除します。
+
+イメージのデバッグには、シェルへの `exec` ではなく `docker logs` と CLI サブコマンド（例: `docker run --rm IMAGE status`）を使ってください。公開イメージは GHCR から取得できます: `docker pull ghcr.io/<owner>/<repo>:latest`。
+
+### Dev Container
+
+`.devcontainer/` は Ubuntu 24.04 ベースの Rust 開発環境（GitHub CLI、Claude Code、Codex CLI、Bun、Docker outside of Docker、act、direnv）を提供します。開く前に、バインドマウントされるホストのディレクトリを作成してください: `mkdir -p ~/.claude ~/.codex`。ビルド成果物と Cargo キャッシュは名前付きボリュームに保存されます。ホストの `gh` はマウントされないため、必要ならコンテナ内で `gh auth login` を実行してください。ホストの AWS/SSH 設定もマウントされません。
+
+初回作成時に、`.codex/config.toml`（Git 管理外）へ参照元の Codex ゲートウェイ設定テンプレートが作成されます。接続先は `https://ai.qleap.jp/v1`、認証には `OPENAI_API_KEY` を使います。既存のファイルは上書きされません。接続先を変更する場合はこの設定を編集してください。
+
+### CI/CD
+
+- `.github/workflows/integration.yaml` はプルリクエスト、`main` 以外のブランチへの push、および再利用ワークフローとして実行され、commitlint（新規コミット範囲）、rustfmt、Clippy（警告はエラー）、`cargo test --locked`、Docker ビルドと `scripts/docker-smoke.sh` を行います。権限は `contents: read` です。
+- `.github/workflows/deployment.yaml` は `main` への push、`v*` タグ、手動実行（`main` のみ）で動作し、先に integration を呼び出してから、マルチアーキテクチャ（`linux/amd64`、`linux/arm64`）イメージを `ghcr.io/<owner>/<repo>` へ公開します。タグは `sha-<short>`、`main` では `latest`、`main` の履歴上にあり `Cargo.toml` と一致する `v<version>` タグのときのみ `<version>` です。`packages: write` は公開ジョブだけが持ちます。
+- コミットメッセージは Conventional Commits に従います（`.commitlintrc.yaml`）。
+
 ## 再接続
 
 Angelic Angel は Firefox 互換の再接続戦略を実装しています:

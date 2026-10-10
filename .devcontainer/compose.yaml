@@ -1,0 +1,22 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: sleep infinity
+    volumes:
+      - ../:/home/vscode/app:cached
+      - target:/home/vscode/app/target
+      - cargo-registry:/home/vscode/.cargo/registry
+      - cargo-git:/home/vscode/.cargo/git
+    environment:
+      CARGO_HOME: /home/vscode/.cargo
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    tty: true
+    stdin_open: true
+
+volumes:
+  target:
+  cargo-registry:
+  cargo-git:

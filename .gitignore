@@ -20,3 +20,17 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 angelic-angel.toml
+
+# Local environment files (keep the example)
+.env
+.env.*
+!.env.example
+
+# Local agent state, working notes and act secrets (Cargo.lock stays tracked)
+/work/
+.claude/
+.codex/
+.secrets
+!.secrets.example
+.direnv/
+.cache/

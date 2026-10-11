@@ -28,7 +28,7 @@ Twitter/X  ──push──▶  Mozilla AutoPush サーバ  ◀──WebSocket�
 ### 重要事項
 
 - **データの取得元**: すべての通知データは Mozilla の Web Push サーバ (`push.services.mozilla.com`) から受信しています。通知データの取得のために Twitter/X に直接アクセスすることはありません。
-- **API の使用は最小限**: Twitter/X の API はプッシュサブスクリプションの初回登録時 (`register` コマンド) にのみ使用されます。通知の受信中に API コールは発生しません。
+- **API の使用は最小限**: Twitter/X の API はプッシュサブスクリプションの初回登録時 (`register` コマンド) と、WebUI の一括通知設定を明示的に開始したときにのみ使用されます。通知の受信中に API コールは発生しません。
 - **スクレイピング不使用**: このツールは Web スクレイピングを一切行いません。ブラウザがプッシュ通知を配信するのと同じ、標準的な W3C Push API のフローを利用しています。
 
 ## 必要環境
@@ -88,6 +88,15 @@ angelic-angel status
 angelic-angel unregister
 ```
 
+### WebUI の操作
+
+WebUI（`angelic-angel serve`）は「通知」「設定」「受信状況」の 3 画面です。Cookie と Webhook の設定のほかに、次の操作があります。
+
+- **Cookie の確認**（「設定」画面）: 「確認」ボタンと、保存のたびに実行される自動確認で、*保存済み*の Cookie が X でまだ使えるかを問い合わせ、アカウント名を表示します。ネットワークエラー・レート制限・X 側の障害などで確認できなかった場合は「確認不可」と表示し、Cookie が無効とは判定しません。入力中で未保存の値は確認の対象ではないため、先に保存してください。
+- **受信先の登録**（「設定」画面、Cookie の下）: Web Push の登録と解除を行います。登録中は Cookie を変更できません。
+- **フォロー中の全員の投稿通知をオン**（「設定」画面、登録の下）: インラインの確認の後、X でフォロー中のすべてのアカウントの投稿通知をオンにします。対象全員の X 側の設定が変更され、途中で中止しても変更済みのアカウントは元に戻りません。ジョブは同時に 1 つだけ実行され、進捗（対象・成功・失敗・残り）を表示します。失敗や一部のみ成功した結果もそのまま表示し、自動では再試行しません。再実行には改めて確認が必要です。保存済みの Cookie が必要ですが、Web Push の登録は不要です。
+- **通知**（「通知」画面）: 受信した通知を新しい順に、アイコン・本文・投稿へのリンク・元データとともに一覧表示します。受信した通知はすべて保存され、件数の上限や自動削除はありません。保存先はローカルの SQLite データベース `<設定ファイル>.notifications.sqlite3`（例: `angelic-angel.toml.notifications.sqlite3`）で、権限 `0600` で作成されます。受信したペイロードを含むため設定ファイルと同様に扱ってください。古い通知は「もっと見る」ボタンで読み込みます。
+
 ### オプション
 
 | フラグ | 説明 |
@@ -122,7 +131,7 @@ docker compose stop
 
 ## 開発
 
-Rust は 1.90.0 に固定されています（`rust-toolchain.toml`、CI、Docker、Dev Container）。
+Rust は 1.99.0 に固定されています（`rust-toolchain.toml`、CI、Docker、Dev Container）。
 
 ```sh
 cargo fmt --all -- --check
@@ -136,11 +145,24 @@ scripts/docker-smoke.sh angelic-angel:local        # オフライン・ダミー
 
 イメージのデバッグには、シェルへの `exec` ではなく `docker logs` と CLI サブコマンド（例: `docker run --rm IMAGE status`）を使ってください。公開イメージは GHCR から取得できます: `docker pull ghcr.io/<owner>/<repo>:latest`。
 
+### WebUI の開発
+
+リポジトリのルートで `bun dev` を実行すると、受信機をビルド（`cargo build --locked`）してから、2 つの子プロセスを起動します。`angelic-angel serve`（API、`127.0.0.1:8080`）と、`web/` の Vite 開発サーバー（`http://localhost:11475/`。`/api` と `/health` を API へプロキシします）です。フロントエンドの依存関係は事前に一度 `bun install --cwd web --frozen-lockfile` で導入してください。
+
+- リポジトリルートの `angelic-angel.toml` を使います。その設定に登録情報があると `serve` は実際の受信機を起動するため、UI を試すだけなら `DEV_CONFIG` で一時ファイルを指定してください（例: `DEV_CONFIG=.cache/dev/angelic-angel.toml bun dev`）。使用中の設定ファイルは起動時に表示されます。
+- WebUI はローカル専用で、認証やログインは不要です。開くとそのまま 3 つの画面が表示されます。`.lock` ファイルは設定ファイルと同じ場所に作られ、Git 管理外です。
+- ファイル監視や自動再起動はしません。フロントエンドの編集はホットリロードされますが、Rust の変更には `bun dev` の再起動が必要です。どちらかの子プロセスが終了すると、もう一方も停止します。`Ctrl+C`（SIGINT/SIGTERM）は自分が起動したプロセスだけを停止して終了を待ち、2 回目の `Ctrl+C` で強制終了します。
+- Vite と API はどちらも `127.0.0.1` でのみ待ち受けます。WebUI に認証はないため、これらのポートを他のホストやネットワークへ公開しないでください。
+- プロキシはブラウザの `Host` と `Origin` をそのまま保ちます（`changeOrigin: false`）。そのため `PUT`/`POST`/`DELETE` に対する API の同一オリジン検査は、Vite 自身が配信したページからのリクエストでのみ通ります。表示された URL で UI を開き、別のオリジン経由では使わないでください。
+- ポートは `DEV_API_PORT` と `DEV_WEB_PORT` で変更できます（既定は `8080` と `11475`。Vite のポートは厳密指定で、他のポートへフォールバックしません）。`cd web && bun run dev` は、自分で起動した API に対して Vite だけを動かします（プロキシ先は `VITE_API_TARGET` で変更できます）。
+
 ### Dev Container
 
 `.devcontainer/` は Ubuntu 24.04 ベースの Rust 開発環境（GitHub CLI、Claude Code、Codex CLI、Bun、Docker outside of Docker、act、direnv）を提供します。開く前に、バインドマウントされるホストのディレクトリを作成してください: `mkdir -p ~/.claude ~/.codex`。ビルド成果物と Cargo キャッシュは名前付きボリュームに保存されます。ホストの `gh` はマウントされないため、必要ならコンテナ内で `gh auth login` を実行してください。ホストの AWS/SSH 設定もマウントされません。
 
-初回作成時に、`.codex/config.toml`（Git 管理外）へ参照元の Codex ゲートウェイ設定テンプレートが作成されます。接続先は `https://ai.qleap.jp/v1`、認証には `OPENAI_API_KEY` を使います。既存のファイルは上書きされません。接続先を変更する場合はこの設定を編集してください。
+`CODEX_HOME` はバインドマウントされたホストの `~/.codex`（コンテナ内では `/home/vscode/.codex`）を指すため、Codex の履歴、セッション、認証、スキル、プロジェクトのトラストはホストと共有され、コンテナを作り直しても残ります。`model_provider` と `[model_providers.*]` のゲートウェイ定義（API キーは `env_key = "OPENAI_API_KEY"` のように環境変数名で参照します）はホストの `~/.codex/config.toml` に置いてください。Dev Container はこれらを書き込みません。
+
+初回作成時に、`.codex/config.toml`（Git 管理外）へプロジェクト単位の上書きだけが作成されます: `model = "gpt-6.1-sol"` と `model_reasoning_effort = "xhigh"` です。既存のファイルは上書きされません。モデルを変えるときはこのファイルを編集または削除してください。
 
 ### CI/CD
 

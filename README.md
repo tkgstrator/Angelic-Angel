@@ -28,7 +28,7 @@ Twitter/X  ──push──▶  Mozilla AutoPush Server  ◀──WebSocket─�
 ### Important Notes
 
 - **Data source**: All notification data is received from Mozilla's Web Push server (`push.services.mozilla.com`). Angelic Angel does not access Twitter/X directly for notification data.
-- **Minimal API usage**: The Twitter/X API is only called during the initial push subscription registration (`register` command). No API calls are made while listening for notifications.
+- **Minimal API usage**: The Twitter/X API is only called during the initial push subscription registration (`register` command) and when you explicitly start the WebUI's bulk notification operation. No API calls are made while listening for notifications.
 - **No scraping**: This tool does not perform any web scraping. It uses the standard W3C Push API flow, the same mechanism browsers use to deliver push notifications.
 
 ## Requirements
@@ -88,6 +88,15 @@ angelic-angel status
 angelic-angel unregister
 ```
 
+### WebUI operations
+
+The WebUI (`angelic-angel serve`) has three screens: Notifications, Settings and Status. Besides the Cookie and Webhook settings, it offers:
+
+- **Cookie check** (Settings screen): the "確認" button, and an automatic check after every save, ask X whether the *saved* cookies still work and show the account name. A result of "could not check" (network error, rate limit, X outage) is shown as such and is never reported as an invalid cookie. Unsaved input is not checked; save it first.
+- **Receiver registration** (Settings screen, below the cookies): registers or unregisters the Web Push subscription. Cookies cannot be changed while registered.
+- **Turn on notifications for everyone you follow** (Settings screen, below the registration): after an inline confirmation, it enables post notifications for every account you follow on X. This changes settings on X for all of them, and cancelling midway does not undo the accounts already changed. It runs one job at a time, shows progress (total, succeeded, failed, remaining), reports failures and partial results as they are, and never retries by itself; running it again needs a new confirmation. It needs the saved cookies but not a Web Push registration.
+- **Notifications** (Notifications screen): lists received notifications newest first, with the icon, text, a link to the post and the original payload. Every received notification is kept: they are stored in a local SQLite database, `<config>.notifications.sqlite3` (for example `angelic-angel.toml.notifications.sqlite3`), created with mode `0600` and never pruned. It contains the received payloads, so treat it like the config. Older entries are loaded on demand with the "もっと見る" (show more) button.
+
 ### Options
 
 | Flag | Description |
@@ -122,7 +131,7 @@ docker compose stop
 
 ## Development
 
-Rust is pinned to 1.90.0 (`rust-toolchain.toml`, CI, Docker and the Dev Container).
+Rust is pinned to 1.99.0 (`rust-toolchain.toml`, CI, Docker and the Dev Container).
 
 ```sh
 cargo fmt --all -- --check
@@ -136,11 +145,24 @@ The runtime uses Distroless with a stripped binary, without a shell, sources or 
 
 To debug the image, use `docker logs` and run CLI subcommands (e.g. `docker run --rm IMAGE status`) rather than `exec`ing a shell. Published images can be pulled from GHCR: `docker pull ghcr.io/<owner>/<repo>:latest`.
 
+### WebUI development
+
+`bun dev` from the repository root builds the receiver (`cargo build --locked`), then runs two child processes: `angelic-angel serve` (the API on `127.0.0.1:8080`) and the Vite dev server for `web/` (`http://localhost:11475/`, which proxies `/api` and `/health` to the API). Install the frontend dependencies once with `bun install --cwd web --frozen-lockfile`.
+
+- It uses `angelic-angel.toml` in the repository root. `serve` starts the real receiver when that config already holds a registration, so point `DEV_CONFIG` at a scratch file (for example `DEV_CONFIG=.cache/dev/angelic-angel.toml bun dev`) when you only want to try the UI. The launcher prints the config in use.
+- The WebUI is local-only and needs no authentication or login: it opens straight onto the three screens. The `.lock` file is stored next to the config and is git-ignored.
+- Nothing is watched or restarted: frontend edits hot-reload, but Rust changes need a restart of `bun dev`. If either child exits, the other is stopped too. `Ctrl+C` (SIGINT/SIGTERM) stops only the processes it started and waits for them; a second `Ctrl+C` forces it.
+- Vite and the API both listen on `127.0.0.1` only. The WebUI has no authentication, so do not expose these ports to other hosts or networks.
+- The proxy keeps the browser's `Host` and `Origin` headers (`changeOrigin: false`), so the API's same-origin check for `PUT`/`POST`/`DELETE` passes only for the page served by Vite itself. Open the UI at the printed URL, not through another origin.
+- `DEV_API_PORT` and `DEV_WEB_PORT` override the ports (default `8080` and `11475`; the Vite port is strict and never falls back). `cd web && bun run dev` runs Vite alone against an API you started yourself (`VITE_API_TARGET` overrides the proxy target).
+
 ### Dev Container
 
 `.devcontainer/` provides an Ubuntu 24.04 Rust environment (GitHub CLI, Claude Code, Codex CLI, Bun, Docker outside of Docker, act, direnv). Create the host directories it bind-mounts before opening it: `mkdir -p ~/.claude ~/.codex`. Build artifacts and Cargo caches live in named volumes. Host `gh` is not mounted, so run `gh auth login` inside the Dev Container if needed; no host AWS/SSH/gh config is mounted.
 
-On first create, `.codex/config.toml` (git-ignored) is seeded with the reference Codex gateway template for `https://ai.qleap.jp/v1`, authenticated through `OPENAI_API_KEY`; an existing file is never overwritten. Edit or delete it to use the default routing.
+`CODEX_HOME` points at the bind-mounted host `~/.codex` (`/home/vscode/.codex` in the container), so Codex history, sessions, auth, skills and project trust are shared with the host and survive container rebuilds. `model_provider` and the `[model_providers.*]` gateway definition (API keys are referenced by environment variable name, e.g. `env_key = "OPENAI_API_KEY"`) belong in the host `~/.codex/config.toml`; the Dev Container does not write them.
+
+On first create, `.codex/config.toml` (git-ignored) is seeded with project-level overrides only: `model = "gpt-6.1-sol"` and `model_reasoning_effort = "xhigh"`. An existing file is never overwritten. Edit or delete it to change the model.
 
 ### CI/CD
 

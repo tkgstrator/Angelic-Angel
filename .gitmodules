@@ -1,0 +1,3 @@
+[submodule "vendor/x-transaction"]
+	path = vendor/x-transaction
+	url = https://github.com/qtmleap/x-transaction

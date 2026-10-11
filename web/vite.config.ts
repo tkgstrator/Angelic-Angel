@@ -1,9 +1,10 @@
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import type { IncomingMessage } from 'node:http'
 import { extname, join, resolve } from 'node:path'
 import { brotliCompressSync, constants, gzipSync } from 'node:zlib'
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
-import type { Plugin } from 'vite'
+import type { Plugin, ProxyOptions } from 'vite'
 import { defineConfig } from 'vitest/config'
 
 const COMPRESSIBLE = new Set(['.js', '.css', '.html'])
@@ -45,9 +46,28 @@ function precompress(): Plugin {
 
 const target = process.env.VITE_API_TARGET ?? 'http://127.0.0.1:8080'
 
+const NOTIFICATIONS_PATH = '/api/notifications'
+
+// 通知 GET の応答は上流の content-length と connection を引き継がず、下流の接続管理を Node に任せる。
+export function normalizeNotificationsResponseHeaders(
+  proxyRes: Pick<IncomingMessage, 'headers'>,
+  req: Pick<IncomingMessage, 'method' | 'url'>,
+): void {
+  if (req.method === 'GET' && req.url?.split('?', 1)[0] === NOTIFICATIONS_PATH) {
+    delete proxyRes.headers['content-length']
+    delete proxyRes.headers.connection
+  }
+}
+
 // Keep the browser's Host and Origin untouched: the API rejects mutations whose Origin does not
 // match Host, so `changeOrigin` must stay false (Vite's string shorthand would turn it on).
-const proxy = { target, changeOrigin: false }
+const proxy: ProxyOptions = {
+  target,
+  changeOrigin: false,
+  configure: (server) => {
+    server.on('proxyRes', normalizeNotificationsResponseHeaders)
+  },
+}
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), precompress()],

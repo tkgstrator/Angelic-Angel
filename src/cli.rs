@@ -39,4 +39,24 @@ pub enum Commands {
     Status,
     /// Unregister AutoPush subscription
     Unregister,
+    /// Run the WebUI server together with the managed receiver
+    Serve {
+        /// Address to bind the HTTP server to
+        #[arg(long, env = "WEBUI_BIND", default_value = "127.0.0.1:8080")]
+        bind: String,
+        /// Directory containing the built WebUI assets
+        #[arg(long, env = "WEBUI_ASSETS_DIR", default_value = "web/dist")]
+        assets_dir: PathBuf,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn web_token_command_is_gone() {
+        assert!(Cli::try_parse_from(["angelic-angel", "web-token"]).is_err());
+        assert!(Cli::try_parse_from(["angelic-angel", "serve"]).is_ok());
+    }
 }

@@ -20,21 +20,14 @@ hide_env_diff = true
 TOML
 fi
 
-# Optional local Codex gateway template; an existing config is never touched.
-# The directory is gitignored. Remove or edit it to route Codex elsewhere.
+# Project-level Codex overrides only (model and effort); an existing config is
+# never touched. Providers, auth, history and project trust live in the shared
+# $CODEX_HOME (/home/vscode/.codex), not here. The directory is gitignored.
 mkdir -p .codex
 if [ ! -e .codex/config.toml ]; then
   cat > .codex/config.toml <<'TOML'
-model_provider = "gateway"
-model = "codex,gpt-6.1-sol"
-model_reasoning_effort = "low"
-
-[model_providers.gateway]
-name = "gateway"
-model = "codex,gpt-6.1-sol"
-base_url = "https://ai.qleap.jp/v1"
-env_key = "OPENAI_API_KEY"
-wire_api = "responses"
+model = "gpt-6.1-sol"
+model_reasoning_effort = "xhigh"
 TOML
 fi
 

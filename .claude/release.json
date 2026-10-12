@@ -1,0 +1,38 @@
+{
+	"schemaVersion": 1,
+	"version": {
+		"source": "Cargo.toml",
+		"derivedFiles": ["Cargo.lock"],
+		"bumpCommand": null
+	},
+	"branches": {
+		"source": "develop",
+		"target": "master"
+	},
+	"pullRequest": {
+		"titleTemplate": "chore: release v{version}",
+		"mergeMethod": "merge"
+	},
+	"tag": {
+		"template": "v{version}",
+		"annotated": true
+	},
+	"checks": {
+		"required": ["Commit Lint", "rustfmt", "Clippy", "Test", "Docker Smoke"]
+	},
+	"workflows": {
+		"releaseFiles": [
+			".github/workflows/deployment.yaml",
+			".github/workflows/integration.yaml"
+		],
+		"triggerFingerprint": "sha256:deployment=dc4c1395314467a93aa7c0ba70954f0957983d1286f90d01162e680d0ca90ca5;integration=443e0941aec7e60961a2c70a4d989ef26aba3b8293f8a5758898a367f40cd4c7"
+	},
+	"notes": {
+		"mode": "github-generated",
+		"file": null
+	},
+	"artifacts": {
+		"buildCommands": [],
+		"paths": []
+	}
+}

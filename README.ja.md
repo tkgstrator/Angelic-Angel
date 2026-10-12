@@ -111,7 +111,6 @@ WebUI（`angelic-angel serve`）は「通知」「設定」「受信状況」の
 Docker Compose 2.24 以上が必要です。コンテナに必要なのは、環境変数で渡す X の認証情報と Webhook だけです。初回起動時に自分で登録を済ませ、登録情報をマウントしたディレクトリに保存します。
 
 ```sh
-mkdir config && sudo chown 65532:65532 config   # コンテナは UID 65532 で動作します
 cp .env.example .env   # 編集して TWITTER_AUTH_TOKEN、TWITTER_CSRF_TOKEN、Webhook を設定
 
 docker compose up -d --build
@@ -120,7 +119,8 @@ docker compose stop
 ```
 
 - `TWITTER_AUTH_TOKEN` と `TWITTER_CSRF_TOKEN` は、`auth_token` と `ct0` の Cookie の値です（[`auth_token` と `ct0` の取得方法](#auth_token-と-ct0-の取得方法)）。
-- コンテナは UID 65532 で動作するため、`./config` はその UID が書き込める必要があります。存在しない `./config` を Docker が自動で作ると所有者が root になり、コンテナは "cannot open lock file" で失敗します。自分のユーザーで動かす場合は、`./config` を自分の所有にして、サービスに `user: "1000:1000"`（`id -u`:`id -g` の値）を追加してください。それまでに UID 65532 が `./config` に作ったファイルは、そのユーザーに `chown` する必要があります。
+- `./config` を誰が作っても（自分で作っても、無ければ Docker が作っても）、`chown` も `user:` も不要です。コンテナは root で起動し、設定ファイルを開く前に、既存の設定ファイルの所有者の UID/GID へ切り替えます。ファイルが無い、または root 所有のときは `/config` ディレクトリの所有者へ、ディレクトリも root 所有なら 65532:65532 へ切り替えます。ディレクトリが root 所有のときは、そのディレクトリと、中にある root 所有の `.lock`・履歴データベース・`.tmp-*`（設定ファイルが root 所有ならそれも）を、切り替え先の所有に変えます。以前 `user: "1000:1000"` で動かして作られた `./config` が、いまは root 所有のディレクトリになっていても、そのまま動きます。ディレクトリが設定ファイルとは別の非 root ユーザーの所有のときは、設定ファイルの所有者に合わせてディレクトリは変更しないため、そのユーザーが書き込めないと "cannot open lock file" で失敗することがあります。結果は最初のログ行（`running as 65532:65532 owning /config`）に出力され、以降のプロセスは root ではありません。標準の `CHOWN`、`SETUID`、`SETGID` ケーパビリティが必要です。
+- `user:`（または `docker run --user`）で root 以外を明示した場合は、切り替えも `chown` も行いません。その UID が `./config` に書き込める必要があり、書き込めないと "cannot open lock file ... Permission denied" で起動に失敗します。`./config` に自分で置いたファイルは、切り替え先のユーザーが読める状態でなければなりません。root 所有のファイルは、ディレクトリも root 所有のときだけ引き渡されます。
 - ファイルではなくディレクトリをマウントしてください。設定は一時ファイルに書いてからリネームして保存され、ロックと履歴データベースも同じディレクトリに置かれます。
 - コンテナ内の `localhost` はコンテナ自身を指します。ホスト上の Webhook には `http://host.docker.internal:8080/endpoint` のような URL を使ってください。Linux では、ホスト側のサービスをブリッジ IP や `0.0.0.0` など、Docker から到達できるアドレスで待ち受ける必要があります。
 - `.env` を編集したら `docker compose up -d` でコンテナを再作成してください。`restart` だけでは新しい値は反映されません。
@@ -195,7 +195,7 @@ docker compose up -d
 
 ### 環境変数を使わない場合
 
-設定ファイルを持ち込むこともできます。登録済みの `angelic-angel.toml` を `./config`（所有者は UID 65532）に置くか、コンテナ内で作成します。
+設定ファイルを持ち込むこともできます。登録済みの `angelic-angel.toml` を `./config`（所有者は上記のとおり）に置くか、コンテナ内で作成します。
 
 ```sh
 # 認証情報は対話入力（シェル履歴に秘密情報を残さないため）
@@ -234,7 +234,7 @@ docker build -t angelic-angel:local .
 scripts/docker-smoke.sh angelic-angel:local        # オフライン・ダミー認証情報のみ
 ```
 
-ランタイムは strip 済みバイナリを載せた Distroless で、シェル・ソース・ビルドキャッシュを含みません。`scripts/docker-smoke.sh` はダミーの認証情報とネットワーク無効化を使い、設定の永続化、`ANGELIC_ANGEL_CONFIG`、権限、エラー時の終了コード（30 秒待機する自動登録の失敗を含む）、SIGINT による停止を検証します。必要に応じて別の BusyBox ヘルパーを pull し、作成したテスト用リソースを削除します。
+ランタイムは strip 済みバイナリを載せた Distroless で、シェル・ソース・ビルドキャッシュを含みません。`scripts/docker-smoke.sh` はダミーの認証情報とネットワーク無効化を使い、設定の永続化、`ANGELIC_ANGEL_CONFIG`、権限、bind mount したディレクトリの所有者への切り替え（root 所有・別 UID 所有）と `--user` 明示時の挙動、エラー時の終了コード（30 秒待機する自動登録の失敗を含む）、SIGINT による停止を検証します。必要に応じて別の BusyBox ヘルパーを pull し、作成したテスト用リソースを削除します。
 
 イメージのデバッグには、シェルへの `exec` ではなく `docker logs` と CLI サブコマンド（例: `docker run --rm IMAGE status`）を使ってください。公開イメージは GHCR から取得できます: `docker pull ghcr.io/<owner>/<repo>:latest`。
 

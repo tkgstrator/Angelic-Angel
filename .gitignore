@@ -33,7 +33,8 @@ angelic-angel.toml.*
 
 # Local agent state, working notes and act secrets (Cargo.lock stays tracked)
 /work/
-.claude/
+.claude/*
+!.claude/release.json
 .codex/
 .secrets
 !.secrets.example

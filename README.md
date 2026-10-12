@@ -166,8 +166,8 @@ On first create, `.codex/config.toml` (git-ignored) is seeded with project-level
 
 ### CI/CD
 
-- `.github/workflows/integration.yaml` runs on pull requests, non-`main` branch pushes and as a reusable workflow: commitlint over the new commit range, rustfmt, Clippy (warnings denied), `cargo test --locked`, and a Docker build plus `scripts/docker-smoke.sh`. Permissions are `contents: read`.
-- `.github/workflows/deployment.yaml` runs on `main` pushes, `v*` tags and manual dispatch (`main` only). It calls the integration workflow first, then publishes a multi-arch (`linux/amd64`, `linux/arm64`) image to `ghcr.io/<owner>/<repo>` tagged `sha-<short>`; `latest` on `main`; and `<version>` only for a `v<version>` tag in `main` history that matches `Cargo.toml`. Only the publish job has `packages: write`.
+- `.github/workflows/integration.yaml` runs on pull requests, non-`master` branch pushes and as a reusable workflow: commitlint over the new commit range, rustfmt, Clippy (warnings denied), `cargo test --locked`, and a Docker build plus `scripts/docker-smoke.sh`. Permissions are `contents: read`.
+- `.github/workflows/deployment.yaml` runs on `master` pushes, `v*` tags and manual dispatch (`master` only). It calls the integration workflow first, then publishes a multi-arch (`linux/amd64`, `linux/arm64`) image to `ghcr.io/<owner>/<repo>` tagged `sha-<short>`; `latest` on `master`; and `<version>` only for a `v<version>` tag in `master` history that matches `Cargo.toml`. Only the publish job has `packages: write`.
 - Commit messages follow Conventional Commits (`.commitlintrc.yaml`; types: build, chore, ci, docs, feat, fix, perf, refactor, revert, test).
 
 ## Reconnection

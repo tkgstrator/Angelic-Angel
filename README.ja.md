@@ -166,8 +166,8 @@ scripts/docker-smoke.sh angelic-angel:local        # オフライン・ダミー
 
 ### CI/CD
 
-- `.github/workflows/integration.yaml` はプルリクエスト、`main` 以外のブランチへの push、および再利用ワークフローとして実行され、commitlint（新規コミット範囲）、rustfmt、Clippy（警告はエラー）、`cargo test --locked`、Docker ビルドと `scripts/docker-smoke.sh` を行います。権限は `contents: read` です。
-- `.github/workflows/deployment.yaml` は `main` への push、`v*` タグ、手動実行（`main` のみ）で動作し、先に integration を呼び出してから、マルチアーキテクチャ（`linux/amd64`、`linux/arm64`）イメージを `ghcr.io/<owner>/<repo>` へ公開します。タグは `sha-<short>`、`main` では `latest`、`main` の履歴上にあり `Cargo.toml` と一致する `v<version>` タグのときのみ `<version>` です。`packages: write` は公開ジョブだけが持ちます。
+- `.github/workflows/integration.yaml` はプルリクエスト、`master` 以外のブランチへの push、および再利用ワークフローとして実行され、commitlint（新規コミット範囲）、rustfmt、Clippy（警告はエラー）、`cargo test --locked`、Docker ビルドと `scripts/docker-smoke.sh` を行います。権限は `contents: read` です。
+- `.github/workflows/deployment.yaml` は `master` への push、`v*` タグ、手動実行（`master` のみ）で動作し、先に integration を呼び出してから、マルチアーキテクチャ（`linux/amd64`、`linux/arm64`）イメージを `ghcr.io/<owner>/<repo>` へ公開します。タグは `sha-<short>`、`master` では `latest`、`master` の履歴上にあり `Cargo.toml` と一致する `v<version>` タグのときのみ `<version>` です。`packages: write` は公開ジョブだけが持ちます。
 - コミットメッセージは Conventional Commits に従います（`.commitlintrc.yaml`）。
 
 ## 再接続

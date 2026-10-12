@@ -2,7 +2,7 @@ name: Integration
 on:
   push:
     branches-ignore:
-      - main
+      - master
     tags-ignore:
       - "**"
   pull_request:
@@ -23,8 +23,8 @@ jobs:
   commitlint:
     name: Commit Lint
     runs-on: ubuntu-24.04
-    # Skip main, tags, manual and reusable (release) runs.
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/main')
+    # Skip master, tags, manual and reusable (release) runs.
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/master')
     steps:
       - uses: actions/checkout@v5
         with:
@@ -51,8 +51,8 @@ jobs:
             from=$PUSH_BEFORE
             if [ -z "$from" ] || [ "$from" = "0000000000000000000000000000000000000000" ] \
               || ! git cat-file -e "$from^{commit}" 2>/dev/null; then
-              git fetch --no-tags origin main
-              from=$(git merge-base origin/main "$to")
+              git fetch --no-tags origin master
+              from=$(git merge-base origin/master "$to")
             fi
           fi
           export NODE_PATH="$RUNNER_TEMP/commitlint/node_modules"

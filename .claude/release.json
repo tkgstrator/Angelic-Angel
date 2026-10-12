@@ -7,7 +7,7 @@
 	},
 	"branches": {
 		"source": "develop",
-		"target": "main"
+		"target": "master"
 	},
 	"pullRequest": {
 		"titleTemplate": "chore: release v{version}",
@@ -25,7 +25,7 @@
 			".github/workflows/deployment.yaml",
 			".github/workflows/integration.yaml"
 		],
-		"triggerFingerprint": "sha256:deployment=cc69f12a88c1b4cd0877e48156ff88caaabeecafc439ec037db489aa499fc51e;integration=555dd5a08138f7016f144bb61ec07778fb94d8d0f1db6c1e79a26a428c7447cc"
+		"triggerFingerprint": "sha256:deployment=dc4c1395314467a93aa7c0ba70954f0957983d1286f90d01162e680d0ca90ca5;integration=443e0941aec7e60961a2c70a4d989ef26aba3b8293f8a5758898a367f40cd4c7"
 	},
 	"notes": {
 		"mode": "github-generated",

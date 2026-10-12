@@ -1,7 +1,10 @@
 use crate::config::TwitterConfig;
 use crate::error::{AngelicAngelError, Result};
 use crate::push::PushSubscription;
-use crate::transaction::{Transaction, ondemand_file_hash};
+use crate::transaction::{
+    Transaction, entry_script_urls, is_signer_url, module_import_urls, module_priority,
+    ondemand_file_hash,
+};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::header::{CONTENT_TYPE, HeaderValue, LOCATION};
 use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
@@ -14,28 +17,26 @@ use tokio::sync::Mutex;
 
 const TWITTER_API_BASE: &str = "https://x.com/i/api/1.1";
 const TWITTER_SETTINGS_BASE: &str = "https://api.x.com/1.1";
-const TWITTER_HOME_URL: &str = "https://x.com/home";
+const TWITTER_HOME_URL: &str = "https://x.com/";
+const TWITTER_HOME_FALLBACK_URL: &str = "https://x.com/home";
+const ASSET_BASE: &str = "https://abs.twimg.com/";
 const ONDEMAND_URL_PREFIX: &str = "https://abs.twimg.com/responsive-web/client-web/ondemand.s.";
 const ONDEMAND_URL_SUFFIX: &str = "a.js";
 const TRANSACTION_HEADER: &str = "x-client-transaction-id";
 const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
 /// 呼び出し側の外側タイムアウト (30 秒) より十分短くし、初期化が毎回途中で切られないようにする。
-const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
+const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_BOOTSTRAP_BYTES: usize = 4 * 1024 * 1024;
 /// 生成器の有効期間。X 側の鍵が入れ替わっても再起動なしで追従するための上限で、期限後の最初の呼び出しが取り直す。
 const TRANSACTION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const MAX_ONDEMAND_HASH_LEN: usize = 64;
-/// 匿名 bootstrap だけが辿る同一オリジン内の redirect 回数。未ログインの /home は 1 回転送される。
+/// 匿名 bootstrap のホーム取得だけが辿る同一オリジン内の redirect 回数。未ログインの /home は 1 回転送される。
 const MAX_BOOTSTRAP_REDIRECTS: usize = 3;
-/// 上流の `Transaction.create()` が x.com/home に付ける匿名ヘッダ (User-Agent は client 既定)。
-const HOME_HEADERS: [(&str, &str); 6] = [
-    ("authority", "x.com"),
-    ("accept-language", "en-US,en;q=0.9"),
-    ("cache-control", "no-cache"),
-    ("referer", "https://x.com"),
-    ("x-twitter-active-user", "yes"),
-    ("x-twitter-client-language", "en"),
-];
+/// 署名モジュール探索の上限 (上流 discovery.ts と同じ)。
+const MAX_SIGNER_REQUESTS: usize = 12;
+const MAX_SIGNER_DEPTH: usize = 3;
+/// 上流 discovery.ts が匿名取得に付けるヘッダ (User-Agent は client 既定)。
+const BOOTSTRAP_HEADERS: [(&str, &str); 1] = [("accept-language", "en-US,en;q=0.9")];
 const AUTHORIZATION_BEARER: &str = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
 const DEVICE_ID: &str = "Mac/Firefox";
 const FRIENDS_PAGE_SIZE: &str = "5000";
@@ -235,7 +236,11 @@ async fn read_body(response: Response) -> std::result::Result<Vec<u8>, XError> {
 struct Endpoints {
     settings_base: String,
     api_base: String,
+    /// 最初に取るページ。bootstrap の手掛かりが無いときだけ `fallback_url` を取る。
     home_url: String,
+    fallback_url: String,
+    /// 署名モジュールを取ってよいオリジン。相対パスは `/x-web/` 配下の `.js` に限る。
+    asset_base: Url,
     ondemand_prefix: String,
 }
 
@@ -245,6 +250,8 @@ impl Endpoints {
             settings_base: TWITTER_SETTINGS_BASE.to_string(),
             api_base: TWITTER_API_BASE.to_string(),
             home_url: TWITTER_HOME_URL.to_string(),
+            fallback_url: TWITTER_HOME_FALLBACK_URL.to_string(),
+            asset_base: Url::parse(ASSET_BASE).expect("静的な URL"),
             ondemand_prefix: ONDEMAND_URL_PREFIX.to_string(),
         }
     }
@@ -306,21 +313,13 @@ impl XApi {
         format!("{}/friendships/update.json", self.endpoints.api_base)
     }
 
-    /// 認証情報なしで HTML とスクリプトを取り、生成器を作る。取得先は固定ホストとハッシュ検証済みの URL だけ。
+    /// 認証情報なしでホーム HTML と署名モジュールを取り、生成器を作る。取得先は X の固定ホストと、
+    /// そこから検証を通ったモジュール URL だけで、取得した JavaScript は実行しない。
     async fn bootstrap(&self) -> std::result::Result<Transaction, XError> {
         let work = async {
-            let home = self
-                .fetch_text(&self.endpoints.home_url, &HOME_HEADERS)
-                .await?;
-            let hash = ondemand_file_hash(&home)
-                .filter(|hash| hash.len() <= MAX_ONDEMAND_HASH_LEN)
-                .ok_or(XError::Malformed)?;
-            let url = format!(
-                "{}{hash}{ONDEMAND_URL_SUFFIX}",
-                self.endpoints.ondemand_prefix
-            );
-            let script = self.fetch_text(&url, &[]).await?;
-            Transaction::new(&home, &script).map_err(|error| {
+            let home = self.fetch_home().await?;
+            let signer = self.fetch_signer(&home).await?;
+            Transaction::new(&home, &signer).map_err(|error| {
                 tracing::debug!(%error, "x-client-transaction-id generator rejected the page");
                 XError::Malformed
             })
@@ -334,21 +333,94 @@ impl XApi {
         }
     }
 
-    /// 匿名 GET。redirect は同一オリジンへの最大 `MAX_BOOTSTRAP_REDIRECTS` 回だけ手動で辿り、
-    /// 別オリジン・ループ・回数超過は転送先へ送らず `Status` で失敗させる。
+    /// 旧形式の ondemand.s の URL。hash は 16 進の短いものだけを通す。
+    fn legacy_signer_url(&self, html: &str) -> Option<String> {
+        let hash = ondemand_file_hash(html).filter(|hash| hash.len() <= MAX_ONDEMAND_HASH_LEN)?;
+        Some(format!(
+            "{}{hash}{ONDEMAND_URL_SUFFIX}",
+            self.endpoints.ondemand_prefix
+        ))
+    }
+
+    fn entry_urls(&self, html: &str) -> Vec<Url> {
+        match Url::parse(&self.endpoints.home_url) {
+            Ok(base) => entry_script_urls(html, &base, &self.endpoints.asset_base),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn has_bootstrap(&self, html: &str) -> bool {
+        self.legacy_signer_url(html).is_some() || !self.entry_urls(html).is_empty()
+    }
+
+    /// ルートを取り、手掛かりが無いときだけ /home を取る。取得そのものの失敗では取り直さない。
+    async fn fetch_home(&self) -> std::result::Result<String, XError> {
+        let html = self
+            .fetch_text(&self.endpoints.home_url, MAX_BOOTSTRAP_REDIRECTS)
+            .await?;
+        if self.has_bootstrap(&html) {
+            return Ok(html);
+        }
+        let fallback = self
+            .fetch_text(&self.endpoints.fallback_url, MAX_BOOTSTRAP_REDIRECTS)
+            .await?;
+        if self.has_bootstrap(&fallback) {
+            Ok(fallback)
+        } else {
+            Err(XError::Malformed)
+        }
+    }
+
+    /// 署名モジュールを探す。`entry-client` から import を幅優先で辿り、`sign.*.js` に当たったら返す。
+    /// 探索は深さ・リクエスト数に上限があり、取得先は `asset_base` 配下の検証済み URL だけ。
+    async fn fetch_signer(&self, html: &str) -> std::result::Result<String, XError> {
+        if let Some(url) = self.legacy_signer_url(html) {
+            return self.fetch_text(&url, 0).await;
+        }
+        let mut queue: Vec<(Url, usize)> = self
+            .entry_urls(html)
+            .into_iter()
+            .map(|url| (url, 0))
+            .collect();
+        let mut visited: Vec<Url> = Vec::new();
+        while !queue.is_empty() && visited.len() < MAX_SIGNER_REQUESTS {
+            let (url, depth) = queue.remove(0);
+            if visited.contains(&url) {
+                continue;
+            }
+            visited.push(url.clone());
+            let source = self.fetch_text(url.as_str(), 0).await?;
+            if is_signer_url(&url) {
+                return Ok(source);
+            }
+            if depth < MAX_SIGNER_DEPTH {
+                let imports = module_import_urls(&source, &url, &self.endpoints.asset_base);
+                queue.extend(imports.into_iter().map(|next| (next, depth + 1)));
+                queue.sort_by_key(|(url, depth)| (module_priority(url), *depth));
+            }
+        }
+        tracing::debug!(
+            requests = visited.len(),
+            "x-client-transaction-id signer module was not found"
+        );
+        Err(XError::Malformed)
+    }
+
+    /// 匿名 GET。redirect は同一オリジンへの最大 `max_redirects` 回だけ手動で辿り、
+    /// 別オリジン・ループ・回数超過は転送先へ送らず `Status` で失敗させる (0 なら一切辿らない)。
     /// 失敗は常に `Status` / `Transport` / `Malformed` にし、401・403・429 を認証失敗として扱わない。
     async fn fetch_text(
         &self,
         start: &str,
-        headers: &[(&str, &str)],
+        max_redirects: usize,
     ) -> std::result::Result<String, XError> {
         let mut url = Url::parse(start).map_err(|_| XError::Malformed)?;
         let origin = url.origin();
         let mut visited = vec![url.clone()];
         let mut response = loop {
             let mut request = self.client.get(url.clone());
-            for (name, value) in headers {
-                request = request.header(*name, *value);
+            for (name, value) in BOOTSTRAP_HEADERS {
+                request = request.header(name, value);
             }
             let response = request.send().await.map_err(transport)?;
             let status = response.status();
@@ -368,7 +440,7 @@ impl XApi {
                 Some(next)
                     if matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
                         && next.origin() == origin
-                        && visited.len() <= MAX_BOOTSTRAP_REDIRECTS
+                        && visited.len() <= max_redirects
                         && !visited.contains(&next) =>
                 {
                     visited.push(next.clone());
@@ -573,6 +645,8 @@ mod tests {
             settings_base: format!("{base}/1.1"),
             api_base: format!("{base}/i/api/1.1"),
             home_url: format!("{base}/home"),
+            fallback_url: format!("{base}/home-fallback"),
+            asset_base: Url::parse(base).unwrap(),
             ondemand_prefix: format!("{base}/ondemand.s."),
         }
     }
@@ -624,6 +698,7 @@ mod tests {
     #[derive(Clone)]
     struct Site {
         home: Arc<Mutex<(u16, String)>>,
+        fallback: Arc<Mutex<(u16, String)>>,
         script: Arc<Mutex<(u16, String)>>,
         settings: Arc<Mutex<(u16, String)>>,
     }
@@ -632,6 +707,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 home: Arc::new(Mutex::new((200, fixture::home_html()))),
+                fallback: Arc::new(Mutex::new((200, "<html>no bootstrap</html>".into()))),
                 script: Arc::new(Mutex::new((200, fixture::ondemand_js()))),
                 settings: Arc::new(Mutex::new((200, r#"{"screen_name":"me_1"}"#.into()))),
             }
@@ -644,6 +720,7 @@ mod tests {
             };
             match (seen.method.as_str(), seen.path.as_str()) {
                 ("GET", "/home") => scripted(&self.home),
+                ("GET", "/home-fallback") => scripted(&self.fallback),
                 ("GET", SCRIPT_PATH) => scripted(&self.script),
                 ("GET", "/1.1/account/settings.json") => scripted(&self.settings),
                 ("GET", "/i/api/1.1/friends/ids.json") => reply(
@@ -764,10 +841,12 @@ mod tests {
             pinned(api.friendships_update_url()),
             expect("x.com", "/i/api/1.1/friendships/update.json")
         );
+        assert_eq!(pinned(api.endpoints.home_url.clone()), expect("x.com", "/"));
         assert_eq!(
-            pinned(api.endpoints.home_url.clone()),
+            pinned(api.endpoints.fallback_url.clone()),
             expect("x.com", "/home")
         );
+        assert_eq!(api.endpoints.asset_base.as_str(), "https://abs.twimg.com/");
         assert_eq!(
             pinned(format!(
                 "{}{}{}",
@@ -817,8 +896,7 @@ mod tests {
             }
         }
         let home = seen.iter().find(|s| s.path == "/home").unwrap();
-        assert_eq!(home.headers["referer"], "https://x.com");
-        assert_eq!(home.headers["x-twitter-active-user"], "yes");
+        assert_eq!(home.headers["accept-language"], "en-US,en;q=0.9");
         assert_eq!(seen.iter().filter(|s| s.path.contains("/1.1/")).count(), 4);
     }
 
@@ -880,7 +958,7 @@ mod tests {
             log.lock()
                 .unwrap()
                 .iter()
-                .all(|s| s.path == "/home" || s.path == SCRIPT_PATH),
+                .all(|s| ["/home", "/home-fallback", SCRIPT_PATH].contains(&s.path.as_str())),
             "bootstrap が失敗している間は API にリクエストを送らない"
         );
         let attempts = count(&log, "/home");
@@ -1062,7 +1140,7 @@ mod tests {
             for name in CREDENTIAL_HEADERS {
                 assert!(!hop.headers.contains_key(name), "{} に {name}", hop.path);
             }
-            for (name, value) in HOME_HEADERS {
+            for (name, value) in BOOTSTRAP_HEADERS {
                 assert_eq!(hop.headers[name], value, "{} の {name}", hop.path);
             }
             assert_eq!(hop.headers["user-agent"], BROWSER_USER_AGENT);
@@ -1177,6 +1255,393 @@ mod tests {
                 .iter()
                 .all(|s| s.path != "/1.1/account/settings.json")
         );
+    }
+
+    const ENTRY_PATH: &str = "/x-web/x-web/entry-client-logged-out-abc.js";
+    const ASSETS: &str = "/x-web/x-web/assets";
+
+    fn modern_home(entry_src: &str) -> String {
+        fixture::home_html_with(
+            false,
+            &format!(r#"<script type="module" src="{entry_src}"></script>"#),
+        )
+    }
+
+    fn module(path: &str, status: u16, body: &str) -> Route {
+        // Route の path は 'static なので、テスト内で使う固定文字列だけを渡す
+        (
+            Box::leak(path.to_string().into_boxed_str()),
+            status,
+            None,
+            body.to_string(),
+        )
+    }
+
+    fn paths(log: &Log) -> Vec<String> {
+        log.lock().unwrap().iter().map(|s| s.path.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn bootstrap_discovers_the_signer_through_imports_anonymously() {
+        let log = Log::default();
+        let site = vec![
+            ("/home", 200, None, modern_home(ENTRY_PATH)),
+            (
+                ENTRY_PATH,
+                200,
+                None,
+                r#"import{x}from"./assets/sentry-filter-def.js";"#.to_string(),
+            ),
+            module(
+                &format!("{ASSETS}/sentry-filter-def.js"),
+                200,
+                "const s=()=>import(`./sign.o-ghi.js`)",
+            ),
+            module(
+                &format!("{ASSETS}/sign.o-ghi.js"),
+                200,
+                &fixture::ondemand_js(),
+            ),
+            module(
+                "/1.1/account/settings.json",
+                200,
+                r#"{"screen_name":"me_1"}"#,
+            ),
+        ];
+        let server = serve(scripted(&log, site)).await;
+        let api = bootstrapping(&server.base, Duration::from_secs(5));
+        assert_eq!(api.screen_name(&twitter()).await.unwrap(), "me_1");
+
+        assert_eq!(
+            paths(&log),
+            [
+                "/home".to_string(),
+                ENTRY_PATH.to_string(),
+                format!("{ASSETS}/sentry-filter-def.js"),
+                format!("{ASSETS}/sign.o-ghi.js"),
+                "/1.1/account/settings.json".to_string(),
+            ]
+        );
+        let seen = log.lock().unwrap();
+        for hop in &seen[..4] {
+            for name in CREDENTIAL_HEADERS {
+                assert!(!hop.headers.contains_key(name), "{} に {name}", hop.path);
+            }
+            assert_eq!(hop.headers["accept-language"], "en-US,en;q=0.9");
+            assert_eq!(hop.headers["user-agent"], BROWSER_USER_AGENT);
+        }
+        assert_valid_id(&seen[4]);
+    }
+
+    #[tokio::test]
+    async fn signer_discovery_prefers_relevant_modules_and_stays_bounded() {
+        let twitter = twitter();
+        // 関連しそうなモジュールを先に取り、深さ 3 までで見つける
+        let log = Log::default();
+        let site = vec![
+            ("/home", 200, None, modern_home(ENTRY_PATH)),
+            module(
+                ENTRY_PATH,
+                200,
+                r#"import "./sentry-unrelated.js"; import "./transaction-client.js";"#,
+            ),
+            module(
+                "/x-web/x-web/sentry-unrelated.js",
+                200,
+                r#"import "./irrelevant.js";"#,
+            ),
+            module(
+                "/x-web/x-web/transaction-client.js",
+                200,
+                r#"import("./sign.o-live.js")"#,
+            ),
+            module("/x-web/x-web/sign.o-live.js", 200, &fixture::ondemand_js()),
+            module(
+                "/1.1/account/settings.json",
+                200,
+                r#"{"screen_name":"me_1"}"#,
+            ),
+        ];
+        let server = serve(scripted(&log, site)).await;
+        let api = bootstrapping(&server.base, Duration::from_secs(5));
+        api.screen_name(&twitter).await.unwrap();
+        assert_eq!(
+            &paths(&log)[1..5],
+            [
+                ENTRY_PATH,
+                "/x-web/x-web/sentry-unrelated.js",
+                "/x-web/x-web/transaction-client.js",
+                "/x-web/x-web/sign.o-live.js"
+            ]
+        );
+        drop(server);
+
+        // sign が深さ 4 にあれば見つからない
+        let log = Log::default();
+        let site = vec![
+            ("/home", 200, None, modern_home(ENTRY_PATH)),
+            module(ENTRY_PATH, 200, r#"import "./a.js""#),
+            module("/x-web/x-web/a.js", 200, r#"import "./b.js""#),
+            module("/x-web/x-web/b.js", 200, r#"import "./c.js""#),
+            module("/x-web/x-web/c.js", 200, r#"import "./sign.o-x.js""#),
+            module("/x-web/x-web/sign.o-x.js", 200, &fixture::ondemand_js()),
+        ];
+        let server = serve(scripted(&log, site)).await;
+        let api = bootstrapping(&server.base, Duration::from_secs(5));
+        assert_eq!(
+            api.screen_name(&twitter).await.unwrap_err(),
+            XError::Malformed
+        );
+        assert!(!paths(&log).iter().any(|p| p.contains("sign.o-x")));
+        drop(server);
+
+        // 循環でも広がっても、モジュールの取得は 12 件まで
+        let log = Log::default();
+        let mut site = vec![
+            ("/home", 200, None, modern_home(ENTRY_PATH)),
+            module(
+                ENTRY_PATH,
+                200,
+                &(0..20)
+                    .map(|i| format!(r#"import "./leaf{i}.js";"#))
+                    .collect::<String>(),
+            ),
+        ];
+        for i in 0..20 {
+            site.push(module(
+                &format!("/x-web/x-web/leaf{i}.js"),
+                200,
+                "export const x=1",
+            ));
+        }
+        let server = serve(scripted(&log, site)).await;
+        let api = bootstrapping(&server.base, Duration::from_secs(5));
+        assert_eq!(
+            api.screen_name(&twitter).await.unwrap_err(),
+            XError::Malformed
+        );
+        assert_eq!(paths(&log).len(), 1 + MAX_SIGNER_REQUESTS);
+        drop(server);
+
+        let log = Log::default();
+        let mut site = vec![
+            ("/home", 200, None, modern_home(ENTRY_PATH)),
+            module(ENTRY_PATH, 200, r#"import "./module0.js""#),
+        ];
+        for i in 0..20 {
+            site.push(module(
+                &format!("/x-web/x-web/module{i}.js"),
+                200,
+                &format!(
+                    r#"import "./module{}.js"; import "./entry-client-logged-out-abc.js""#,
+                    i + 1
+                ),
+            ));
+        }
+        let server = serve(scripted(&log, site)).await;
+        let api = bootstrapping(&server.base, Duration::from_secs(5));
+        assert_eq!(
+            api.screen_name(&twitter).await.unwrap_err(),
+            XError::Malformed
+        );
+        let fetched = paths(&log);
+        assert!(fetched.len() <= 1 + MAX_SIGNER_REQUESTS);
+        assert_eq!(
+            fetched.iter().filter(|p| p.as_str() == ENTRY_PATH).count(),
+            1,
+            "同じモジュールは 1 回だけ取る"
+        );
+    }
+
+    #[tokio::test]
+    async fn signer_discovery_never_fetches_unsafe_modules_or_follows_redirects() {
+        let sink_log = Log::default();
+        let sink = serve(recording(Arc::clone(&sink_log), |_| reply(200, "{}"))).await;
+        let sink_port = sink.base.rsplit(':').next().unwrap().to_string();
+        let hostile = [
+            format!(r#"import "{}/x-web/sign.o-a.js";"#, sink.base),
+            format!(r#"import "http://localhost:{sink_port}/x-web/sign.o-b.js";"#),
+            r#"import "https://evil.invalid/x-web/sign.o-c.js";"#.to_string(),
+            r#"import "//evil.invalid/x-web/sign.o-d.js";"#.to_string(),
+            r#"import "/other/sign.o-e.js";"#.to_string(),
+            r#"import "./sign.o-f.json";"#.to_string(),
+            r#"import "../../other/sign.o-g.js";"#.to_string(),
+            r#"import(`./${name}.js`);"#.to_string(),
+        ]
+        .concat();
+        let log = Log::default();
+        let site = vec![
+            ("/home", 200, None, modern_home(ENTRY_PATH)),
+            module(ENTRY_PATH, 200, &hostile),
+        ];
+        let server = serve(scripted(&log, site)).await;
+        let api = bootstrapping(&server.base, Duration::from_secs(5));
+        assert_eq!(
+            api.screen_name(&twitter()).await.unwrap_err(),
+            XError::Malformed
+        );
+        assert_eq!(paths(&log), ["/home", ENTRY_PATH]);
+        assert!(sink_log.lock().unwrap().is_empty());
+        drop(server);
+
+        // entry が別オリジン・範囲外のときは取りに行かない
+        let foreign_entries = [
+            format!("{}/x-web/x-web/entry-client-x.js", sink.base),
+            "https://evil.invalid/x-web/x-web/entry-client-x.js".to_string(),
+            "/other/entry-client-x.js".to_string(),
+        ];
+        for entry in foreign_entries {
+            let log = Log::default();
+            let site = vec![
+                ("/home", 200, None, modern_home(&entry)),
+                ("/home-fallback", 200, None, "<html></html>".to_string()),
+            ];
+            let server = serve(scripted(&log, site)).await;
+            let api = bootstrapping(&server.base, Duration::from_secs(5));
+            assert_eq!(
+                api.screen_name(&twitter()).await.unwrap_err(),
+                XError::Malformed,
+                "{entry}"
+            );
+            assert_eq!(paths(&log), ["/home", "/home-fallback"], "{entry}");
+        }
+        assert!(sink_log.lock().unwrap().is_empty());
+
+        // モジュールの redirect は辿らない
+        let log = Log::default();
+        let site = vec![
+            ("/home", 200, None, modern_home(ENTRY_PATH)),
+            (
+                ENTRY_PATH,
+                302,
+                Some(format!("{}/x", sink.base)),
+                String::new(),
+            ),
+        ];
+        let server = serve(scripted(&log, site)).await;
+        let api = bootstrapping(&server.base, Duration::from_secs(5));
+        assert_eq!(
+            api.screen_name(&twitter()).await.unwrap_err(),
+            XError::Status(302)
+        );
+        assert_eq!(paths(&log), ["/home", ENTRY_PATH]);
+        assert!(sink_log.lock().unwrap().is_empty());
+
+        // 同一オリジン内でもモジュールの redirect は辿らない (署名モジュールは redirect しない)
+        let log = Log::default();
+        let site = vec![
+            ("/home", 200, None, modern_home(ENTRY_PATH)),
+            (
+                ENTRY_PATH,
+                302,
+                Some("/x-web/x-web/moved.js".to_string()),
+                String::new(),
+            ),
+            module("/x-web/x-web/moved.js", 200, "import './sign.o-a.js'"),
+        ];
+        let server = serve(scripted(&log, site)).await;
+        let api = bootstrapping(&server.base, Duration::from_secs(5));
+        assert_eq!(
+            api.screen_name(&twitter()).await.unwrap_err(),
+            XError::Status(302)
+        );
+        assert_eq!(paths(&log), ["/home", ENTRY_PATH]);
+    }
+
+    #[tokio::test]
+    async fn module_failures_are_provider_errors_and_never_reach_the_api() {
+        let twitter = twitter();
+        for (status, expected) in [
+            (503, XError::Status(503)),
+            (403, XError::Status(403)),
+            (401, XError::Status(401)),
+            (429, XError::Status(429)),
+        ] {
+            let log = Log::default();
+            let site = vec![
+                ("/home", 200, None, modern_home(ENTRY_PATH)),
+                module(ENTRY_PATH, status, "blocked"),
+            ];
+            let server = serve(scripted(&log, site)).await;
+            let api = bootstrapping(&server.base, Duration::from_secs(5));
+            let error = api.screen_name(&twitter).await.unwrap_err();
+            assert_eq!(error, expected);
+            assert!(!error.is_fatal());
+            assert!(!paths(&log).iter().any(|p| p.contains("/1.1/")));
+        }
+
+        // 署名らしきモジュールが無い
+        let log = Log::default();
+        let site = vec![
+            ("/home", 200, None, modern_home(ENTRY_PATH)),
+            module(ENTRY_PATH, 200, "globalThis.remoteExecuted=true;"),
+        ];
+        let server = serve(scripted(&log, site)).await;
+        let api = bootstrapping(&server.base, Duration::from_secs(5));
+        assert_eq!(
+            api.screen_name(&twitter).await.unwrap_err(),
+            XError::Malformed
+        );
+        assert!(!paths(&log).iter().any(|p| p.contains("/1.1/")));
+    }
+
+    #[tokio::test]
+    async fn the_fallback_page_is_fetched_only_when_the_first_has_no_bootstrap() {
+        let twitter = twitter();
+        // 手掛かりが無い → fallback を取る
+        let log = Log::default();
+        let site = Site::new();
+        *site.home.lock().unwrap() = (200, "<html></html>".into());
+        *site.fallback.lock().unwrap() = (200, fixture::home_html());
+        let server = serve(site.router(&log)).await;
+        let api = bootstrapping(&server.base, Duration::from_secs(5));
+        assert_eq!(api.screen_name(&twitter).await.unwrap(), "me_1");
+        assert_eq!(count(&log, "/home"), 1);
+        assert_eq!(count(&log, "/home-fallback"), 1);
+        drop(server);
+
+        // 手掛かりがある・取得に失敗した → fallback は取らない
+        for (status, body) in [(200, fixture::home_html()), (503, "down".into())] {
+            let log = Log::default();
+            let site = Site::new();
+            *site.home.lock().unwrap() = (status, body);
+            let server = serve(site.router(&log)).await;
+            let api = bootstrapping(&server.base, Duration::from_secs(5));
+            let _ = api.screen_name(&twitter).await;
+            assert_eq!(count(&log, "/home-fallback"), 0, "{status}");
+        }
+
+        // どちらにも無い
+        let log = Log::default();
+        let site = Site::new();
+        *site.home.lock().unwrap() = (200, "<html></html>".into());
+        let server = serve(site.router(&log)).await;
+        let api = bootstrapping(&server.base, Duration::from_secs(5));
+        assert_eq!(
+            api.screen_name(&twitter).await.unwrap_err(),
+            XError::Malformed
+        );
+    }
+
+    #[tokio::test]
+    async fn the_legacy_manifest_takes_priority_over_entry_scripts() {
+        let log = Log::default();
+        let home =
+            fixture::home_html_with(true, &format!(r#"<script src="{ENTRY_PATH}"></script>"#));
+        let site = vec![
+            ("/home", 200, None, home),
+            (SCRIPT_PATH, 200, None, fixture::ondemand_js()),
+            (
+                "/1.1/account/settings.json",
+                200,
+                None,
+                r#"{"screen_name":"me_1"}"#.to_string(),
+            ),
+        ];
+        let server = serve(scripted(&log, site)).await;
+        let api = bootstrapping(&server.base, Duration::from_secs(5));
+        assert_eq!(api.screen_name(&twitter()).await.unwrap(), "me_1");
+        assert!(!paths(&log).iter().any(|p| p == ENTRY_PATH));
     }
 
     #[tokio::test]
@@ -1377,6 +1842,15 @@ mod tests {
             api.screen_name(&twitter).await.unwrap_err(),
             XError::Malformed
         );
+    }
+
+    /// 実際の x.com へ Cookie なしで 1 回だけ bootstrap する手動確認。`cargo test -- --ignored`。
+    #[tokio::test]
+    #[ignore = "実際の x.com に接続する"]
+    async fn live_anonymous_bootstrap_builds_a_generator() {
+        let transaction = XApi::new().bootstrap().await.expect("匿名 bootstrap");
+        let id = transaction.generate("GET", "/1.1/account/settings.json");
+        assert!(id.len() > 60 && !id.contains('='));
     }
 
     #[test]

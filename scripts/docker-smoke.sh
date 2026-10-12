@@ -17,26 +17,33 @@ SUFFIX="$$-$(date +%s)"
 PREFIX="angelic-smoke-$SUFFIX"
 INIT_VOLUME="$PREFIX-init"
 LISTEN_VOLUME="$PREFIX-listen"
+AUTOREG_VOLUME="$PREFIX-autoreg"
 LISTEN_CONTAINER="$PREFIX-listen"
+AUTOREG_CONTAINER="$PREFIX-autoreg"
 CERT_CONTAINER="$PREFIX-cert"
 ONESHOT_CONTAINER="$PREFIX-run"
-CONFIG=/data/angelic-angel.toml
+CONFIG=/config/angelic-angel.toml
+OTHER_CONFIG=/config/other.toml
 DUMMY_AUTH=dummy-auth-token
 DUMMY_CT0=dummy-ct0-token
+ENV_AUTH=dummy-env-auth-token
+ENV_CT0=dummy-env-ct0-token
 
 # Every resource name is recorded before it is created, so the trap only ever
 # removes resources owned by this run.
-OWNED_CONTAINERS=$LISTEN_CONTAINER$'\n'$CERT_CONTAINER$'\n'$ONESHOT_CONTAINER
-OWNED_VOLUMES=$INIT_VOLUME$'\n'$LISTEN_VOLUME
+OWNED_CONTAINERS=$LISTEN_CONTAINER$'\n'$AUTOREG_CONTAINER$'\n'$CERT_CONTAINER$'\n'$ONESHOT_CONTAINER
+OWNED_VOLUMES=$INIT_VOLUME$'\n'$LISTEN_VOLUME$'\n'$AUTOREG_VOLUME
 CERT_DIR=
 
 cleanup() {
   local status=$? name failed=0 resources
   trap - EXIT
-  if [ "$status" -ne 0 ] && docker container inspect "$LISTEN_CONTAINER" >/dev/null 2>&1; then
-    echo "--- logs of $LISTEN_CONTAINER ---" >&2
-    docker logs "$LISTEN_CONTAINER" >&2 || true
-  fi
+  for name in "$LISTEN_CONTAINER" "$AUTOREG_CONTAINER"; do
+    if [ "$status" -ne 0 ] && docker container inspect "$name" >/dev/null 2>&1; then
+      echo "--- logs of $name ---" >&2
+      docker logs "$name" >&2 || true
+    fi
+  done
   if resources=$(docker container ls -a --format '{{.Names}}'); then
     while IFS= read -r name; do
       [ -n "$name" ] || continue
@@ -95,7 +102,7 @@ app() {
   oneshot "$@"
 }
 
-# Helper runs as the application's UID/GID so it sees /data as the runtime does.
+# Helper runs as the application's UID/GID so it sees /config as the runtime does.
 helper() {
   oneshot --user 65532:65532 "$@"
 }
@@ -125,38 +132,90 @@ expect_contains help "$out" "listen"
 
 echo "== fresh volumes: init"
 # The application must be the first to mount each fresh volume so Docker copies
-# the image's /data (UID 65532, mode 700) into it.
+# the image's /config (UID 65532, mode 700) into it.
 for vol in "$INIT_VOLUME" "$LISTEN_VOLUME"; do
   docker volume create "$vol" >/dev/null
-  app -v "$vol:/data" "$IMAGE" init --auth-token "$DUMMY_AUTH" --ct0 "$DUMMY_CT0" >/dev/null 2>&1 \
+  app -v "$vol:/config" "$IMAGE" init --auth-token "$DUMMY_AUTH" --ct0 "$DUMMY_CT0" >/dev/null 2>&1 \
     || fail "init failed on $vol"
 done
+# This one stays without a config file: it only ever sees credentials from the environment.
+docker volume create "$AUTOREG_VOLUME" >/dev/null
+app -v "$AUTOREG_VOLUME:/config" "$IMAGE" status >/dev/null 2>&1 || fail "status failed on $AUTOREG_VOLUME"
 
 echo "== status and persistence"
-out=$(app -v "$INIT_VOLUME:/data" "$IMAGE" status 2>&1)
+out=$(app -v "$INIT_VOLUME:/config" "$IMAGE" status 2>&1)
 expect_contains status "$out" "$DUMMY_AUTH"
 expect_contains status "$out" "$DUMMY_CT0"
 expect_contains status "$out" "not registered"
 
+echo "== status with credentials from the environment"
+out=$(app -e "TWITTER_AUTH_TOKEN=$ENV_AUTH" -e "TWITTER_CSRF_TOKEN=$ENV_CT0" \
+  -v "$INIT_VOLUME:/config" "$IMAGE" status 2>&1)
+expect_contains env-status "$out" "from environment"
+case $out in
+  *"$ENV_AUTH"* | *"$ENV_CT0"* | *"$DUMMY_AUTH"*) fail "status leaked a credential value: $out" ;;
+esac
+out=$(app -e "TWITTER_AUTH_TOKEN=$ENV_AUTH" -v "$INIT_VOLUME:/config" "$IMAGE" status 2>&1)
+expect_contains half-env-status "$out" "TWITTER_CSRF_TOKEN is not"
+
+echo "== ANGELIC_ANGEL_CONFIG selects the config file"
+app -e "ANGELIC_ANGEL_CONFIG=$OTHER_CONFIG" -v "$INIT_VOLUME:/config" "$IMAGE" \
+  init --auth-token "$DUMMY_AUTH" --ct0 "$DUMMY_CT0" >/dev/null 2>&1 \
+  || fail "init with ANGELIC_ANGEL_CONFIG failed"
+out=$(app -e "ANGELIC_ANGEL_CONFIG=$OTHER_CONFIG" -v "$INIT_VOLUME:/config" "$IMAGE" status 2>&1)
+expect_contains config-env "$out" "$OTHER_CONFIG"
+out=$(helper -v "$INIT_VOLUME:/config" "$HELPER_IMAGE" sh -c "stat -c '%n %u' $OTHER_CONFIG") \
+  || fail "ANGELIC_ANGEL_CONFIG did not create $OTHER_CONFIG: $out"
+expect_contains config-env-file "$out" "$OTHER_CONFIG 65532"
+
 echo "== permissions"
-out=$(helper -v "$INIT_VOLUME:/data" "$HELPER_IMAGE" \
-  sh -c "stat -c '%n %u:%a' /data $CONFIG \
+out=$(helper -v "$INIT_VOLUME:/config" "$HELPER_IMAGE" \
+  sh -c "stat -c '%n %u:%a' /config $CONFIG \
     && test -r $CONFIG && test -w $CONFIG \
-    && touch /data/.smoke-write && rm /data/.smoke-write") \
-  || fail "helper cannot access /data as UID 65532: $out"
-expect_contains permissions "$out" "/data 65532:700"
+    && touch /config/.smoke-write && rm /config/.smoke-write") \
+  || fail "helper cannot access /config as UID 65532: $out"
+expect_contains permissions "$out" "/config 65532:700"
 expect_contains permissions "$out" "$CONFIG 65532:"
 
 echo "== listen without registration"
 set +e
-out=$(app -v "$INIT_VOLUME:/data" "$IMAGE" listen 2>&1)
+out=$(app -v "$INIT_VOLUME:/config" "$IMAGE" listen 2>&1)
 code=$?
 set -e
 [ "$code" -eq 1 ] || fail "listen without registration exited $code, expected 1: $out"
 expect_contains listen-missing "$out" "No registration found"
 
+echo "== listen with environment credentials: failed auto-registration"
+# Offline, so the automatic registration cannot succeed. It must fail for that reason
+# (not with "No registration found"), wait before exiting so a restart loop does not
+# hammer X, exit non-zero and write no credential into the config directory.
+docker run -d --name "$AUTOREG_CONTAINER" --network none \
+  -e "TWITTER_AUTH_TOKEN=$ENV_AUTH" -e "TWITTER_CSRF_TOKEN=$ENV_CT0" \
+  -v "$AUTOREG_VOLUME:/config" "$IMAGE" listen >/dev/null \
+  || fail "cannot start auto-registration container"
+i=0
+while [ "$i" -lt 90 ]; do
+  [ "$(docker inspect -f '{{.State.Running}}' "$AUTOREG_CONTAINER")" = "true" ] || break
+  sleep 1
+  i=$((i + 1))
+done
+[ "$(docker inspect -f '{{.State.Running}}' "$AUTOREG_CONTAINER")" != "true" ] \
+  || fail "auto-registration container did not exit within 90s: $(docker logs "$AUTOREG_CONTAINER" 2>&1)"
+out=$(docker logs "$AUTOREG_CONTAINER" 2>&1)
+[ "$(docker inspect -f '{{.State.ExitCode}}' "$AUTOREG_CONTAINER")" = "1" ] \
+  || fail "failed auto-registration exited with $(docker inspect -f '{{.State.ExitCode}}' "$AUTOREG_CONTAINER"), expected 1: $out"
+expect_contains autoreg "$out" "automatic registration failed"
+case $out in
+  *"No registration found. Run"*) fail "auto-registration was not attempted: $out" ;;
+  *"$ENV_AUTH"* | *"$ENV_CT0"*) fail "log leaked a credential value: $out" ;;
+esac
+docker rm "$AUTOREG_CONTAINER" >/dev/null || fail "cannot remove $AUTOREG_CONTAINER"
+helper -v "$AUTOREG_VOLUME:/config" "$HELPER_IMAGE" \
+  sh -c "! grep -rqF -e '$ENV_AUTH' -e '$ENV_CT0' /config" \
+  || fail "environment credentials were written under /config"
+
 echo "== listen offline with fabricated registration"
-helper -i -v "$LISTEN_VOLUME:/data" "$HELPER_IMAGE" sh -c "cat > $CONFIG" <<TOML \
+helper -i -v "$LISTEN_VOLUME:/config" "$HELPER_IMAGE" sh -c "cat > $CONFIG" <<TOML \
   || fail "cannot seed fabricated registration"
 [twitter]
 auth_token = "$DUMMY_AUTH"
@@ -174,10 +233,10 @@ public_key = [1, 2, 3]
 private_key = [1, 2, 3]
 auth_secret = [1, 2, 3]
 TOML
-out=$(app -v "$LISTEN_VOLUME:/data" "$IMAGE" status 2>&1)
+out=$(app -v "$LISTEN_VOLUME:/config" "$IMAGE" status 2>&1)
 expect_contains fabricated-status "$out" "active"
 
-docker run -d --name "$LISTEN_CONTAINER" --network none -v "$LISTEN_VOLUME:/data" "$IMAGE" >/dev/null \
+docker run -d --name "$LISTEN_CONTAINER" --network none -v "$LISTEN_VOLUME:/config" "$IMAGE" >/dev/null \
   || fail "cannot start listener"
 seen=0
 i=0

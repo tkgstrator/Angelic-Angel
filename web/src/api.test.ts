@@ -10,20 +10,34 @@ const invalid = [
   ['not an object', 'all'],
   ['empty object', {}],
   ['missing key', { tweet: true, other: true }],
+  ['missing retweet', { tweet: true, xchat_message_received: true, other: true }],
+  ['missing quote and reply', { ...allowAll, quote: undefined, reply: undefined }],
+  ['missing quote', { ...allowAll, quote: undefined }],
+  ['missing reply', { ...allowAll, reply: undefined }],
   ['string instead of boolean', { ...allowAll, other: 'true' }],
   ['number instead of boolean', { ...allowAll, tweet: 1 }],
   ['null value', { ...allowAll, xchat_message_received: null }],
+  ['null retweet', { ...allowAll, retweet: null }],
+  ['string retweet', { ...allowAll, retweet: 'false' }],
+  ['null quote', { ...allowAll, quote: null }],
+  ['string quote', { ...allowAll, quote: 'false' }],
+  ['null reply', { ...allowAll, reply: null }],
+  ['number reply', { ...allowAll, reply: 0 }],
 ] as const
 
 describe('notificationFilterSchema', () => {
   it('accepts all boolean combinations', () => {
-    for (const tweet of [true, false]) {
-      for (const xchat_message_received of [true, false]) {
-        for (const other of [true, false]) {
-          const filter = { tweet, xchat_message_received, other }
-          expect(notificationFilterSchema.parse(filter)).toEqual(filter)
-        }
+    for (const bits of Array.from({ length: 64 }, (_, n) => n)) {
+      const on = (bit: number) => (bits & (1 << bit)) !== 0
+      const filter = {
+        tweet: on(0),
+        retweet: on(1),
+        quote: on(2),
+        reply: on(3),
+        xchat_message_received: on(4),
+        other: on(5),
       }
+      expect(notificationFilterSchema.parse(filter)).toEqual(filter)
     }
   })
 
@@ -65,7 +79,14 @@ describe('notification_filter at the API boundary', () => {
   })
 
   it('passes valid filters through unchanged', async () => {
-    const filter = { tweet: false, xchat_message_received: true, other: false }
+    const filter = {
+      tweet: false,
+      retweet: false,
+      quote: false,
+      reply: true,
+      xchat_message_received: true,
+      other: false,
+    }
     mockApi({
       'GET /api/settings': () => json(settings({ notification_filter: filter })),
       [FIRST]: () => json(page(['a'], null, filter)),

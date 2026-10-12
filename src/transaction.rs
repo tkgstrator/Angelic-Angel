@@ -3,6 +3,7 @@
 
 use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
 use regex::Regex;
+use reqwest::Url;
 use sha2::{Digest, Sha256};
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,6 +53,19 @@ static SVG_ANIMATION: LazyLock<Regex> = LazyLock::new(|| {
         r#"<(?i-u:svg)[^>]*(?i-u:id)=["'](?i-u:loading-x-anim-)[0-9]+["'][^>]*>(?s:.)*?</(?i-u:svg)>"#,
     )
 });
+/// 上流 discovery.ts の `<script src>` 抽出。ASCII の空白と境界だけを使う。
+static SCRIPT_SRC: LazyLock<Regex> = LazyLock::new(|| {
+    compile(
+        r#"<(?i-u:script)(?-u:\b)[^>]*(?-u:\b)(?i-u:src)(?-u:\s)*=(?-u:\s)*["']([^"']+)["'][^>]*>"#,
+    )
+});
+/// 上流 discovery.ts の import / dynamic import / re-export 抽出。
+static MODULE_IMPORT: LazyLock<Regex> = LazyLock::new(|| {
+    compile(
+        r#"(?-u:\b)(?:import(?-u:\s)*\((?-u:\s)*|import(?-u:\s)*(?:[^"'`;]*?(?-u:\b)from(?-u:\s)*)?|export(?-u:\s)+[^;]*?(?-u:\b)from(?-u:\s)*)["'`]([^"'`]+)["'`]"#,
+    )
+});
+static SIGNER_PATH: LazyLock<Regex> = LazyLock::new(|| compile(r"/sign[.-][^/]*\.js(?:\?|$)"));
 static PATH_D: LazyLock<Regex> =
     LazyLock::new(|| compile(r#"<(?i-u:path)[^>]*(?i-u:d)=["']([^"']+)["']"#));
 
@@ -218,6 +232,63 @@ pub fn ondemand_file_hash(home_html: &str) -> Option<&str> {
         .find(|caps| caps.get(1).is_some_and(|m| m.as_str() == index))
         .and_then(|caps| caps.get(2))
         .map(|m| m.as_str())
+}
+
+/// 取得してよい署名モジュールの URL か。`asset_base` と同一オリジンで、`/x-web/` 配下の `.js` だけを通す。
+pub fn asset_url(value: &str, base: &Url, asset_base: &Url) -> Option<Url> {
+    if value.contains("${") {
+        return None;
+    }
+    let url = base.join(value).ok()?;
+    let allowed = url.origin() == asset_base.origin()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path().starts_with("/x-web/")
+        && url.path().ends_with(".js");
+    allowed.then_some(url)
+}
+
+/// ホーム HTML の `<script src>` のうち、探索の起点にする `entry-client` モジュール。
+pub fn entry_script_urls(html: &str, base: &Url, asset_base: &Url) -> Vec<Url> {
+    SCRIPT_SRC
+        .captures_iter(html)
+        .filter_map(|caps| asset_url(caps.get(1)?.as_str(), base, asset_base))
+        .filter(|url| url.as_str().contains("entry-client"))
+        .collect()
+}
+
+/// モジュールが import / re-export する署名候補 URL。重複は初出の順に畳む。
+pub fn module_import_urls(source: &str, base: &Url, asset_base: &Url) -> Vec<Url> {
+    let mut urls: Vec<Url> = Vec::new();
+    for caps in MODULE_IMPORT.captures_iter(source) {
+        let Some(url) = caps
+            .get(1)
+            .and_then(|value| asset_url(value.as_str(), base, asset_base))
+        else {
+            continue;
+        };
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+    urls
+}
+
+/// 現行の署名モジュール (`sign.o-*.js`) の URL か。
+pub fn is_signer_url(url: &Url) -> bool {
+    SIGNER_PATH.is_match(url.as_str())
+}
+
+/// 探索の優先度。小さいほど先に取得する。
+pub fn module_priority(url: &Url) -> u8 {
+    let text = url.as_str();
+    if text.contains("/sign.") || text.contains("/sign-") {
+        0
+    } else if text.contains("sentry") || text.contains("transaction") {
+        1
+    } else {
+        2
+    }
 }
 
 /// ondemand.s から (行を選ぶ添字, 残りのキーバイト添字) を取り出す。
@@ -474,8 +545,13 @@ pub(crate) mod fixture {
         (0..70u32).map(|i| ((i * 37 + 11) % 256) as u8).collect()
     }
 
-    /// 合成したホーム HTML。本物の X のデータは含まない。
+    /// 合成したホーム HTML (旧 webpack の ondemand.s 対応表つき)。本物の X のデータは含まない。
     pub fn home_html() -> String {
+        home_html_with(true, "")
+    }
+
+    /// `legacy` なら ondemand.s の対応表を含め、`body_extra` を body の末尾に足す。
+    pub fn home_html_with(legacy: bool, body_extra: &str) -> String {
         let frames: String = (0..4u32)
             .map(|frame| {
                 let rows: Vec<String> = (0..16u32)
@@ -492,8 +568,15 @@ pub(crate) mod fixture {
                 )
             })
             .collect();
+        let manifest = if legacy {
+            format!(
+                r#"<script>{{1:"x",20113:"ondemand.s"}}{{1:"y",20113:"{ONDEMAND_HASH}"}}</script>"#
+            )
+        } else {
+            String::new()
+        };
         format!(
-            r#"<html><head><meta name="twitter-site-verification" content="{}"></head><body><script>{{1:"x",20113:"ondemand.s"}}{{1:"y",20113:"{ONDEMAND_HASH}"}}</script>{frames}</body></html>"#,
+            r#"<html><head><meta name="twitter-site-verification" content="{}"></head><body>{manifest}{frames}{body_extra}</body></html>"#,
             STANDARD.encode(key_bytes())
         )
     }
@@ -641,6 +724,9 @@ mod tests {
             &VERIFICATION_KEY,
             &SVG_ANIMATION,
             &PATH_D,
+            &SCRIPT_SRC,
+            &MODULE_IMPORT,
+            &SIGNER_PATH,
         ] {
             let _ = pattern.as_str();
         }
@@ -726,6 +812,235 @@ mod tests {
         assert_ne!(
             transaction.generate_with("GET", "/1.1/account/settings.json", 1001, 0),
             id
+        );
+    }
+
+    fn abs(path: &str) -> Url {
+        Url::parse("https://abs.twimg.com")
+            .unwrap()
+            .join(path)
+            .unwrap()
+    }
+
+    fn import_paths(source: &str) -> Vec<String> {
+        let base = abs("/x-web/x-web/entry-client-logged-out-abc.js");
+        let asset_base = abs("/");
+        module_import_urls(source, &base, &asset_base)
+            .iter()
+            .map(|url| url.as_str().replace("https://abs.twimg.com", ""))
+            .collect()
+    }
+
+    /// 期待値は PR #5 (c6400ea) の discovery.ts に同じ入力を与えて記録した取得順。
+    #[test]
+    fn module_imports_match_the_upstream_discovery_order() {
+        let cases: [(&str, &[&str]); 8] = [
+            (
+                r#"import a from"./a.js";import{b}from './b.js';export*from"./c.js";export{d}from'./d.js';import"./e.js";import("./f.js");import
+(
+"./g.js");import(`./h.js`);import x,{y}from"./i.js";const important="./nope.js";import q from"./a.js";import.meta.url;"#,
+                &[
+                    "/x-web/x-web/a.js",
+                    "/x-web/x-web/b.js",
+                    "/x-web/x-web/e.js",
+                    "/x-web/x-web/f.js",
+                    "/x-web/x-web/g.js",
+                    "/x-web/x-web/h.js",
+                    "/x-web/x-web/i.js",
+                ],
+            ),
+            (
+                r#"import"./a.js?x=1#h";import"../up.js";import"/x-web/abs.js";import"//abs.twimg.com/x-web/schemeless.js";import"./data.json";import"https://abs.twimg.com:443/x-web/port443.js";import"https://abs.twimg.com:8443/x-web/port.js";import"https://user@abs.twimg.com/x-web/user.js";import"HTTPS://ABS.TWIMG.COM/x-web/upper.js";import"./a/../norm.js";import"http://abs.twimg.com/x-web/http.js";import"https://abs.twimg.com/other/outside.js";"#,
+                &[
+                    "/x-web/x-web/a.js?x=1#h",
+                    "/x-web/up.js",
+                    "/x-web/abs.js",
+                    "/x-web/schemeless.js",
+                    "/x-web/port443.js",
+                    "/x-web/upper.js",
+                    "/x-web/x-web/norm.js",
+                ],
+            ),
+            (
+                r#"import(`./${x}.js`);import(`./ok.js`);import"./a${b}.js";"#,
+                &["/x-web/x-web/ok.js"],
+            ),
+            (
+                r#"import a from `./t1.js`;export * from './t2.js';export{x as y} from"./t3.js";import{z}from"./t4.js""#,
+                &[
+                    "/x-web/x-web/t1.js",
+                    "/x-web/x-web/t2.js",
+                    "/x-web/x-web/t4.js",
+                ],
+            ),
+            (
+                r#"let from="./nope.js";import x;import("./real.js");export default from;import{a}from"./b.js""#,
+                &["/x-web/x-web/real.js", "/x-web/x-web/b.js"],
+            ),
+            (
+                "import {\n  a,\n  b\n} from\n  \"./ml.js\";\nexport {\n  c\n} from\n\"./ml2.js\";",
+                &["/x-web/x-web/ml.js", "/x-web/x-web/ml2.js"],
+            ),
+            (
+                r#"import"./a.js";import"./a.js";import"./b.js";import"./a.js""#,
+                &["/x-web/x-web/a.js", "/x-web/x-web/b.js"],
+            ),
+            ("", &[]),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(import_paths(source), expected, "{source}");
+        }
+    }
+
+    /// 期待値は merge 後の上流 discovery.ts (85197cf) に同じ HTML を与えて記録した最初の取得先。
+    #[test]
+    fn entry_scripts_match_the_upstream_html_variants() {
+        let home = Url::parse("https://x.com/").unwrap();
+        let asset_base = abs("/");
+        let e = "https://abs.twimg.com/x-web/x-web/entry-client-logged-out-abc.js";
+        let second = "https://abs.twimg.com/x-web/x-web/entry-client-second.js";
+        let cases: Vec<(String, Vec<&str>)> =
+            vec![
+            (format!(r#"<script type="module" src="{e}"></script>"#), vec![e]),
+            (format!("<SCRIPT TYPE=\"module\" SRC='{e}'></SCRIPT>"), vec![e]),
+            (format!(r#"<script src  =  "{e}" async></script>"#), vec![e]),
+            (format!(r#"<script data-src="{e}"></script>"#), vec![e]),
+            (format!(r#"<scripts src="{e}"></scripts>"#), vec![]),
+            (format!("<script src={e}></script>"), vec![]),
+            (r#"<script src="/x-web/x-web/entry-client-rel.js"></script>"#.into(), vec![]),
+            (
+                r#"<script src="x-web/x-web/entry-client-dot.js"></script>"#.into(),
+                vec![],
+            ),
+            (
+                r#"<script src="https://abs.twimg.com/x-web/x-web/other-abc.js"></script>"#.into(),
+                vec![],
+            ),
+            (
+                r#"<script src="https://evil.example/x-web/entry-client-x.js"></script>"#.into(),
+                vec![],
+            ),
+            (
+                r#"<script src="http://abs.twimg.com/x-web/x-web/entry-client-http.js"></script>"#
+                    .into(),
+                vec![],
+            ),
+            (
+                r#"<script src="https://abs.twimg.com/other/entry-client-x.js"></script>"#.into(),
+                vec![],
+            ),
+            (
+                format!(r#"<script src="{e}"></script><script src="{second}"></script>"#),
+                vec![e, second],
+            ),
+            (
+                r#"<script src="https://abs.twimg.com/x-web/x-web/a.js?entry-client"></script>"#
+                    .into(),
+                vec!["https://abs.twimg.com/x-web/x-web/a.js?entry-client"],
+            ),
+            (
+                format!("<script\n  type=\"module\"\n  src=\"{e}\"\n></script>"),
+                vec![e],
+            ),
+            (format!(r#"<script>var s="src='{e}'"</script>"#), vec![]),
+        ];
+        for (html, expected) in cases {
+            let urls: Vec<String> = entry_script_urls(&html, &home, &asset_base)
+                .iter()
+                .map(|url| url.as_str().to_string())
+                .collect();
+            let mut unique = urls.clone();
+            unique.dedup();
+            assert_eq!(unique, expected, "{html}");
+        }
+    }
+
+    #[test]
+    fn signer_names_and_priorities_follow_upstream() {
+        let signer = |path: &str| is_signer_url(&abs(path));
+        assert!(signer("/x-web/x-web/assets/sign.o-CaaduMJe.js"));
+        assert!(signer("/x-web/x-web/assets/sign-x.js?v=1"));
+        assert!(signer("/x-web/x-web/assets/sign.json.js"));
+        assert!(!signer("/x-web/x-web/assets/design.js"));
+        assert!(!signer("/x-web/x-web/assets/signature.js"));
+        assert!(!signer("/x-web/sign.o-a.js/other.js"));
+        assert!(!signer("/x-web/x-web/assets/sign.o-a.mjs"));
+
+        let priority = |path: &str| module_priority(&abs(path));
+        assert_eq!(priority("/x-web/x-web/assets/sign.o-a.js"), 0);
+        assert_eq!(priority("/x-web/x-web/assets/sign-a.js"), 0);
+        assert_eq!(priority("/x-web/x-web/assets/sentry-filter-a.js"), 1);
+        assert_eq!(
+            priority("/x-web/x-web/assets/client-transaction-id-plugin-a.js"),
+            1
+        );
+        assert_eq!(priority("/x-web/x-web/assets/design.js"), 2);
+        assert_eq!(priority("/x-web/x-web/assets/signature.js"), 2);
+    }
+
+    #[test]
+    fn entry_scripts_come_only_from_the_asset_origin() {
+        let home = Url::parse("https://x.com/").unwrap();
+        let asset_base = abs("/");
+        let entries = |html: &str| -> Vec<String> {
+            entry_script_urls(html, &home, &asset_base)
+                .iter()
+                .map(|url| url.as_str().to_string())
+                .collect()
+        };
+        let entry = "https://abs.twimg.com/x-web/x-web/entry-client-logged-out-abc.js";
+        assert_eq!(
+            entries(&format!(
+                r#"<script type="module" async src="{entry}" nonce="n"></script>"#
+            )),
+            [entry]
+        );
+        assert_eq!(
+            entries(&format!("<SCRIPT TYPE='module' SRC='{entry}'></SCRIPT>")),
+            [entry]
+        );
+        assert_eq!(
+            entries(&format!(
+                "<script\n  type=\"module\"\n  src=\"{entry}\"\n></script>"
+            )),
+            [entry]
+        );
+        assert_eq!(
+            entries(r#"<script src="https://abs.twimg.com/x-web/x-web/other-abc.js"></script>"#),
+            Vec::<String>::new()
+        );
+        for hostile in [
+            "https://evil.example/x-web/entry-client-x.js",
+            "http://abs.twimg.com/x-web/x-web/entry-client-x.js",
+            "https://abs.twimg.com/other/entry-client-x.js",
+            "https://abs.twimg.com/x-web/entry-client-x.json",
+            "https://user@abs.twimg.com/x-web/entry-client-x.js",
+            "https://abs.twimg.com:8443/x-web/entry-client-x.js",
+            "//evil.example/x-web/entry-client-x.js",
+        ] {
+            assert!(
+                entries(&format!(r#"<script src="{hostile}"></script>"#)).is_empty(),
+                "{hostile}"
+            );
+        }
+        assert_eq!(
+            entries(r#"<script src="/x-web/x-web/entry-client-rel.js"></script>"#),
+            Vec::<String>::new(),
+            "x.com 起点の相対パスは abs.twimg.com ではないので通さない"
+        );
+    }
+
+    /// PR #5 のフィクスチャを現行 X の生成器で取った期待値 (時刻・乱数固定) と照合する。
+    /// フィクスチャは qtmleap/x-transaction の `src/fixtures/` で、公開されている X のモジュールの抜粋。
+    #[test]
+    fn matches_the_native_generator_of_the_current_x_web_assets() {
+        let html = include_str!("../scripts/fixtures/x-web-home.html");
+        let signer = include_str!("../scripts/fixtures/x-web-sign.js");
+        let transaction = Transaction::new(html, signer).unwrap();
+        let time = (1_700_000_000_000_i64 - TWITTER_EPOCH_MS).div_euclid(1000);
+        assert_eq!(
+            transaction.generate_with("GET", "/i/api/graphql/test/Test", time, 128),
+            "gARMwg5e+JFOvnM1sC+kcsC3oVQaD2Oo7qigITAc/z4cvThEGg5Ei8OAaRmhA/iPbRANhIElp9rZbwoVr/tz+nJbBfEhgw"
         );
     }
 

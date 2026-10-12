@@ -10,8 +10,8 @@ services:
         required: false
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # Mount the directory, not the file: saves go through a temp file + rename, and the
+    # lock and the notification history live next to the config. It must be writable by
+    # UID 65532 (`sudo chown 65532:65532 config`).
     volumes:
-      - angelic-angel-data:/data
-
-volumes:
-  angelic-angel-data:
+      - ./config:/config

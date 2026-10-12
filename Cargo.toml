@@ -1,6 +1,6 @@
 [package]
 name = "angelic-angel"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -29,4 +29,5 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 tower-http = { version = "0.6", default-features = false, features = ["fs"] }
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 sha2 = "0.10"
+hmac = "0.12"
 regex = { version = "1", default-features = false, features = ["std", "perf"] }

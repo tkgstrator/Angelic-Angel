@@ -199,17 +199,20 @@ describe('Settings', () => {
 const checkbox = (name: string | RegExp) => screen.getByRole('checkbox', { name })
 const FILTER_NAMES = [
   /投稿（tweet）/,
+  /リツイート（RT）/,
+  /引用RT/,
+  /リプライ/,
   /チャット（xchat_message_received）/,
   /その他・未指定/,
 ] as const
 
 describe('Settings notification filter', () => {
-  it('lists the three kinds, all enabled by default, with the explanation', async () => {
+  it('lists the six kinds, all enabled by default, with the explanation', async () => {
     mockApi(settingsRoutes())
     render(<Settings />)
     await screen.findByLabelText(/auth_token/)
     const group = screen.getByRole('group', { name: '通知フィルター' })
-    expect(within(group).getAllByRole('checkbox')).toHaveLength(3)
+    expect(within(group).getAllByRole('checkbox')).toHaveLength(6)
     for (const name of FILTER_NAMES) expect(checkbox(name)).toBeChecked()
     expect(
       within(group).getByText(
@@ -226,12 +229,63 @@ describe('Settings notification filter', () => {
     })
     render(<Settings />)
     await screen.findByLabelText(/auth_token/)
-    expect(checkbox(FILTER_NAMES[0])).toBeChecked()
-    expect(checkbox(FILTER_NAMES[1])).not.toBeChecked()
-    expect(checkbox(FILTER_NAMES[2])).toBeChecked()
+    const chat = FILTER_NAMES[4]
+    for (const name of FILTER_NAMES.filter((n) => n !== chat)) expect(checkbox(name)).toBeChecked()
+    expect(checkbox(chat)).not.toBeChecked()
   })
 
-  it('saves all three kinds together with the form and keeps them after a reload', async () => {
+  it('toggles quotes and replies independently of each other and of retweets', async () => {
+    const body = { current: {} as { notification_filter?: NotificationFilter } }
+    mockApi({
+      ...settingsRoutes(),
+      'GET /api/settings': () =>
+        json(settings({ notification_filter: filterOf({ quote: false }) })),
+      [PUT]: (init) => {
+        body.current = JSON.parse(String(init.body))
+        return json(settings({ notification_filter: filterOf({ reply: false }) }))
+      },
+    })
+    render(<Settings />)
+    await screen.findByLabelText(/auth_token/)
+    expect(checkbox(/引用RT/)).not.toBeChecked()
+    expect(checkbox(/リプライ/)).toBeChecked()
+    expect(checkbox(/リツイート（RT）/)).toBeChecked()
+
+    await userEvent.click(checkbox(/リプライ/))
+    expect(checkbox(/引用RT/)).not.toBeChecked()
+    expect(checkbox(/リプライ/)).not.toBeChecked()
+    expect(checkbox(/リツイート（RT）/)).toBeChecked()
+    expect(checkbox(/投稿（tweet）/)).toBeChecked()
+
+    await userEvent.click(checkbox(/引用RT/))
+    await save()
+    await screen.findByText('保存しました。')
+    expect(body.current.notification_filter).toEqual(filterOf({ reply: false }))
+  })
+
+  it('toggles the retweet kind independently of tweets', async () => {
+    const body = { current: {} as { notification_filter?: NotificationFilter } }
+    mockApi({
+      ...settingsRoutes(),
+      'GET /api/settings': () =>
+        json(settings({ notification_filter: filterOf({ retweet: false }) })),
+      [PUT]: (init) => {
+        body.current = JSON.parse(String(init.body))
+        return json(settings({ notification_filter: filterOf({ retweet: false }) }))
+      },
+    })
+    render(<Settings />)
+    await screen.findByLabelText(/auth_token/)
+    expect(checkbox(/リツイート（RT）/)).not.toBeChecked()
+    expect(checkbox(/投稿（tweet）/)).toBeChecked()
+    await userEvent.click(checkbox(/投稿（tweet）/))
+    await userEvent.click(checkbox(/リツイート（RT）/))
+    await save()
+    await screen.findByText('保存しました。')
+    expect(body.current.notification_filter).toEqual(filterOf({ tweet: false }))
+  })
+
+  it('saves all six kinds together with the form and keeps them after a reload', async () => {
     let stored = filterOf()
     let body: { notification_filter?: NotificationFilter } = {}
     mockApi({
@@ -248,10 +302,16 @@ describe('Settings notification filter', () => {
     await userEvent.click(checkbox(FILTER_NAMES[0]))
     await userEvent.click(checkbox(FILTER_NAMES[1]))
     await userEvent.click(checkbox(FILTER_NAMES[2]))
+    await userEvent.click(checkbox(FILTER_NAMES[3]))
+    await userEvent.click(checkbox(FILTER_NAMES[4]))
+    await userEvent.click(checkbox(FILTER_NAMES[5]))
     await save()
     await screen.findByText('保存しました。')
     expect(body.notification_filter).toEqual({
       tweet: false,
+      retweet: false,
+      quote: false,
+      reply: false,
       xchat_message_received: false,
       other: false,
     })
@@ -261,10 +321,12 @@ describe('Settings notification filter', () => {
     render(<Settings />)
     await screen.findByLabelText(/auth_token/)
     for (const name of FILTER_NAMES) expect(checkbox(name)).not.toBeChecked()
-    await userEvent.click(checkbox(FILTER_NAMES[1]))
+    await userEvent.click(checkbox(FILTER_NAMES[4]))
     await save()
     await waitFor(() =>
-      expect(body.notification_filter).toEqual(filterOf({ tweet: false, other: false })),
+      expect(body.notification_filter).toEqual(
+        filterOf({ tweet: false, retweet: false, quote: false, reply: false, other: false }),
+      ),
     )
   })
 
@@ -277,7 +339,7 @@ describe('Settings notification filter', () => {
     await screen.findByLabelText(/auth_token/)
     await save()
     await screen.findByText('保存しました。')
-    expect(checkbox(FILTER_NAMES[2])).not.toBeChecked()
+    expect(checkbox(FILTER_NAMES[5])).not.toBeChecked()
     expect(checkbox(FILTER_NAMES[0])).toBeChecked()
   })
 

@@ -6,13 +6,16 @@
 
 use crate::config::NotificationFilter;
 use crate::error::{AngelicAngelError, Result};
+use crate::tweet_lookup::{TweetLookup, TweetShape};
+use regex::Regex;
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const BACKFILL_CHUNK: i64 = 200;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PAGE_LIMIT: usize = 100;
@@ -45,51 +48,123 @@ PRAGMA user_version = {SCHEMA_VERSION};
     )
 }
 
-/// `data.type` から決まる通知の区分。
+/// 通知の区分。`data.type` から決まるが、`Retweet` は X の `data.type` に無く、投稿の中身から導く。
+/// `Quote` と `Reply` は payload だけでは判別できず、[`resolve_kind`] が公開 API への照会で決める。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationKind {
     Tweet,
+    Retweet,
+    Quote,
+    Reply,
     XchatMessageReceived,
     Other,
 }
 
 impl NotificationKind {
-    const KNOWN: [NotificationKind; 2] = [Self::Tweet, Self::XchatMessageReceived];
+    /// X が `data.type` に載せる値。`Retweet`・`Quote`・`Reply` は含まない。
+    const DATA_TYPES: [NotificationKind; 2] = [Self::Tweet, Self::XchatMessageReceived];
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Tweet => "tweet",
+            Self::Retweet => "retweet",
+            Self::Quote => "quote",
+            Self::Reply => "reply",
             Self::XchatMessageReceived => "xchat_message_received",
             Self::Other => "other",
         }
     }
 
+    /// payload の `data.type` を読む。`"retweet"`・`"quote"`・`"reply"` という `data.type` は存在しないので `Other` にする。
     fn from_data_type(value: &str) -> Self {
-        Self::KNOWN
+        Self::DATA_TYPES
             .into_iter()
             .find(|kind| kind.as_str() == value)
             .unwrap_or(Self::Other)
     }
+
+    /// DB の `kind` 列に保存した文字列を戻す。
+    fn from_stored(value: &str) -> Self {
+        [Self::Retweet, Self::Quote, Self::Reply]
+            .into_iter()
+            .find(|kind| kind.as_str() == value)
+            .unwrap_or_else(|| Self::from_data_type(value))
+    }
+}
+
+static RETWEET_URI: LazyLock<Regex> = LazyLock::new(|| compile(r"^/[^/]+/status/([0-9]+)$"));
+static RETWEET_TAG: LazyLock<Regex> = LazyLock::new(|| compile(r"^tweet-([0-9]+)$"));
+
+fn compile(pattern: &str) -> Regex {
+    Regex::new(pattern).expect("静的パターンは常にコンパイルできる")
 }
 
 /// `notification.data.type` を優先し、文字列が無いときだけ外側の `data.type` を読む。
+/// `type` が `tweet` で、同じ `data` の `uri`（元ツイート）と `tag`（通知自身）の ID が
+/// 食い違うときだけ `Retweet` とする。どちらかが欠けるか形式が違えば `Tweet` のまま残す。
 /// 本文や `scribe_target` からは推定しない。
 pub fn classify(payload: &Value) -> NotificationKind {
-    let data_type = |scope: &Value| {
-        scope
-            .get("data")
-            .and_then(|data| data.get("type"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
+    let Some((data, data_type)) = typed_data(payload) else {
+        return NotificationKind::Other;
     };
+    match NotificationKind::from_data_type(data_type) {
+        NotificationKind::Tweet if is_retweet(data) => NotificationKind::Retweet,
+        kind => kind,
+    }
+}
+
+/// `notification.data` を優先し、そこに文字列の `type` が無いときだけ外側の `data` を読む。
+fn typed_data(payload: &Value) -> Option<(&Value, &str)> {
+    fn scoped(scope: &Value) -> Option<(&Value, &str)> {
+        let data = scope.get("data")?;
+        let data_type = data.get("type")?.as_str()?;
+        Some((data, data_type))
+    }
     payload
         .get("notification")
-        .and_then(data_type)
-        .or_else(|| data_type(payload))
-        .map_or(NotificationKind::Other, |value| {
-            NotificationKind::from_data_type(&value)
-        })
+        .and_then(scoped)
+        .or_else(|| scoped(payload))
+}
+
+/// `data` の文字列 `key` が `pattern` に合うとき、その最初のキャプチャ（ツイート ID）を返す。
+fn captured_id(data: &Value, key: &str, pattern: &Regex) -> Option<String> {
+    let text = data.get(key)?.as_str()?;
+    Some(pattern.captures(text)?.get(1)?.as_str().to_owned())
+}
+
+fn is_retweet(data: &Value) -> bool {
+    match (
+        captured_id(data, "uri", &RETWEET_URI),
+        captured_id(data, "tag", &RETWEET_TAG),
+    ) {
+        (Some(source), Some(own)) => source != own,
+        _ => false,
+    }
+}
+
+/// 通知自身のツイート ID（`classify` と同じ `data` の `tag` が `tweet-<数字>` のとき）。
+fn tweet_id(payload: &Value) -> Option<String> {
+    let (data, _) = typed_data(payload)?;
+    captured_id(data, "tag", &RETWEET_TAG)
+}
+
+/// 履歴とフィルターに使う最終的な区分。
+/// 公開 API に照会するのは `classify` が `Tweet` とした投稿だけにする。リツイートの ID を照会すると
+/// 元ツイートの形が返り、引用RT と誤判定するため。照会できなかったときは `Tweet` のまま残す。
+pub async fn resolve_kind(payload: &Value, lookup: &TweetLookup) -> NotificationKind {
+    let kind = classify(payload);
+    if kind != NotificationKind::Tweet {
+        return kind;
+    }
+    let Some(id) = tweet_id(payload) else {
+        return kind;
+    };
+    match lookup.shape(&id).await {
+        Some(TweetShape::Reply) => NotificationKind::Reply,
+        Some(TweetShape::Quote) => NotificationKind::Quote,
+        Some(TweetShape::Plain) | None => kind,
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,9 +188,20 @@ pub struct NotificationPage {
     pub notification_filter: NotificationFilter,
 }
 
-/// Records a received notification. A repeated `id` is ignored.
+/// Records a received notification as `kind`. A repeated `id` is ignored.
+pub fn append_as(
+    config_path: &Path,
+    id: &str,
+    payload: &Value,
+    kind: NotificationKind,
+) -> Result<()> {
+    append_with_timeout(config_path, id, payload, kind, now_secs(), BUSY_TIMEOUT)
+}
+
+/// payload から `classify` した区分で記録する。
+#[cfg(test)]
 pub fn append(config_path: &Path, id: &str, payload: &Value) -> Result<()> {
-    append_at(config_path, id, payload, now_secs())
+    append_as(config_path, id, payload, classify(payload))
 }
 
 /// フィルターを適用せずに一覧を返す。
@@ -177,8 +263,13 @@ fn list_with_timeout(
                 "SELECT id, received_at, title, body, url, icon, payload, kind FROM notifications \
                  WHERE seq < ?1 AND ( \
                      (kind = 'tweet' AND ?3) \
-                     OR (kind = 'xchat_message_received' AND ?4) \
-                     OR (kind NOT IN ('tweet', 'xchat_message_received') AND ?5) \
+                     OR (kind = 'retweet' AND ?4) \
+                     OR (kind = 'quote' AND ?5) \
+                     OR (kind = 'reply' AND ?6) \
+                     OR (kind = 'xchat_message_received' AND ?7) \
+                     OR (kind NOT IN ( \
+                         'tweet', 'retweet', 'quote', 'reply', 'xchat_message_received' \
+                     ) AND ?8) \
                  ) ORDER BY seq DESC LIMIT ?2",
             )
             .map_err(db_error)?;
@@ -188,6 +279,9 @@ fn list_with_timeout(
                 before_seq,
                 fetch,
                 filter.tweet,
+                filter.retweet,
+                filter.quote,
+                filter.reply,
                 filter.xchat_message_received,
                 filter.other
             ],
@@ -204,7 +298,7 @@ fn list_with_timeout(
                     url: url.as_deref().and_then(sanitize_link),
                     icon: icon.as_deref().and_then(sanitize_icon),
                     payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
-                    kind: NotificationKind::from_data_type(&kind),
+                    kind: NotificationKind::from_stored(&kind),
                 })
             },
         )
@@ -226,8 +320,10 @@ fn list_with_timeout(
     })
 }
 
+#[cfg(test)]
 fn append_at(config_path: &Path, id: &str, payload: &Value, received_at: u64) -> Result<()> {
-    append_with_timeout(config_path, id, payload, received_at, BUSY_TIMEOUT)
+    let kind = classify(payload);
+    append_with_timeout(config_path, id, payload, kind, received_at, BUSY_TIMEOUT)
 }
 
 /// Stores the entry and returns `Ok` only once the transaction has committed (or the id was
@@ -236,6 +332,7 @@ fn append_with_timeout(
     config_path: &Path,
     id: &str,
     payload: &Value,
+    kind: NotificationKind,
     received_at: u64,
     busy_timeout: Duration,
 ) -> Result<()> {
@@ -244,7 +341,7 @@ fn append_with_timeout(
             "invalid notification id".to_string(),
         ));
     }
-    let item = build_item(id, payload, received_at);
+    let item = build_item(id, payload, kind, received_at);
     let mut conn = open(&history_path(config_path), busy_timeout)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -301,7 +398,7 @@ fn user_version(conn: &Connection) -> Result<i64> {
         .map_err(db_error)
 }
 
-/// 新規作成と v1→v2 を単一の書き込みトランザクションで行う。
+/// 新規作成と v1→v2、v2→v3 を単一の書き込みトランザクションで行う。
 /// 他プロセスの完了を待つ間に状況が変わるため、ロック取得後に版を読み直す。
 fn migrate(conn: &mut Connection) -> Result<()> {
     let tx = conn
@@ -309,7 +406,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         .map_err(db_error)?;
     match user_version(&tx)? {
         0 => tx.execute_batch(&schema_sql()).map_err(db_error)?,
+        // v1→v2 は現在の `classify` で全行を分類し直すので、そのまま最新の版になる。
         1 => migrate_v1_to_v2(&tx)?,
+        2 => migrate_v2_to_v3(&tx)?,
         SCHEMA_VERSION => {},
         _ => return Err(unsupported_schema()),
     }
@@ -325,18 +424,33 @@ fn unsupported_schema() -> AngelicAngelError {
 fn migrate_v1_to_v2(tx: &Connection) -> Result<()> {
     tx.execute_batch("ALTER TABLE notifications ADD COLUMN kind TEXT NOT NULL DEFAULT 'other'")
         .map_err(db_error)?;
+    reclassify(tx, None)?;
+    set_schema_version(tx)
+}
+
+/// `retweet` 区分の導入前に `tweet` として保存された行のうち、リツイートだったものを分類し直す。
+/// 切り詰め済みなどで payload から判別できない行は `tweet` のまま残る。
+fn migrate_v2_to_v3(tx: &Connection) -> Result<()> {
+    reclassify(tx, Some(NotificationKind::Tweet))?;
+    set_schema_version(tx)
+}
+
+/// `only` を指定すると、その区分で保存済みの行だけを読み、区分が変わるものを更新する。
+/// 行は `BACKFILL_CHUNK` 件ずつ読む。
+fn reclassify(tx: &Connection, only: Option<NotificationKind>) -> Result<()> {
     let mut last_seq = 0_i64;
     loop {
         let chunk = {
             let mut stmt = tx
                 .prepare(
                     "SELECT seq, payload FROM notifications WHERE seq > ?1 \
-                     ORDER BY seq LIMIT ?2",
+                     AND (?3 IS NULL OR kind = ?3) ORDER BY seq LIMIT ?2",
                 )
                 .map_err(db_error)?;
-            stmt.query_map(params![last_seq, BACKFILL_CHUNK], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
+            stmt.query_map(
+                params![last_seq, BACKFILL_CHUNK, only.map(NotificationKind::as_str)],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
             .map_err(db_error)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(db_error)?
@@ -351,13 +465,17 @@ fn migrate_v1_to_v2(tx: &Connection) -> Result<()> {
         for (seq, payload) in &chunk {
             let kind = serde_json::from_str::<Value>(payload)
                 .map_or(NotificationKind::Other, |value| classify(&value));
-            if kind != NotificationKind::Other {
+            if kind != NotificationKind::Other && Some(kind) != only {
                 update
                     .execute(params![kind.as_str(), seq])
                     .map_err(db_error)?;
             }
         }
     }
+    Ok(())
+}
+
+fn set_schema_version(tx: &Connection) -> Result<()> {
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
         .map_err(db_error)
 }
@@ -428,7 +546,12 @@ fn history_path(config_path: &Path) -> PathBuf {
     config_path.with_file_name(name)
 }
 
-fn build_item(id: &str, payload: &Value, received_at: u64) -> NotificationItem {
+fn build_item(
+    id: &str,
+    payload: &Value,
+    kind: NotificationKind,
+    received_at: u64,
+) -> NotificationItem {
     let summary = summarize(payload);
     NotificationItem {
         id: id.to_string(),
@@ -437,7 +560,7 @@ fn build_item(id: &str, payload: &Value, received_at: u64) -> NotificationItem {
         body: summary.body,
         url: summary.url,
         icon: summary.icon,
-        kind: classify(payload),
+        kind,
         payload: bound_payload(payload),
     }
 }
@@ -707,7 +830,16 @@ mod tests {
         let mut conn = open(&history_path(&path), BUSY_TIMEOUT).unwrap();
         let tx = conn.transaction().unwrap();
         for n in 0..120 {
-            insert(&tx, &build_item(&format!("c:{n}"), &sample(n), n as u64)).unwrap();
+            insert(
+                &tx,
+                &build_item(
+                    &format!("c:{n}"),
+                    &sample(n),
+                    NotificationKind::Other,
+                    n as u64,
+                ),
+            )
+            .unwrap();
         }
         tx.commit().unwrap();
 
@@ -724,7 +856,18 @@ mod tests {
         let mut conn = open(&history_path(&path), BUSY_TIMEOUT).unwrap();
         let tx = conn.transaction().unwrap();
         for n in 0..TOTAL {
-            assert!(insert(&tx, &build_item(&format!("c:{n}"), &sample(n), n as u64)).unwrap());
+            assert!(
+                insert(
+                    &tx,
+                    &build_item(
+                        &format!("c:{n}"),
+                        &sample(n),
+                        NotificationKind::Other,
+                        n as u64
+                    )
+                )
+                .unwrap()
+            );
         }
         tx.commit().unwrap();
         drop(conn);
@@ -1121,12 +1264,28 @@ mod tests {
             "config error: notification history is busy"
         );
         // The id is already stored, but a locked database must still not report success.
-        let write = append_with_timeout(&path, "c:1", &sample(1), 1, SHORT_TIMEOUT).unwrap_err();
+        let write = append_with_timeout(
+            &path,
+            "c:1",
+            &sample(1),
+            NotificationKind::Other,
+            1,
+            SHORT_TIMEOUT,
+        )
+        .unwrap_err();
         assert_eq!(
             write.to_string(),
             "config error: notification history is busy"
         );
-        let fresh = append_with_timeout(&path, "c:2", &sample(2), 1, SHORT_TIMEOUT).unwrap_err();
+        let fresh = append_with_timeout(
+            &path,
+            "c:2",
+            &sample(2),
+            NotificationKind::Other,
+            1,
+            SHORT_TIMEOUT,
+        )
+        .unwrap_err();
         assert_eq!(
             fresh.to_string(),
             "config error: notification history is busy"
@@ -1144,7 +1303,7 @@ mod tests {
         let path = config_path();
         let mut conn = open(&history_path(&path), BUSY_TIMEOUT).unwrap();
         let tx = conn.transaction().unwrap();
-        let item = build_item("c:1", &sample(1), 1);
+        let item = build_item("c:1", &sample(1), NotificationKind::Other, 1);
         assert!(insert(&tx, &item).unwrap());
         assert!(!insert(&tx, &item).unwrap());
 
@@ -1186,7 +1345,13 @@ mod tests {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
-        assert!(insert(&tx, &build_item("c:2", &sample(2), 2)).unwrap());
+        assert!(
+            insert(
+                &tx,
+                &build_item("c:2", &sample(2), NotificationKind::Other, 2)
+            )
+            .unwrap()
+        );
 
         let journal = path.with_file_name("c.toml.notifications.sqlite3-journal");
         assert!(
@@ -1223,12 +1388,50 @@ mod tests {
         json!({ "title": format!("t{n}"), "data": { "type": data_type } })
     }
 
-    fn filter(tweet: bool, xchat_message_received: bool, other: bool) -> NotificationFilter {
+    /// 実際の Web Push と同じ形。`uri` は元ツイート、`tag` はリツイート自身の ID。
+    fn tweet_data(uri: &str, tag: &str) -> Value {
+        json!({
+            "title": "t",
+            "body": "b",
+            "tag": tag,
+            "data": { "type": "tweet", "uri": uri, "tag": tag, "scribe_target": "tweet" },
+        })
+    }
+
+    fn retweet_payload() -> Value {
+        tweet_data(
+            "/Gunma_kankou/status/2109479175887245361",
+            "tweet-2109480482920673532",
+        )
+    }
+
+    fn plain_tweet_payload() -> Value {
+        tweet_data(
+            "/niigata_bic/status/2109197207392141321",
+            "tweet-2109197207392141321",
+        )
+    }
+
+    /// `quote` と `reply` は有効のまま。この 2 区分を変えるときは構造体を直接作る。
+    fn filter(
+        tweet: bool,
+        retweet: bool,
+        xchat_message_received: bool,
+        other: bool,
+    ) -> NotificationFilter {
         NotificationFilter {
             tweet,
+            retweet,
+            quote: true,
+            reply: true,
             xchat_message_received,
             other,
         }
+    }
+
+    /// 判定済みの区分を指定して保存する。
+    fn append_kind(path: &Path, id: &str, payload: &Value, kind: NotificationKind, at: u64) {
+        append_with_timeout(path, id, payload, kind, at, BUSY_TIMEOUT).unwrap();
     }
 
     fn list_with(
@@ -1242,7 +1445,9 @@ mod tests {
 
     #[test]
     fn classify_reads_only_data_type_with_inner_precedence() {
-        use NotificationKind::{Other, Tweet, XchatMessageReceived};
+        use NotificationKind::{Other, Retweet, Tweet, XchatMessageReceived};
+        let rt_data = json!({ "type": "tweet", "uri": "/a/status/1", "tag": "tweet-2" });
+        let same_data = json!({ "type": "tweet", "uri": "/a/status/1", "tag": "tweet-1" });
         let cases = [
             (json!({ "data": { "type": "tweet" } }), Tweet),
             (
@@ -1295,10 +1500,163 @@ mod tests {
                 json!({ "truncated": true, "raw": "{\"data\":{\"type\":\"tweet\"}}" }),
                 Other,
             ),
+            // リツイート: type が tweet で、uri と tag の ID が食い違うときだけ。
+            (retweet_payload(), Retweet),
+            (plain_tweet_payload(), Tweet),
+            (json!({ "data": rt_data }), Retweet),
+            (json!({ "notification": { "data": rt_data } }), Retweet),
+            (
+                json!({ "notification": { "data": same_data }, "data": rt_data }),
+                Tweet,
+            ),
+            (
+                json!({ "notification": { "data": rt_data }, "data": same_data }),
+                Retweet,
+            ),
+            // type を読んだのと同じ階層の uri/tag だけを使う。
+            (
+                json!({ "notification": { "data": { "type": 5, "uri": "/a/status/1", "tag": "tweet-2" } },
+                        "data": same_data }),
+                Tweet,
+            ),
+            (
+                json!({ "notification": { "data": { "type": 5 } }, "data": rt_data }),
+                Retweet,
+            ),
+            (
+                json!({ "notification": { "data": { "type": "tweet" } }, "data": rt_data }),
+                Tweet,
+            ),
+            (
+                json!({ "uri": "/a/status/1", "tag": "tweet-2", "data": { "type": "tweet" } }),
+                Tweet,
+            ),
+            // どちらかが欠けるか、形式が違えば除外側に倒さない。
+            (
+                json!({ "data": { "type": "tweet", "uri": "/a/status/1" } }),
+                Tweet,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "tag": "tweet-2" } }),
+                Tweet,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "uri": 1, "tag": "tweet-2" } }),
+                Tweet,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "uri": "/a/status/1", "tag": 2 } }),
+                Tweet,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "uri": null, "tag": null } }),
+                Tweet,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "uri": "/a/status/1", "tag": "retweet-2" } }),
+                Tweet,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "uri": "/a/status/1", "tag": "tweet-x" } }),
+                Tweet,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "uri": "/a/status/1", "tag": "tweet-" } }),
+                Tweet,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "uri": "/a/status/1", "tag": "tweet-2\n" } }),
+                Tweet,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "uri": "/a/status/1", "tag": "tweet-2-x" } }),
+                Tweet,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "uri": "/a/status/1", "tag": "tweet-２" } }),
+                Tweet,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "uri": "/a/status/x", "tag": "tweet-2" } }),
+                Tweet,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "uri": "/a/status/1/photo/1", "tag": "tweet-2" } }),
+                Tweet,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "uri": "/a/status/1?s=20", "tag": "tweet-2" } }),
+                Tweet,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "uri": "/a/status/1\n", "tag": "tweet-2" } }),
+                Tweet,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "uri": "/i/web/status/1", "tag": "tweet-2" } }),
+                Tweet,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "uri": "//status/1", "tag": "tweet-2" } }),
+                Tweet,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "uri": "a/status/1", "tag": "tweet-2" } }),
+                Tweet,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "uri": "https://x.com/a/status/1", "tag": "tweet-2" } }),
+                Tweet,
+            ),
+            // tweet 以外の type は uri/tag が食い違っても区分を変えない。
+            (
+                json!({ "data": { "type": "recommendation", "uri": "/a/status/1", "tag": "tweet-2" } }),
+                Other,
+            ),
+            (
+                json!({ "data": { "type": "xchat_message_received", "uri": "/a/status/1", "tag": "tweet-2" } }),
+                XchatMessageReceived,
+            ),
+            // `retweet` は X の data.type には存在しない。
+            (
+                json!({ "data": { "type": "retweet", "uri": "/a/status/1", "tag": "tweet-2" } }),
+                Other,
+            ),
+            (json!({ "data": { "type": "retweet" } }), Other),
         ];
         for (payload, expected) in cases {
             assert_eq!(classify(&payload), expected, "{payload}");
         }
+    }
+
+    #[test]
+    fn a_stored_retweet_quote_or_reply_is_restored_but_is_not_a_data_type() {
+        for (name, kind) in [
+            ("retweet", NotificationKind::Retweet),
+            ("quote", NotificationKind::Quote),
+            ("reply", NotificationKind::Reply),
+        ] {
+            assert_eq!(NotificationKind::from_stored(name), kind);
+            assert_eq!(kind.as_str(), name);
+            assert_eq!(
+                NotificationKind::from_data_type(name),
+                NotificationKind::Other
+            );
+        }
+        for kind in [
+            NotificationKind::Tweet,
+            NotificationKind::Retweet,
+            NotificationKind::Quote,
+            NotificationKind::Reply,
+            NotificationKind::XchatMessageReceived,
+            NotificationKind::Other,
+        ] {
+            assert_eq!(NotificationKind::from_stored(kind.as_str()), kind);
+        }
+        assert_eq!(
+            NotificationKind::from_stored("something_new"),
+            NotificationKind::Other
+        );
     }
 
     #[test]
@@ -1307,13 +1665,38 @@ mod tests {
         append_at(&path, "c:1", &typed("tweet", 1), 1).unwrap();
         append_at(&path, "c:2", &typed("xchat_message_received", 2), 2).unwrap();
         append_at(&path, "c:3", &typed("something_new", 3), 3).unwrap();
+        append_at(&path, "c:4", &retweet_payload(), 4).unwrap();
+        append_kind(
+            &path,
+            "c:5",
+            &plain_tweet_payload(),
+            NotificationKind::Quote,
+            5,
+        );
+        append_kind(
+            &path,
+            "c:6",
+            &plain_tweet_payload(),
+            NotificationKind::Reply,
+            6,
+        );
         let value = serde_json::to_value(list(&path, None, 10).unwrap()).unwrap();
-        assert_eq!(value["items"][0]["kind"], "other");
-        assert_eq!(value["items"][1]["kind"], "xchat_message_received");
-        assert_eq!(value["items"][2]["kind"], "tweet");
+        assert_eq!(value["items"][0]["kind"], "reply");
+        assert_eq!(value["items"][1]["kind"], "quote");
+        assert_eq!(value["items"][2]["kind"], "retweet");
+        assert_eq!(value["items"][3]["kind"], "other");
+        assert_eq!(value["items"][4]["kind"], "xchat_message_received");
+        assert_eq!(value["items"][5]["kind"], "tweet");
         assert_eq!(
             value["notification_filter"],
-            json!({ "tweet": true, "xchat_message_received": true, "other": true })
+            json!({
+                "tweet": true,
+                "retweet": true,
+                "quote": true,
+                "reply": true,
+                "xchat_message_received": true,
+                "other": true
+            })
         );
     }
 
@@ -1329,7 +1712,7 @@ mod tests {
         assert_eq!(item.payload["truncated"], json!(true));
         assert_eq!(item.kind, NotificationKind::XchatMessageReceived);
         assert!(
-            list_filtered(&path, None, 10, &filter(true, false, true))
+            list_filtered(&path, None, 10, &filter(true, true, false, true))
                 .unwrap()
                 .items
                 .is_empty()
@@ -1337,33 +1720,59 @@ mod tests {
     }
 
     #[test]
-    fn all_eight_filter_combinations_select_the_matching_kinds() {
+    fn a_retweet_stays_a_retweet_after_its_payload_is_truncated() {
+        let path = config_path();
+        let mut huge = retweet_payload();
+        huge["data"]["blob"] = json!("x".repeat(40_000));
+        append_at(&path, "c:1", &huge, 1).unwrap();
+        let item = list(&path, None, 1).unwrap().items.remove(0);
+        assert_eq!(item.payload["truncated"], json!(true));
+        assert_eq!(item.kind, NotificationKind::Retweet);
+        assert!(
+            list_filtered(&path, None, 10, &filter(true, false, true, true))
+                .unwrap()
+                .items
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn every_filter_combination_selects_the_matching_kinds() {
+        use NotificationKind::{Quote, Reply};
         let path = config_path();
         append_at(&path, "tweet", &typed("tweet", 1), 1).unwrap();
-        append_at(&path, "chat", &typed("xchat_message_received", 2), 2).unwrap();
-        append_at(&path, "other", &typed("unknown", 3), 3).unwrap();
-        append_at(&path, "missing", &sample(4), 4).unwrap();
+        append_at(&path, "retweet", &retweet_payload(), 2).unwrap();
+        append_kind(&path, "quote", &plain_tweet_payload(), Quote, 3);
+        append_kind(&path, "reply", &plain_tweet_payload(), Reply, 4);
+        append_at(&path, "chat", &typed("xchat_message_received", 5), 5).unwrap();
+        append_at(&path, "other", &typed("unknown", 6), 6).unwrap();
+        append_at(&path, "missing", &sample(7), 7).unwrap();
+        type Shown = fn(&NotificationFilter) -> bool;
+        let rows: [(&str, Shown); 7] = [
+            ("tweet", |f| f.tweet),
+            ("retweet", |f| f.retweet),
+            ("quote", |f| f.quote),
+            ("reply", |f| f.reply),
+            ("chat", |f| f.xchat_message_received),
+            ("other", |f| f.other),
+            ("missing", |f| f.other),
+        ];
 
-        for bits in 0..8_u8 {
-            let f = filter(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
-            let mut expected = Vec::new();
-            if f.other {
-                expected.push("missing");
-                expected.push("other");
-            }
-            if f.xchat_message_received {
-                expected.push("chat");
-            }
-            if f.tweet {
-                expected.push("tweet");
-            }
-            expected.sort_by_key(|id| {
-                std::cmp::Reverse(
-                    ["tweet", "chat", "other", "missing"]
-                        .iter()
-                        .position(|x| x == id),
-                )
-            });
+        for bits in 0..64_u8 {
+            let f = NotificationFilter {
+                tweet: bits & 1 != 0,
+                retweet: bits & 2 != 0,
+                quote: bits & 4 != 0,
+                reply: bits & 8 != 0,
+                xchat_message_received: bits & 16 != 0,
+                other: bits & 32 != 0,
+            };
+            let expected: Vec<&str> = rows
+                .iter()
+                .rev()
+                .filter(|(_, shown)| shown(&f))
+                .map(|(id, _)| *id)
+                .collect();
             let page = list_with(&path, f, None, 50);
             assert_eq!(ids(&page), expected, "{f:?}");
             assert_eq!(page.notification_filter, f);
@@ -1377,7 +1786,14 @@ mod tests {
         for n in 0..5 {
             append_at(&path, &format!("c:{n}"), &typed("tweet", n), n as u64).unwrap();
         }
-        let none = filter(false, false, false);
+        let none = NotificationFilter {
+            tweet: false,
+            retweet: false,
+            quote: false,
+            reply: false,
+            xchat_message_received: false,
+            other: false,
+        };
         let page = list_with(&path, none, None, 2);
         assert!(page.items.is_empty());
         assert!(page.next_cursor.is_none());
@@ -1410,7 +1826,7 @@ mod tests {
         }
         append_at(&path, "new-tweet", &typed("tweet", 2), 1).unwrap();
 
-        let tweets_only = filter(true, false, false);
+        let tweets_only = filter(true, false, false, false);
         let first = list_with(&path, tweets_only, None, 1);
         assert_eq!(ids(&first), ["new-tweet"]);
         assert_eq!(first.next_cursor.as_deref(), Some("new-tweet"));
@@ -1435,11 +1851,11 @@ mod tests {
         append_at(&path, "hidden", &typed("xchat_message_received", 2), 2).unwrap();
         append_at(&path, "t2", &typed("tweet", 3), 3).unwrap();
 
-        let tweets_only = filter(true, false, false);
+        let tweets_only = filter(true, false, false, false);
         let page = list_with(&path, tweets_only, Some("hidden"), 10);
         assert_eq!(ids(&page), ["t1"]);
         // 設定変更後に、以前の応答にあった cursor を持ち越してもエラーにならない。
-        let page = list_with(&path, filter(false, false, true), Some("t2"), 10);
+        let page = list_with(&path, filter(false, false, false, true), Some("t2"), 10);
         assert!(page.items.is_empty());
         assert!(list_filtered(&path, Some("never-stored"), 10, &tweets_only).is_err());
     }
@@ -1535,12 +1951,17 @@ mod tests {
         assert_eq!(user_version(&conn).unwrap(), SCHEMA_VERSION);
 
         // 再度開いても何も変わらず、保存した履歴は移行後もフィルターできる。
-        let again = list_with(&path, filter(true, false, false), None, 50);
+        let again = list_with(&path, filter(true, false, false, false), None, 50);
         assert_eq!(ids(&again), ["f", "a"]);
         assert_eq!(snapshot(&path), before);
         append_at(&path, "new", &typed("tweet", 9), 9).unwrap();
         assert_eq!(
-            ids(&list_with(&path, filter(true, false, false), None, 50))[0],
+            ids(&list_with(
+                &path,
+                filter(true, false, false, false),
+                None,
+                50
+            ))[0],
             "new"
         );
     }
@@ -1596,7 +2017,7 @@ mod tests {
         for handle in handles {
             assert_eq!(handle.join().unwrap(), SCHEMA_VERSION);
         }
-        let page = list_with(&path, filter(true, false, false), None, 100);
+        let page = list_with(&path, filter(true, false, false, false), None, 100);
         assert_eq!(page.items.len(), 100);
         assert!(page.next_cursor.is_some());
     }
@@ -1615,5 +2036,399 @@ mod tests {
         let conn = Connection::open(history_path(&path)).unwrap();
         assert_eq!(user_version(&conn).unwrap(), 1);
         assert_eq!(snapshot(&path).len(), 1);
+    }
+
+    /// v2（`kind` 列あり、`retweet` 区分なし）の履歴を作る。各行は (id, payload, 保存済みの kind)。
+    fn create_v2(config: &Path, rows: &[(String, String, &str)]) {
+        let db = history_path(config);
+        ensure_private_file(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notifications (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                received_at INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                url TEXT,
+                icon TEXT,
+                payload TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'other'
+            );
+            PRAGMA user_version = 2;",
+        )
+        .unwrap();
+        for (n, (id, payload, kind)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO notifications (id, received_at, title, body, payload, kind) \
+                 VALUES (?1, ?2, ?3, '', ?4, ?5)",
+                params![id, n as i64, format!("title-{n}"), payload, kind],
+            )
+            .unwrap();
+        }
+    }
+
+    fn stored_kinds(config: &Path) -> Vec<(String, String)> {
+        let conn = Connection::open(history_path(config)).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, kind FROM notifications ORDER BY seq")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn v2_history_turns_only_its_retweets_into_retweets() {
+        let path = config_path();
+        let truncated = json!({ "truncated": true, "original_bytes": 99999,
+            "raw": "{\"data\":{\"type\":\"tweet\"" })
+        .to_string();
+        let rows: Vec<(String, String, &str)> = vec![
+            ("plain".into(), plain_tweet_payload().to_string(), "tweet"),
+            ("rt".into(), retweet_payload().to_string(), "tweet"),
+            (
+                "rt-nested".into(),
+                json!({ "notification": retweet_payload() }).to_string(),
+                "tweet",
+            ),
+            ("bare".into(), typed("tweet", 3).to_string(), "tweet"),
+            (
+                "chat".into(),
+                typed("xchat_message_received", 4).to_string(),
+                "xchat_message_received",
+            ),
+            ("novel".into(), typed("novel", 5).to_string(), "other"),
+            ("broken".into(), "this is {not json".to_string(), "tweet"),
+            ("cut".into(), truncated, "tweet"),
+            // tweet として保存された行以外には触れない。
+            ("stale-other".into(), retweet_payload().to_string(), "other"),
+        ];
+        create_v2(&path, &rows);
+        let before = snapshot(&path);
+
+        let page = list(&path, None, 50).unwrap();
+        let kinds: Vec<_> = page
+            .items
+            .iter()
+            .rev()
+            .map(|i| (i.id.as_str(), i.kind))
+            .collect();
+        use NotificationKind::{Other, Retweet, Tweet, XchatMessageReceived};
+        assert_eq!(
+            kinds,
+            [
+                ("plain", Tweet),
+                ("rt", Retweet),
+                ("rt-nested", Retweet),
+                ("bare", Tweet),
+                ("chat", XchatMessageReceived),
+                ("novel", Other),
+                ("broken", Tweet),
+                ("cut", Tweet),
+                ("stale-other", Other),
+            ]
+        );
+        assert_eq!(
+            snapshot(&path),
+            before,
+            "seq, id and payload must be preserved"
+        );
+        let conn = Connection::open(db_file(&path)).unwrap();
+        assert_eq!(user_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // 移行後は retweet 単独でも、tweet から RT を外しても絞り込める。
+        let only_rt = list_with(&path, filter(false, true, false, false), None, 50);
+        assert_eq!(ids(&only_rt), ["rt-nested", "rt"]);
+        let no_rt = list_with(&path, filter(true, false, true, true), None, 50);
+        assert_eq!(
+            ids(&no_rt),
+            [
+                "stale-other",
+                "cut",
+                "broken",
+                "novel",
+                "chat",
+                "bare",
+                "plain"
+            ]
+        );
+        assert_eq!(snapshot(&path), before);
+    }
+
+    #[test]
+    fn v2_migration_walks_the_tweet_rows_in_chunks() {
+        let path = config_path();
+        let total = (BACKFILL_CHUNK as usize) * 2 + 37;
+        let rows: Vec<(String, String, &str)> = (0..total)
+            .map(|n| match n % 3 {
+                0 => (format!("r:{n}"), retweet_payload().to_string(), "tweet"),
+                1 => (format!("r:{n}"), plain_tweet_payload().to_string(), "tweet"),
+                _ => (
+                    format!("r:{n}"),
+                    typed("xchat_message_received", n).to_string(),
+                    "xchat_message_received",
+                ),
+            })
+            .collect();
+        create_v2(&path, &rows);
+
+        let conn = open(&history_path(&path), BUSY_TIMEOUT).unwrap();
+        let count = |kind: &str| -> usize {
+            conn.query_row(
+                "SELECT COUNT(*) FROM notifications WHERE kind = ?1",
+                [kind],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap() as usize
+        };
+        assert_eq!(count("retweet"), total.div_ceil(3));
+        assert_eq!(count("tweet"), (total + 1) / 3);
+        assert_eq!(count("xchat_message_received"), total / 3);
+        assert_eq!(user_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v1_history_is_classified_with_retweets_in_a_single_migration() {
+        let path = config_path();
+        let rows: Vec<(String, String)> = vec![
+            ("plain".into(), plain_tweet_payload().to_string()),
+            ("rt".into(), retweet_payload().to_string()),
+            (
+                "chat".into(),
+                typed("xchat_message_received", 1).to_string(),
+            ),
+        ];
+        create_v1(&path, &rows);
+
+        let conn = open(&history_path(&path), BUSY_TIMEOUT).unwrap();
+        assert_eq!(user_version(&conn).unwrap(), SCHEMA_VERSION);
+        drop(conn);
+        assert_eq!(
+            stored_kinds(&path),
+            [
+                ("plain".to_string(), "tweet".to_string()),
+                ("rt".to_string(), "retweet".to_string()),
+                ("chat".to_string(), "xchat_message_received".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_v3_history_is_not_reclassified_on_open() {
+        let path = config_path();
+        append_at(&path, "rt", &retweet_payload(), 1).unwrap();
+        let conn = Connection::open(history_path(&path)).unwrap();
+        conn.execute("UPDATE notifications SET kind = 'tweet'", [])
+            .unwrap();
+        drop(conn);
+        assert_eq!(
+            stored_kinds(&path),
+            [("rt".to_string(), "tweet".to_string())]
+        );
+        assert_eq!(
+            list(&path, None, 10).unwrap().items[0].kind,
+            NotificationKind::Tweet
+        );
+    }
+
+    #[test]
+    fn append_as_stores_the_given_kind_and_append_classifies() {
+        let path = config_path();
+        append_as(&path, "q", &plain_tweet_payload(), NotificationKind::Quote).unwrap();
+        append(&path, "rt", &retweet_payload()).unwrap();
+        append(&path, "plain", &plain_tweet_payload()).unwrap();
+        // 同じ ID は区分が違っても無視される。
+        append_as(&path, "q", &plain_tweet_payload(), NotificationKind::Reply).unwrap();
+        let mut huge = plain_tweet_payload();
+        huge["data"]["blob"] = json!("x".repeat(40_000));
+        append_as(&path, "cut", &huge, NotificationKind::Reply).unwrap();
+
+        let stored = |id: &str, kind: &str| (id.to_string(), kind.to_string());
+        assert_eq!(
+            stored_kinds(&path),
+            [
+                stored("q", "quote"),
+                stored("rt", "retweet"),
+                stored("plain", "tweet"),
+                stored("cut", "reply"),
+            ]
+        );
+        let item = list(&path, None, 1).unwrap().items.remove(0);
+        assert_eq!(item.payload["truncated"], json!(true));
+        assert_eq!(item.kind, NotificationKind::Reply);
+    }
+
+    #[test]
+    fn a_v2_migration_leaves_stored_quotes_and_replies_alone() {
+        let path = config_path();
+        // 移行が読むのは tweet として保存された行だけ。リツイートの形をしていても書き換えない。
+        let rows: Vec<(String, String, &str)> = vec![
+            ("plain".into(), plain_tweet_payload().to_string(), "tweet"),
+            ("quote".into(), plain_tweet_payload().to_string(), "quote"),
+            ("reply".into(), plain_tweet_payload().to_string(), "reply"),
+            ("quote-rt".into(), retweet_payload().to_string(), "quote"),
+            ("reply-rt".into(), retweet_payload().to_string(), "reply"),
+            ("rt".into(), retweet_payload().to_string(), "tweet"),
+        ];
+        create_v2(&path, &rows);
+
+        let conn = open(&history_path(&path), BUSY_TIMEOUT).unwrap();
+        assert_eq!(user_version(&conn).unwrap(), SCHEMA_VERSION);
+        drop(conn);
+        let stored = |id: &str, kind: &str| (id.to_string(), kind.to_string());
+        assert_eq!(
+            stored_kinds(&path),
+            [
+                stored("plain", "tweet"),
+                stored("quote", "quote"),
+                stored("reply", "reply"),
+                stored("quote-rt", "quote"),
+                stored("reply-rt", "reply"),
+                stored("rt", "retweet"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_id_to_look_up_is_the_notification_own_tag() {
+        let wrapped = json!({ "notification": plain_tweet_payload() });
+        let outer_only = json!({
+            "notification": { "title": "t" },
+            "data": { "type": "tweet", "tag": "tweet-77" },
+        });
+        let cases = [
+            (plain_tweet_payload(), Some("2109197207392141321")),
+            (retweet_payload(), Some("2109480482920673532")),
+            (wrapped, Some("2109197207392141321")),
+            (outer_only, Some("77")),
+            (
+                json!({ "data": { "type": "tweet", "tag": "retweet-2" } }),
+                None,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "tag": "tweet-" } }),
+                None,
+            ),
+            (
+                json!({ "data": { "type": "tweet", "tag": "tweet-1x" } }),
+                None,
+            ),
+            (json!({ "data": { "type": "tweet", "tag": 5 } }), None),
+            (json!({ "data": { "type": "tweet" } }), None),
+            // 外側の `tag` だけでは足りない。`classify` と同じ `data` を読む。
+            (
+                json!({ "tag": "tweet-3", "data": { "type": "tweet" } }),
+                None,
+            ),
+            (json!({ "tag": "tweet-3" }), None),
+        ];
+        for (payload, expected) in cases {
+            assert_eq!(tweet_id(&payload).as_deref(), expected, "{payload}");
+        }
+    }
+
+    mod lookup {
+        use super::*;
+        use crate::tweet_lookup::mock::{MockApi, REFUSED_ENDPOINT, http_response, json_response};
+
+        const PLAIN_REQUEST: &str = "GET /tweet-result?id=2109197207392141321&token=0 HTTP/1.1";
+
+        async fn kind_after(response: Vec<u8>, payload: &Value) -> (NotificationKind, Vec<String>) {
+            let api = MockApi::start(response).await;
+            let lookup = TweetLookup::with_endpoint(&api.url).unwrap();
+            (resolve_kind(payload, &lookup).await, api.requests())
+        }
+
+        #[tokio::test]
+        async fn a_plain_tweet_becomes_a_quote_or_a_reply_by_the_lookup() {
+            let cases = [
+                (
+                    r#"{"__typename":"Tweet","quoted_tweet":{"id_str":"1"}}"#,
+                    NotificationKind::Quote,
+                ),
+                (
+                    r#"{"__typename":"Tweet","in_reply_to_status_id_str":"1"}"#,
+                    NotificationKind::Reply,
+                ),
+                (
+                    r#"{"__typename":"Tweet","in_reply_to_status_id_str":"1","quoted_tweet":{}}"#,
+                    NotificationKind::Reply,
+                ),
+                (r#"{"__typename":"Tweet"}"#, NotificationKind::Tweet),
+                (
+                    r#"{"__typename":"TweetTombstone"}"#,
+                    NotificationKind::Tweet,
+                ),
+            ];
+            for (response, expected) in cases {
+                let wrapped = json!({ "notification": plain_tweet_payload() });
+                for payload in [plain_tweet_payload(), wrapped] {
+                    let (kind, requests) = kind_after(json_response(response), &payload).await;
+                    assert_eq!(kind, expected, "{response}");
+                    assert_eq!(requests, [PLAIN_REQUEST]);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_failed_lookup_leaves_the_tweet_a_tweet() {
+            let quote = r#"{"__typename":"Tweet","quoted_tweet":{}}"#;
+            let failures = [
+                http_response(
+                    "500 Internal Server Error",
+                    "application/json",
+                    quote.as_bytes(),
+                ),
+                http_response("404 Not Found", "text/html", b"<html></html>"),
+                http_response("200 OK", "text/html", b"<html></html>"),
+                http_response("200 OK", "application/json", b"{"),
+            ];
+            for response in failures {
+                let (kind, requests) = kind_after(response, &plain_tweet_payload()).await;
+                assert_eq!(kind, NotificationKind::Tweet);
+                assert_eq!(requests.len(), 1);
+            }
+            let refused = TweetLookup::with_endpoint(REFUSED_ENDPOINT).unwrap();
+            assert_eq!(
+                resolve_kind(&plain_tweet_payload(), &refused).await,
+                NotificationKind::Tweet
+            );
+        }
+
+        #[tokio::test]
+        async fn nothing_but_a_plain_tweet_is_looked_up() {
+            let quote = json_response(r#"{"__typename":"Tweet","quoted_tweet":{}}"#);
+            let api = MockApi::start(quote).await;
+            let lookup = TweetLookup::with_endpoint(&api.url).unwrap();
+            let cases = [
+                // リツイートの ID を照会すると元ツイートが返り、引用RT と誤判定する。
+                (retweet_payload(), NotificationKind::Retweet),
+                (
+                    json!({ "data": { "type": "xchat_message_received", "tag": "tweet-3" } }),
+                    NotificationKind::XchatMessageReceived,
+                ),
+                (
+                    json!({ "data": { "type": "novel", "tag": "tweet-4" } }),
+                    NotificationKind::Other,
+                ),
+                (
+                    json!({ "data": { "tag": "tweet-5" } }),
+                    NotificationKind::Other,
+                ),
+                (json!({ "title": "t" }), NotificationKind::Other),
+                // 自身の ID を取り出せない投稿は、照会せず Tweet のまま。
+                (typed("tweet", 1), NotificationKind::Tweet),
+                (
+                    json!({ "data": { "type": "tweet", "tag": "retweet-2" } }),
+                    NotificationKind::Tweet,
+                ),
+            ];
+            for (payload, expected) in cases {
+                assert_eq!(resolve_kind(&payload, &lookup).await, expected, "{payload}");
+            }
+            assert!(api.requests().is_empty());
+        }
     }
 }

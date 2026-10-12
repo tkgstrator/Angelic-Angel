@@ -28,7 +28,7 @@ Twitter/X  ──push──▶  Mozilla AutoPush Server  ◀──WebSocket─�
 ### Important Notes
 
 - **Data source**: All notification data is received from Mozilla's Web Push server (`push.services.mozilla.com`). Angelic Angel does not access Twitter/X directly for notification data.
-- **Minimal API usage**: The Twitter/X API is only called during the initial push subscription registration (`register` command) and when you explicitly start the WebUI's bulk notification operation. No API calls are made while listening for notifications.
+- **Minimal API usage**: The Twitter/X API is only called during the initial push subscription registration (`register` command, or the automatic registration of the first `listen` with credentials in the environment) and when you explicitly start the WebUI's bulk notification operation. No API calls are made while listening for notifications.
 - **No scraping**: This tool does not perform any web scraping. It uses the standard W3C Push API flow, the same mechanism browsers use to deliver push notifications.
 
 ## Requirements
@@ -78,6 +78,8 @@ WEBHOOK_ENDPOINT=https://your-webhook.example.com/endpoint angelic-angel listen
 
 The `WEBHOOK_ENDPOINT` environment variable specifies where decrypted notification payloads are sent via HTTP POST.
 
+Alternatively, skip steps 1 and 2: with `TWITTER_AUTH_TOKEN` and `TWITTER_CSRF_TOKEN` (the `auth_token` and `ct0` cookies) set, `listen` registers on its first start when there is no registration yet. The values are read from the environment and never written to the config file. See [Docker](#docker).
+
 ### Other commands
 
 ```sh
@@ -101,33 +103,124 @@ The WebUI (`angelic-angel serve`) has three screens: Notifications, Settings and
 
 | Flag | Description |
 |------|-------------|
-| `-c, --config <PATH>` | Configuration file path (default: `angelic-angel.toml`) |
+| `-c, --config <PATH>` | Configuration file path (env: `ANGELIC_ANGEL_CONFIG`, default: `angelic-angel.toml`) |
 | `-v, --verbose` | Enable debug logging |
 
 ## Docker
 
-Requires Docker Compose 2.24+.
+Requires Docker Compose 2.24+. The container only needs your X credentials and a webhook in environment variables: on the first start it registers itself and stores the registration in a mounted directory.
 
 ```sh
-docker compose build
-cp .env.example .env   # then edit .env and set your actual webhook URL
+mkdir config && sudo chown 65532:65532 config   # the container runs as UID 65532
+cp .env.example .env   # then edit .env: TWITTER_AUTH_TOKEN, TWITTER_CSRF_TOKEN and your webhook
 
-# Prompts for credentials, avoiding secrets in shell history
-docker compose run --rm -it angelic-angel init
-docker compose run --rm angelic-angel register
-docker compose run --rm angelic-angel status
-
-docker compose up -d
+docker compose up -d --build
 docker compose logs -f
 docker compose stop
 ```
 
-- The container uses `/data/angelic-angel.toml` for credentials and registration. `docker compose down` keeps the named volume; `docker compose down -v` deletes it.
-- `WEBHOOK_ENDPOINT` is required for forwarding, but `init` and `status` do not need `.env`.
+- `TWITTER_AUTH_TOKEN` and `TWITTER_CSRF_TOKEN` are the `auth_token` and `ct0` cookie values (see [Getting `auth_token` and `ct0`](#getting-auth_token-and-ct0)).
+- The container runs as UID 65532, so `./config` must be writable by it. If Docker creates a missing `./config` itself, it is owned by root and the container fails with "cannot open lock file". To run as your own user instead, keep `./config` owned by you and add `user: "1000:1000"` (your `id -u`:`id -g`) to the service. Files in `./config` written earlier by UID 65532 must then be `chown`ed to that user.
+- Mount the directory, not the file: the config is saved through a temporary file and a rename, and the lock and the history database live next to it.
 - Inside a container, `localhost` is the container itself. For a webhook on the host, use a URL such as `http://host.docker.internal:8080/endpoint`. On Linux, the host service must listen on an address reachable from Docker, such as the bridge IP or `0.0.0.0`.
 - After editing `.env`, run `docker compose up -d` to recreate the container with the new values; `restart` alone does not reload them.
-- The default command is `listen`; other commands replace it, e.g. `docker compose run --rm angelic-angel unregister`.
-- Do not run `up` before `init` and `register`, or the restart policy will loop on failure.
+- The default command is `listen`; other commands replace it, e.g. `docker compose run --rm angelic-angel status`. Stop the running container first (`docker compose stop`): a config is locked by one process at a time.
+
+### Using the published image
+
+Instead of building, use the image from GHCR. The environment variables are interpolated from the `.env` next to `compose.yaml`:
+
+```yaml
+services:
+  angelic-angel:
+    image: ghcr.io/tkgstrator/angelic-angel:latest
+    restart: unless-stopped
+    stop_signal: SIGINT
+    environment:
+      TWITTER_AUTH_TOKEN: ${TWITTER_AUTH_TOKEN}
+      TWITTER_CSRF_TOKEN: ${TWITTER_CSRF_TOKEN}
+      WEBHOOK_ENDPOINT: ${WEBHOOK_ENDPOINT}
+      WEBHOOK_SECRET_KEY: ${WEBHOOK_SECRET_KEY}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./config:/config
+```
+
+```sh
+# .env (never commit it)
+TWITTER_AUTH_TOKEN=your-auth_token-cookie-value
+TWITTER_CSRF_TOKEN=your-ct0-cookie-value
+WEBHOOK_ENDPOINT=https://your-webhook.example.com/endpoint
+WEBHOOK_SECRET_KEY=your-shared-secret
+```
+
+- Setting the credentials through environment variables and the automatic registration need an image from a release that includes them; the earlier releases (up to v0.1.1) do not. If `latest` is an older image, `docker compose pull` fetches the current one.
+- For reproducible deployments, pin a version tag instead of `latest` (the `X.Y.Z` form, e.g. `ghcr.io/tkgstrator/angelic-angel:0.2.0`).
+
+### Environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `TWITTER_AUTH_TOKEN` | The `auth_token` cookie. Set it together with `TWITTER_CSRF_TOKEN` |
+| `TWITTER_CSRF_TOKEN` | The `ct0` cookie. Set it together with `TWITTER_AUTH_TOKEN` |
+| `WEBHOOK_ENDPOINT` | Webhook URL. A non-blank value takes precedence over the config file |
+| `WEBHOOK_SECRET_KEY` | Shared secret used to sign webhook requests. Required when a webhook URL is set |
+| `ANGELIC_ANGEL_CONFIG` | Config file path. The image sets `/config/angelic-angel.toml`; `--config` takes precedence |
+
+- The two credentials are a pair. When both are set (non-blank) they are used instead of `[twitter]` in the config file; when neither is, the config file is used; **when only one is set, the command fails with an error** (it never falls back to the file).
+- The credential values are never written to the config file. They are also used when a registration is renewed after AutoPush invalidates it (this can happen days later), so keep them set for as long as the container runs. `status` shows that they come from the environment without printing the values.
+
+### First start and stored state
+
+- If there is no registration and both credentials are set, `listen` registers with AutoPush and X, saves the registration, and starts receiving. An existing config file keeps its other settings (webhook, notification filter, `[twitter]`); a missing one is created with mode `0600`. Before contacting X it checks that the config can be saved, so a read-only mount fails without leaving registrations behind on X's side.
+- The registration (UAID and keys) is stored in `./config/angelic-angel.toml`, and the notification history in `./config/angelic-angel.toml.notifications.sqlite3`. Keep `./config` across restarts; treat it like a credential.
+- If the automatic registration fails (for example because the cookies are no longer valid), the error is logged and the process waits 30 seconds before exiting with a non-zero code, so that `restart: unless-stopped` does not hit X's login endpoints in a tight loop. `docker stop` (SIGINT) ends the wait immediately. Errors found before contacting X (half-set credentials, an unwritable `./config`) exit at once.
+- Without credentials and without a registration, `listen` exits with "No registration found" and the restart policy keeps retrying. Set the credentials, or place a registered config file in `./config`.
+
+### Changing the credentials
+
+```sh
+docker compose stop
+docker compose run --rm angelic-angel unregister
+sudo rm config/angelic-angel.toml     # then edit .env with the new values
+docker compose up -d
+```
+
+`unregister` removes the AutoPush subscription; deleting the config file makes the next start register again with the new credentials. This also drops the webhook and filter stored in that file. The history database is kept.
+
+### Running more than one instance
+
+Do not run the same registration (config file) in two places at once. If two containers each register automatically from the environment, they get different UAIDs, so the same account's notifications arrive twice and your webhook receives every one of them twice. Run a single container per config directory.
+
+### Without environment credentials
+
+You can also bring your own config file instead. Place a registered `angelic-angel.toml` in `./config` (owned by UID 65532), or create it in the container:
+
+```sh
+# Prompts for credentials, avoiding secrets in shell history
+docker compose run --rm -it angelic-angel init
+docker compose run --rm angelic-angel register
+docker compose run --rm angelic-angel status
+docker compose up -d
+```
+
+Do not run `up` before the registration exists, or the restart policy will loop on failure.
+
+### Migrating from the `/data` volume
+
+Earlier versions kept everything in the named volume `angelic-angel-data` mounted at `/data`. Copy it into `./config` before switching:
+
+```sh
+docker compose down                       # keeps the volume (do not use -v)
+docker volume ls | grep angelic-angel-data   # the name is <project>_angelic-angel-data
+mkdir config
+docker run --rm -v <project>_angelic-angel-data:/from:ro -v "$PWD/config":/to busybox:1.37.0 \
+  sh -c 'cp -a /from/. /to/ && chown -R 65532:65532 /to && chmod 700 /to'
+docker compose up -d
+```
+
+Once it runs from `./config`, delete the old volume with `docker volume rm`.
 
 ## Development
 
@@ -141,7 +234,7 @@ docker build -t angelic-angel:local .
 scripts/docker-smoke.sh angelic-angel:local        # offline, dummy credentials only
 ```
 
-The runtime uses Distroless with a stripped binary, without a shell, sources or build caches. `scripts/docker-smoke.sh` verifies configuration persistence, permissions, expected errors and SIGINT shutdown with dummy credentials and networking disabled. It pulls a separate BusyBox helper if needed and removes its own test resources.
+The runtime uses Distroless with a stripped binary, without a shell, sources or build caches. `scripts/docker-smoke.sh` verifies configuration persistence, `ANGELIC_ANGEL_CONFIG`, permissions, expected errors (including a failed automatic registration, which waits 30 seconds) and SIGINT shutdown with dummy credentials and networking disabled. It pulls a separate BusyBox helper if needed and removes its own test resources.
 
 To debug the image, use `docker logs` and run CLI subcommands (e.g. `docker run --rm IMAGE status`) rather than `exec`ing a shell. Published images can be pulled from GHCR: `docker pull ghcr.io/<owner>/<repo>:latest`.
 

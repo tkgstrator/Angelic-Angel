@@ -11,7 +11,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     # Mount the directory, not the file: saves go through a temp file + rename, and the
-    # lock and the notification history live next to the config. It must be writable by
-    # UID 65532 (`sudo chown 65532:65532 config`).
+    # lock and the notification history live next to the config. No chown or `user:` is
+    # needed: the container drops to the owner of the config file, else of ./config
+    # (65532 if root owns both).
     volumes:
       - ./config:/config

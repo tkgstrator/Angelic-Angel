@@ -1,6 +1,6 @@
 [package]
 name = "angelic-angel"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 
 [dependencies]
@@ -31,3 +31,4 @@ rusqlite = { version = "0.40", default-features = false, features = ["bundled"] 
 sha2 = "0.10"
 hmac = "0.12"
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
+libc = "0.2"

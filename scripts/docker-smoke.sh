@@ -4,6 +4,8 @@
 # Uses dummy credentials, a fabricated registration and --network none only;
 # it never contacts Twitter or AutoPush. The runtime image is distroless (no
 # shell), so file checks and seeding use a separate busybox helper image.
+# The image starts as root and the application drops to the owner of /config
+# (65532 when root owns it); the bind-mount cases below check exactly that.
 set -euo pipefail
 
 if [ "$#" -ne 1 ]; then
@@ -34,6 +36,7 @@ ENV_CT0=dummy-env-ct0-token
 OWNED_CONTAINERS=$LISTEN_CONTAINER$'\n'$AUTOREG_CONTAINER$'\n'$CERT_CONTAINER$'\n'$ONESHOT_CONTAINER
 OWNED_VOLUMES=$INIT_VOLUME$'\n'$LISTEN_VOLUME$'\n'$AUTOREG_VOLUME
 CERT_DIR=
+BIND_DIR=
 
 cleanup() {
   local status=$? name failed=0 resources
@@ -65,6 +68,13 @@ cleanup() {
   else
     echo "cleanup: cannot inspect owned volumes" >&2
     failed=1
+  fi
+  if [ -n "$BIND_DIR" ]; then
+    # The bind-mount cases leave root- and foreign-owned files behind; only root can remove them.
+    docker run --rm --name "$ONESHOT_CONTAINER" --network none -v "$BIND_DIR:/work" "$HELPER_IMAGE" \
+      sh -c 'rm -rf /work/* /work/.[!.]*' >/dev/null \
+      || { echo "cleanup: failed to empty $BIND_DIR" >&2; failed=1; }
+    rmdir "$BIND_DIR" || { echo "cleanup: failed to remove $BIND_DIR" >&2; failed=1; }
   fi
   if [ -n "$CERT_DIR" ]; then
     rm -rf "$CERT_DIR" || { echo "cleanup: failed to remove $CERT_DIR" >&2; failed=1; }
@@ -107,14 +117,24 @@ helper() {
   oneshot --user 65532:65532 "$@"
 }
 
+# Helper that stays root, to seed and inspect ownership that the application must not rely on.
+root_helper() {
+  oneshot "$@"
+}
+
 echo "== helper image"
 if ! docker image inspect "$HELPER_IMAGE" >/dev/null 2>&1; then
   docker pull "$HELPER_IMAGE" >/dev/null || fail "cannot pull $HELPER_IMAGE"
 fi
 
 echo "== image metadata"
-[ "$(docker image inspect -f '{{.Config.User}}' "$IMAGE")" = "65532:65532" ] \
-  || fail "image user is not 65532:65532"
+# The image starts as root and the application drops privileges itself. The :nonroot
+# base sets USER 65532, so this also catches a Dockerfile that merely deleted its USER line.
+image_user=$(docker image inspect -f '{{.Config.User}}' "$IMAGE")
+case $image_user in
+  "" | 0 | 0:0 | root | root:root) ;;
+  *) fail "image user is '$image_user', expected root (the application drops privileges)" ;;
+esac
 [ "$(docker image inspect -f '{{.Config.StopSignal}}' "$IMAGE")" = "SIGINT" ] \
   || fail "stop signal is not SIGINT"
 
@@ -132,7 +152,8 @@ expect_contains help "$out" "listen"
 
 echo "== fresh volumes: init"
 # The application must be the first to mount each fresh volume so Docker copies
-# the image's /config (UID 65532, mode 700) into it.
+# the image's /config (UID 65532, mode 700) into it. It starts as root and keeps
+# running as 65532 because that is who owns the volume.
 for vol in "$INIT_VOLUME" "$LISTEN_VOLUME"; do
   docker volume create "$vol" >/dev/null
   app -v "$vol:/config" "$IMAGE" init --auth-token "$DUMMY_AUTH" --ct0 "$DUMMY_CT0" >/dev/null 2>&1 \
@@ -176,6 +197,107 @@ out=$(helper -v "$INIT_VOLUME:/config" "$HELPER_IMAGE" \
   || fail "helper cannot access /config as UID 65532: $out"
 expect_contains permissions "$out" "/config 65532:700"
 expect_contains permissions "$out" "$CONFIG 65532:"
+
+echo "== bind mounts: the application follows the owner of /config"
+BIND_DIR=$(mktemp -d "${TMPDIR:-/tmp}/angelic-smoke.XXXXXX")
+# empty: root-owned, as Docker creates a missing bind-mount source.
+# legacy: root-owned with files an earlier root run left behind.
+# nas: root-owned, holding a 0600 config of UID 1000 that an earlier `user: 1000:1000` run left.
+# foreign: owned by an arbitrary UID.
+# locked: root-owned, for a container that is told to run as a non-root user.
+root_helper -v "$BIND_DIR:/work" "$HELPER_IMAGE" sh -c '
+  mkdir /work/empty /work/legacy /work/nas /work/foreign /work/locked &&
+  chown 12345:12345 /work/foreign && chmod 700 /work/foreign' \
+  || fail "cannot create the bind-mount directories"
+
+# a. A root-owned empty directory is handed to 65532.
+out=$(app -v "$BIND_DIR/empty:/config" "$IMAGE" init --auth-token "$DUMMY_AUTH" --ct0 "$DUMMY_CT0" 2>&1) \
+  || fail "init failed on a root-owned empty bind mount: $out"
+expect_contains bind-empty "$out" "running as 65532:65532 owning /config"
+out=$(root_helper -v "$BIND_DIR/empty:/config" "$HELPER_IMAGE" \
+  sh -c "stat -c '%n %u:%g' /config $CONFIG $CONFIG.lock") \
+  || fail "cannot inspect the root-owned empty bind mount: $out"
+expect_contains bind-empty-owner "$out" "/config 65532:65532"
+expect_contains bind-empty-owner "$out" "$CONFIG 65532:65532"
+expect_contains bind-empty-owner "$out" "$CONFIG.lock 65532:65532"
+out=$(app -v "$BIND_DIR/empty:/config" "$IMAGE" status 2>&1) || fail "status failed on the empty bind mount: $out"
+expect_contains bind-empty-status "$out" "$DUMMY_AUTH"
+
+# a'. Known files of a root-owned directory follow it; unrelated files stay as they are.
+root_helper -i -v "$BIND_DIR/legacy:/config" "$HELPER_IMAGE" \
+  sh -c "cat > $CONFIG && touch $CONFIG.lock /config/unrelated.txt" <<TOML \
+  || fail "cannot seed the legacy bind mount"
+[twitter]
+auth_token = "$DUMMY_AUTH"
+ct0 = "$DUMMY_CT0"
+TOML
+out=$(app -v "$BIND_DIR/legacy:/config" "$IMAGE" status 2>&1) || fail "status failed on the legacy bind mount: $out"
+expect_contains bind-legacy "$out" "running as 65532:65532 owning /config"
+expect_contains bind-legacy "$out" "$DUMMY_AUTH"
+out=$(root_helper -v "$BIND_DIR/legacy:/config" "$HELPER_IMAGE" \
+  sh -c "stat -c '%n %u:%g' /config $CONFIG $CONFIG.lock /config/unrelated.txt") \
+  || fail "cannot inspect the legacy bind mount: $out"
+expect_contains bind-legacy-owner "$out" "/config 65532:65532"
+expect_contains bind-legacy-owner "$out" "$CONFIG 65532:65532"
+expect_contains bind-legacy-owner "$out" "$CONFIG.lock 65532:65532"
+expect_contains bind-legacy-owner "$out" "/config/unrelated.txt 0:0"
+
+# a''. An existing config owned by a non-root user wins over the root-owned directory:
+# the directory is handed to that user, so a 0600 file stays readable and a lock can be created.
+root_helper -i -v "$BIND_DIR/nas:/config" "$HELPER_IMAGE" \
+  sh -c "cat > $CONFIG && chown 1000:10 $CONFIG && chmod 600 $CONFIG" <<TOML \
+  || fail "cannot seed the nas bind mount"
+[twitter]
+auth_token = "x"
+ct0 = "y"
+TOML
+out=$(app -v "$BIND_DIR/nas:/config" "$IMAGE" status 2>&1) || fail "status failed on the nas bind mount: $out"
+expect_contains bind-nas "$out" "running as 1000:10 owning /config"
+expect_contains bind-nas "$out" "$CONFIG"
+out=$(app -v "$BIND_DIR/nas:/config" "$IMAGE" init --auth-token "$DUMMY_AUTH" --ct0 "$DUMMY_CT0" 2>&1) \
+  || fail "init failed on the nas bind mount: $out"
+out=$(root_helper -v "$BIND_DIR/nas:/config" "$HELPER_IMAGE" \
+  sh -c "stat -c '%n %u:%g %a' /config $CONFIG $CONFIG.lock") \
+  || fail "cannot inspect the nas bind mount: $out"
+expect_contains bind-nas-owner "$out" "/config 1000:10 "
+expect_contains bind-nas-owner "$out" "$CONFIG 1000:10 600"
+expect_contains bind-nas-owner "$out" "$CONFIG.lock 1000:10 "
+
+# b. A directory owned by another UID is followed as is; the process is not root.
+out=$(app -v "$BIND_DIR/foreign:/config" "$IMAGE" init --auth-token "$DUMMY_AUTH" --ct0 "$DUMMY_CT0" 2>&1) \
+  || fail "init failed on a bind mount owned by 12345:12345: $out"
+expect_contains bind-foreign "$out" "running as 12345:12345 owning /config"
+out=$(app -v "$BIND_DIR/foreign:/config" "$IMAGE" status 2>&1) \
+  || fail "status failed on a bind mount owned by 12345:12345: $out"
+expect_contains bind-foreign-status "$out" "running as 12345:12345 owning /config"
+expect_contains bind-foreign-status "$out" "$DUMMY_AUTH"
+out=$(root_helper -v "$BIND_DIR/foreign:/config" "$HELPER_IMAGE" \
+  sh -c "stat -c '%n %u:%g' /config $CONFIG $CONFIG.lock") \
+  || fail "cannot inspect the bind mount owned by 12345:12345: $out"
+expect_contains bind-foreign-owner "$out" "/config 12345:12345"
+expect_contains bind-foreign-owner "$out" "$CONFIG 12345:12345"
+expect_contains bind-foreign-owner "$out" "$CONFIG.lock 12345:12345"
+
+# c. An explicit non-root user is respected: nothing is switched or chowned.
+out=$(app --user 65532:65532 -v "$INIT_VOLUME:/config" "$IMAGE" status 2>&1) \
+  || fail "status failed with --user 65532:65532: $out"
+expect_contains explicit-user "$out" "$DUMMY_AUTH"
+case $out in
+  *"running as"*) fail "a non-root start must not switch users: $out" ;;
+esac
+set +e
+out=$(app --user 65532:65532 -v "$BIND_DIR/locked:/config" "$IMAGE" init \
+  --auth-token "$DUMMY_AUTH" --ct0 "$DUMMY_CT0" 2>&1)
+code=$?
+set -e
+[ "$code" -ne 0 ] || fail "init as 65532 succeeded on a root-owned directory: $out"
+expect_contains explicit-user-denied "$out" "Permission denied"
+out=$(root_helper -v "$BIND_DIR/locked:/config" "$HELPER_IMAGE" sh -c "stat -c '%n %u:%g' /config; ls -A /config") \
+  || fail "cannot inspect the locked bind mount: $out"
+expect_contains explicit-user-untouched "$out" "/config 0:0"
+case $out in
+  *angelic-angel*) fail "a non-root start must not create files in a root-owned directory: $out" ;;
+esac
 
 echo "== listen without registration"
 set +e

@@ -4,6 +4,8 @@ mod config;
 mod error;
 mod listener;
 mod notifications;
+#[cfg(unix)]
+mod privileges;
 mod push;
 mod status;
 mod transaction;
@@ -27,10 +29,24 @@ use tracing_subscriber::EnvFilter;
 /// X や AutoPush のエンドポイントを連打しないための間隔になる。
 const AUTO_REGISTER_FAILURE_DELAY: Duration = Duration::from_secs(30);
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cli = Cli::parse();
 
+    // 設定ファイルやロックを開く前に、root なら設定ディレクトリの所有者へ権限を落とす。
+    #[cfg(unix)]
+    {
+        if let Err(e) = privileges::drop_to_config_owner(&cli.config) {
+            eprintln!("{} {}", style("error:").red().bold(), e);
+            std::process::exit(1);
+        }
+    }
+
+    run(cli);
+}
+
+/// 権限を落とした後に tokio のランタイムを作る（スレッドを増やす前に uid を確定させる）。
+#[tokio::main]
+async fn run(cli: Cli) {
     let filter = if cli.verbose {
         EnvFilter::new("debug")
     } else {

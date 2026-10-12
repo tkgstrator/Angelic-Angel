@@ -185,11 +185,14 @@ pub struct SettingsUpdate {
     pub notification_filter: Option<NotificationFilterInput>,
 }
 
-/// 更新では 3 区分すべての指定を必須にし、部分指定で他の区分が黙って有効に戻るのを防ぐ。
+/// 更新では全区分の指定を必須にし、部分指定で他の区分が黙って有効に戻るのを防ぐ。
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotificationFilterInput {
     pub tweet: bool,
+    pub retweet: bool,
+    pub quote: bool,
+    pub reply: bool,
     pub xchat_message_received: bool,
     pub other: bool,
 }
@@ -198,6 +201,9 @@ impl From<NotificationFilterInput> for NotificationFilter {
     fn from(input: NotificationFilterInput) -> Self {
         Self {
             tweet: input.tweet,
+            retweet: input.retweet,
+            quote: input.quote,
+            reply: input.reply,
             xchat_message_received: input.xchat_message_received,
             other: input.other,
         }
@@ -1371,9 +1377,13 @@ mod tests {
         assert_eq!(err.code, "invalid_cursor");
     }
 
+    /// `retweet`・`quote`・`reply` は `tweet` に揃える。個別に変える場合は構造体を直接作る。
     fn filter_input(tweet: bool, chat: bool, other: bool) -> Option<NotificationFilterInput> {
         Some(NotificationFilterInput {
             tweet,
+            retweet: tweet,
+            quote: tweet,
+            reply: tweet,
             xchat_message_received: chat,
             other,
         })
@@ -1499,6 +1509,101 @@ mod tests {
         std::fs::write(&path, "not = [valid toml").unwrap();
         let err = service.notifications(None, 10).await.unwrap_err();
         assert_eq!(err.code, "config_invalid");
+    }
+
+    #[tokio::test]
+    async fn retweets_are_filtered_independently_of_tweets() {
+        let (_, service, path) = setup();
+        service.update_settings(first_setup()).await.unwrap();
+        let retweet = serde_json::json!({"data": {
+            "type": "tweet", "uri": "/a/status/1", "tag": "tweet-2"
+        }});
+        let tweet = serde_json::json!({"data": {
+            "type": "tweet", "uri": "/a/status/3", "tag": "tweet-3"
+        }});
+        notifications::append(&path, "tweet", &tweet).unwrap();
+        notifications::append(&path, "retweet", &retweet).unwrap();
+        let ids = |page: NotificationPage| -> Vec<String> {
+            page.items.into_iter().map(|item| item.id).collect()
+        };
+        assert_eq!(
+            ids(service.notifications(None, 10).await.unwrap()),
+            ["retweet", "tweet"]
+        );
+
+        let dto = service
+            .update_settings(SettingsUpdate {
+                auth_token: None,
+                ct0: None,
+                webhook_endpoint: String::new(),
+                notification_filter: Some(NotificationFilterInput {
+                    tweet: true,
+                    retweet: false,
+                    quote: true,
+                    reply: true,
+                    xchat_message_received: true,
+                    other: true,
+                }),
+            })
+            .await
+            .unwrap();
+        assert!(dto.notification_filter.tweet && !dto.notification_filter.retweet);
+        assert!(!Config::load(&path).unwrap().notification_filter.retweet);
+        let page = service.notifications(None, 10).await.unwrap();
+        assert!(!page.notification_filter.retweet);
+        assert_eq!(ids(page), ["tweet"]);
+    }
+
+    #[tokio::test]
+    async fn quotes_and_replies_are_filtered_independently() {
+        use crate::notifications::NotificationKind::{Quote, Reply, Tweet};
+        let (_, service, path) = setup();
+        service.update_settings(first_setup()).await.unwrap();
+        let payload = serde_json::json!({"data": {"type": "tweet"}});
+        for (id, kind) in [("tweet", Tweet), ("quote", Quote), ("reply", Reply)] {
+            notifications::append_as(&path, id, &payload, kind).unwrap();
+        }
+        let ids = |page: NotificationPage| -> Vec<String> {
+            page.items.into_iter().map(|item| item.id).collect()
+        };
+        let update = |quote, reply| SettingsUpdate {
+            auth_token: None,
+            ct0: None,
+            webhook_endpoint: String::new(),
+            notification_filter: Some(NotificationFilterInput {
+                tweet: true,
+                retweet: true,
+                quote,
+                reply,
+                xchat_message_received: true,
+                other: true,
+            }),
+        };
+        assert_eq!(
+            ids(service.notifications(None, 10).await.unwrap()),
+            ["reply", "quote", "tweet"]
+        );
+
+        let dto = service.update_settings(update(false, true)).await.unwrap();
+        assert!(!dto.notification_filter.quote && dto.notification_filter.reply);
+        let saved = Config::load(&path).unwrap().notification_filter;
+        assert!(!saved.quote && saved.reply);
+        assert_eq!(
+            ids(service.notifications(None, 10).await.unwrap()),
+            ["reply", "tweet"]
+        );
+
+        service.update_settings(update(true, false)).await.unwrap();
+        assert_eq!(
+            ids(service.notifications(None, 10).await.unwrap()),
+            ["quote", "tweet"]
+        );
+
+        service.update_settings(update(false, false)).await.unwrap();
+        assert_eq!(
+            ids(service.notifications(None, 10).await.unwrap()),
+            ["tweet"]
+        );
     }
 
     #[tokio::test]

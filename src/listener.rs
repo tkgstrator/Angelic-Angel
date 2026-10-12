@@ -3,12 +3,18 @@ use crate::config::{self, Config, Registration};
 use crate::error::{AngelicAngelError, Result};
 use crate::notifications;
 use crate::status::Telemetry;
+use crate::tweet_lookup::TweetLookup;
 use crate::twitter;
-use reqwest::Client;
+use hmac::{Hmac, Mac};
+use reqwest::header::{CONTENT_TYPE, HeaderName, HeaderValue};
+use reqwest::{Client, Url, redirect};
+use sha2::Sha256;
+use std::net::IpAddr;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(30);
+const SIGNATURE_HEADER: HeaderName = HeaderName::from_static("webhook-signature");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForwardOutcome {
@@ -163,7 +169,10 @@ async fn try_connect(
             );
 
             tracing::info!("re-registering with Twitter API");
-            let full_config = config::Config::load(config_path)?;
+            // 環境変数で自動登録した設定は [twitter] が空なので、ファイルだけでなく環境変数も見る。
+            let (env_auth, env_csrf) = config::twitter_env_pair();
+            let twitter_credentials =
+                reregistration_twitter(config_path, env_auth.as_deref(), env_csrf.as_deref())?;
 
             let subscription = crate::push::PushSubscription {
                 endpoint: new_reg.endpoint.clone(),
@@ -174,7 +183,7 @@ async fn try_connect(
                 keys: new_keys.clone(),
             };
 
-            twitter::register(&full_config.twitter, &subscription).await?;
+            twitter::register(&twitter_credentials, &subscription).await?;
             tracing::info!("Twitter API re-registration complete");
 
             registration.endpoint = new_reg.endpoint.clone();
@@ -204,6 +213,16 @@ async fn try_connect(
     }
 }
 
+/// UAID 無効化後の再登録で X に渡す認証情報（環境変数が優先、無ければ設定ファイル）。
+fn reregistration_twitter(
+    config_path: &Path,
+    env_auth: Option<&str>,
+    env_csrf: Option<&str>,
+) -> Result<config::TwitterConfig> {
+    let stored = config::Config::load(config_path)?;
+    config::require_twitter_with(env_auth, env_csrf, &stored.twitter)
+}
+
 /// Receives and processes notifications in a loop until the connection drops.
 async fn run_notification_loop(
     client: &mut autopush::AutoPushClient,
@@ -211,6 +230,9 @@ async fn run_notification_loop(
     config_path: &Path,
     telemetry: &Telemetry,
 ) -> Result<()> {
+    // 非 Unicode の値は未設定として扱う。
+    let webhook_secret = std::env::var("WEBHOOK_SECRET_KEY").ok();
+    let lookup = TweetLookup::production()?;
     while let Some(notification) = client.next_notification().await? {
         tracing::info!(
             channel_id = %notification.channel_id,
@@ -227,6 +249,8 @@ async fn run_notification_loop(
                 &registration.keys,
                 config_path,
                 &history_id,
+                webhook_secret.as_deref(),
+                &lookup,
             )
             .await
             {
@@ -282,6 +306,8 @@ async fn handle_notification_data(
     keys: &crate::config::WebPushKeys,
     config_path: &Path,
     history_id: &str,
+    webhook_secret: Option<&str>,
+    lookup: &TweetLookup,
 ) -> Result<ForwardOutcome> {
     let encrypted = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, data)
         .map_err(|e| AngelicAngelError::Decryption(format!("base64 decode failed: {}", e)))?;
@@ -319,7 +345,8 @@ async fn handle_notification_data(
 
     tracing::debug!(payload_bytes, "notification decrypted");
 
-    record_history(config_path, history_id, &payload).await;
+    let kind = notifications::resolve_kind(&payload, lookup).await;
+    record_history(config_path, history_id, &payload, kind).await;
 
     // 履歴保存後に一度だけ設定を読み、フィルターと Webhook の解決に同じ内容を使う。
     let config = Config::load_optional(config_path)?;
@@ -327,7 +354,7 @@ async fn handle_notification_data(
         .as_ref()
         .map(|c| c.notification_filter)
         .unwrap_or_default();
-    if !filter.allows(notifications::classify(&payload)) {
+    if !filter.allows(kind) {
         tracing::info!("notification kind is disabled by the filter, skipping forward");
         return Ok(ForwardOutcome::Skipped);
     }
@@ -337,16 +364,21 @@ async fn handle_notification_data(
         return Ok(ForwardOutcome::Skipped);
     };
 
-    send_to_webhook(&payload, &webhook_url).await
+    send_to_webhook(&payload, &webhook_url, webhook_secret).await
 }
 
 /// Stores the notification in the local history. A failure never blocks forwarding or the ACK.
-async fn record_history(config_path: &Path, history_id: &str, payload: &serde_json::Value) {
+async fn record_history(
+    config_path: &Path,
+    history_id: &str,
+    payload: &serde_json::Value,
+    kind: notifications::NotificationKind,
+) {
     let config_path = config_path.to_path_buf();
     let history_id = history_id.to_owned();
     let payload = payload.clone();
     let saved = tokio::task::spawn_blocking(move || {
-        notifications::append(&config_path, &history_id, &payload)
+        notifications::append_as(&config_path, &history_id, &payload, kind)
     })
     .await;
     if !matches!(saved, Ok(Ok(()))) {
@@ -354,28 +386,97 @@ async fn record_history(config_path: &Path, history_id: &str, payload: &serde_js
     }
 }
 
-/// Sends the decrypted notification payload to the configured webhook endpoint via HTTP POST.
-///
-/// Returns whether the endpoint answered with a 2xx status.
-async fn send_to_webhook(payload: &serde_json::Value, webhook_url: &str) -> Result<ForwardOutcome> {
-    let client = Client::builder().timeout(WEBHOOK_TIMEOUT).build()?;
+/// 通知を署名付き(`Webhook-Signature`)で Webhook へ POST し、2xx で応答したかを返す。
+async fn send_to_webhook(
+    payload: &serde_json::Value,
+    webhook_url: &str,
+    secret: Option<&str>,
+) -> Result<ForwardOutcome> {
+    let url = checked_webhook_url(webhook_url)?;
+    let secret = secret.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+        AngelicAngelError::Config("WEBHOOK_SECRET_KEY is required to send to a webhook".into())
+    })?;
 
-    tracing::info!(url = %webhook_url, "sending to webhook");
+    let body = serde_json::to_vec(payload)?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AngelicAngelError::Config("system clock is before the Unix epoch".into()))?
+        .as_secs();
+    let signature = signature_header(secret, timestamp, &body)?;
 
-    let response = client.post(webhook_url).json(payload).send().await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| String::from("failed to read response body"));
-        tracing::warn!(status = %status, body = %error_text, "webhook request failed");
-        Ok(ForwardOutcome::Failed)
-    } else {
-        tracing::info!(status = %response.status(), "webhook request succeeded");
-        Ok(ForwardOutcome::Forwarded)
+    // 別オリジンへ本文と署名が流出しないようリダイレクトは追従しない。
+    let mut builder = Client::builder()
+        .timeout(WEBHOOK_TIMEOUT)
+        .redirect(redirect::Policy::none());
+    // ローカル宛ての平文 HTTP は、環境の proxy に本文と署名を渡さないよう直接接続する。
+    if url.scheme() == "http" {
+        builder = builder.no_proxy();
     }
+    let client = builder.build()?;
+
+    tracing::info!("sending to webhook");
+
+    let response = client
+        .post(url)
+        .header(CONTENT_TYPE, "application/json")
+        .header(SIGNATURE_HEADER, signature)
+        .body(body)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
+
+    // 応答本文と URL には機密が含まれうるため、ログにはステータスだけを出す。
+    let status = response.status();
+    if status.is_success() {
+        tracing::info!(status = %status, "webhook request succeeded");
+        Ok(ForwardOutcome::Forwarded)
+    } else {
+        tracing::warn!(status = %status, "webhook request failed");
+        Ok(ForwardOutcome::Failed)
+    }
+}
+
+/// HTTPS のみ許可し、HTTP は loopback または Docker ホスト名宛てに限る。
+fn checked_webhook_url(raw: &str) -> Result<Url> {
+    let rejected = || {
+        AngelicAngelError::Config(
+            "webhook URL must be HTTPS (HTTP only for loopback or host.docker.internal)".into(),
+        )
+    };
+    let url = Url::parse(raw).map_err(|_| rejected())?;
+    match url.scheme() {
+        "https" => Ok(url),
+        "http" if is_local_http_host(&url) => Ok(url),
+        _ => Err(rejected()),
+    }
+}
+
+fn is_local_http_host(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host == "host.docker.internal"
+        || host == "localhost"
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// `t=<秒>,v1=<hex>` の署名ヘッダー値を作る。MAC の対象は `<秒>.<本文 bytes>`。
+fn signature_header(secret: &str, timestamp: u64, body: &[u8]) -> Result<HeaderValue> {
+    let failed = || AngelicAngelError::Config("failed to sign the webhook request".into());
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| failed())?;
+    mac.update(timestamp.to_string().as_bytes());
+    mac.update(b".");
+    mac.update(body);
+    let digest = mac.finalize().into_bytes();
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let mut value =
+        HeaderValue::from_str(&format!("t={timestamp},v1={hex}")).map_err(|_| failed())?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 fn decrypt_ece(
@@ -510,42 +611,86 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    /// Accepts one HTTP request and answers 200, handing the request body to the caller.
-    async fn mock_webhook() -> (String, tokio::task::JoinHandle<String>) {
+    use crate::tweet_lookup::mock::{MockApi, REFUSED_ENDPOINT, http_response, json_response};
+
+    const TEST_SECRET: &str = "whsec_synthetic_test_key";
+    const OK_RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    /// モックが受け取ったリクエストの生 bytes。
+    struct Captured {
+        request_line: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl Captured {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    /// 1 リクエストだけ受け付けて `response` を返し、受け取った内容を渡す。
+    async fn serve_once(response: String) -> (String, tokio::task::JoinHandle<Captured>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/hook", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut buf = Vec::new();
             let mut chunk = [0u8; 4096];
-            loop {
+            let (head_len, content_length) = loop {
                 let n = stream.read(&mut chunk).await.unwrap();
                 buf.extend_from_slice(&chunk[..n]);
-                let text = String::from_utf8_lossy(&buf).into_owned();
-                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
                     let length = head
                         .lines()
-                        .find_map(|l| {
-                            l.to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(str::to_owned)
-                        })
+                        .find_map(|l| l.strip_prefix("content-length:"))
                         .and_then(|v| v.trim().parse::<usize>().ok())
                         .unwrap_or(0);
-                    if body.len() >= length || n == 0 {
-                        stream
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                            .await
-                            .unwrap();
-                        return body.to_string();
-                    }
+                    break (pos + 4, length);
                 }
-                if n == 0 {
-                    return String::new();
-                }
+                assert!(n > 0, "connection closed before the request head");
+            };
+            while buf.len() < head_len + content_length {
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "connection closed before the request body");
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            stream.write_all(response.as_bytes()).await.unwrap();
+            let head = String::from_utf8(buf[..head_len - 4].to_vec()).unwrap();
+            let mut lines = head.split("\r\n");
+            let request_line = lines.next().unwrap().to_string();
+            let headers = lines
+                .map(|l| {
+                    let (k, v) = l.split_once(':').unwrap();
+                    (k.to_string(), v.trim().to_string())
+                })
+                .collect();
+            Captured {
+                request_line,
+                headers,
+                body: buf[head_len..head_len + content_length].to_vec(),
             }
         });
         (url, task)
+    }
+
+    /// 1 リクエストだけ受け付けて 200 を返し、本文を文字列で渡す。
+    async fn mock_webhook() -> (String, tokio::task::JoinHandle<String>) {
+        let (url, task) = serve_once(OK_RESPONSE.to_string()).await;
+        let body =
+            tokio::spawn(
+                async move { String::from_utf8_lossy(&task.await.unwrap().body).into_owned() },
+            );
+        (url, body)
+    }
+
+    /// 接続を拒否される照会先。本物の API には通信せず、照会は常に失敗する。
+    fn no_lookup() -> TweetLookup {
+        TweetLookup::with_endpoint(REFUSED_ENDPOINT).unwrap()
     }
 
     fn write_config(path: &Path, webhook: &str) {
@@ -568,6 +713,42 @@ mod tests {
         }
         .save(path)
         .unwrap();
+    }
+
+    #[test]
+    fn reregistration_uses_environment_credentials_when_the_file_has_none() {
+        let dir = test_temp_dir();
+        let path = dir.join("angelic-angel.toml");
+        // 環境変数で自動登録した設定は [twitter] を持たない。
+        Config::default().save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("twitter"));
+
+        let t = reregistration_twitter(&path, Some("env-auth"), Some("env-ct0")).unwrap();
+        assert_eq!(
+            (t.auth_token.as_str(), t.ct0.as_str()),
+            ("env-auth", "env-ct0")
+        );
+        // 環境変数が無ければ空の認証情報で X を呼ばず、設定の不足として失敗する。
+        let err = reregistration_twitter(&path, None, None).unwrap_err();
+        assert!(matches!(err, AngelicAngelError::Config(_)), "{err}");
+    }
+
+    #[test]
+    fn reregistration_prefers_environment_and_rejects_a_half_set_pair() {
+        let dir = test_temp_dir();
+        let path = dir.join("angelic-angel.toml");
+        write_config(&path, "https://example.com/h");
+
+        let t = reregistration_twitter(&path, Some("env-auth"), Some("env-ct0")).unwrap();
+        assert_eq!(t.auth_token, "env-auth");
+        let t = reregistration_twitter(&path, None, None).unwrap();
+        assert_eq!(t.auth_token, "synthetic");
+
+        // 片方だけなら、ファイルの値へ黙って戻さずエラーにする。
+        for (auth, csrf) in [(Some("env-auth"), None), (None, Some("env-ct0"))] {
+            let err = reregistration_twitter(&path, auth, csrf).unwrap_err();
+            assert!(matches!(err, AngelicAngelError::Config(_)), "{err}");
+        }
     }
 
     fn encrypted_message(payload: &str) -> (String, WebPushKeys) {
@@ -593,9 +774,17 @@ mod tests {
             r#"{"title":"Synthetic","body":"hello","data":{"url":"https://x.com/i/status/1"}}"#;
         let (data, keys) = encrypted_message(message);
 
-        let outcome = handle_notification_data(&data, &None, &keys, &path, "chan:7")
-            .await
-            .unwrap();
+        let outcome = handle_notification_data(
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:7",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, ForwardOutcome::Forwarded);
         assert!(server.await.unwrap().contains("Synthetic"));
@@ -618,9 +807,17 @@ mod tests {
         std::fs::create_dir(path.with_file_name("c.toml.notifications.sqlite3")).unwrap();
         let (data, keys) = encrypted_message(r#"{"title":"Still forwarded"}"#);
 
-        let outcome = handle_notification_data(&data, &None, &keys, &path, "chan:8")
-            .await
-            .unwrap();
+        let outcome = handle_notification_data(
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:8",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, ForwardOutcome::Forwarded);
         assert!(server.await.unwrap().contains("Still forwarded"));
@@ -634,9 +831,17 @@ mod tests {
         write_config(&path, &url);
         let (data, keys) = encrypted_message("not json at all");
 
-        handle_notification_data(&data, &None, &keys, &path, "chan:9")
-            .await
-            .unwrap();
+        handle_notification_data(
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:9",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
         server.await.unwrap();
 
         let item = notifications::list(&path, None, 1).unwrap().items.remove(0);
@@ -652,9 +857,17 @@ mod tests {
         write_config_with(&path, webhook);
         let (data, keys) = encrypted_message(&format!(r#"{{"title":"{title}"}}"#));
 
-        let outcome = handle_notification_data(&data, &None, &keys, &path, id)
-            .await
-            .unwrap();
+        let outcome = handle_notification_data(
+            &data,
+            &None,
+            &keys,
+            &path,
+            id,
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, ForwardOutcome::Skipped);
         let page = notifications::list(&path, None, 10).unwrap();
@@ -678,9 +891,17 @@ mod tests {
         let path = test_temp_dir().join("c.toml");
         let (data, keys) = encrypted_message(r#"{"title":"No config"}"#);
 
-        let outcome = handle_notification_data(&data, &None, &keys, &path, "chan:12")
-            .await
-            .unwrap();
+        let outcome = handle_notification_data(
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:12",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, ForwardOutcome::Skipped);
         let page = notifications::list(&path, None, 10).unwrap();
@@ -704,6 +925,9 @@ mod tests {
     fn only(tweet: bool, chat: bool, other: bool) -> NotificationFilter {
         NotificationFilter {
             tweet,
+            retweet: true,
+            quote: true,
+            reply: true,
             xchat_message_received: chat,
             other,
         }
@@ -736,10 +960,17 @@ mod tests {
             write_config_filtered(&path, Some(&url), filter);
             let (data, keys) = encrypted_message(message);
 
-            let outcome =
-                handle_notification_data(&data, &None, &keys, &path, &format!("chan:{n}"))
-                    .await
-                    .unwrap();
+            let outcome = handle_notification_data(
+                &data,
+                &None,
+                &keys,
+                &path,
+                &format!("chan:{n}"),
+                Some(TEST_SECRET),
+                &no_lookup(),
+            )
+            .await
+            .unwrap();
 
             assert_eq!(outcome, ForwardOutcome::Skipped, "{message}");
             assert!(nothing_was_sent(&listener).await, "{message}");
@@ -750,6 +981,261 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_retweet_is_recorded_but_not_forwarded() {
+        let filter = NotificationFilter {
+            retweet: false,
+            ..NotificationFilter::default()
+        };
+        let retweet =
+            r#"{"title":"RT","data":{"type":"tweet","uri":"/a/status/1","tag":"tweet-2"}}"#;
+        let tweet =
+            r#"{"title":"Own","data":{"type":"tweet","uri":"/a/status/3","tag":"tweet-3"}}"#;
+
+        let path = test_temp_dir().join("c.toml");
+        let (url, listener) = silent_webhook().await;
+        write_config_filtered(&path, Some(&url), filter);
+        let (data, keys) = encrypted_message(retweet);
+        let outcome = handle_notification_data(
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:25",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ForwardOutcome::Skipped);
+        assert!(nothing_was_sent(&listener).await);
+        let item = notifications::list(&path, None, 1).unwrap().items.remove(0);
+        assert_eq!(item.id, "chan:25");
+        assert_eq!(item.kind, notifications::NotificationKind::Retweet);
+
+        // 同じ設定でも、ID が一致する通常の投稿は転送される。
+        let path = test_temp_dir().join("c.toml");
+        let (url, server) = mock_webhook().await;
+        write_config_filtered(&path, Some(&url), filter);
+        let (data, keys) = encrypted_message(tweet);
+        let outcome = handle_notification_data(
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:26",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ForwardOutcome::Forwarded);
+        assert!(server.await.unwrap().contains("Own"));
+    }
+
+    /// 照会 ID が 5 の通常投稿（`data.uri` と `data.tag` の ID が一致する）。
+    const LOOKED_UP_TWEET: &str =
+        r#"{"title":"Looked up","data":{"type":"tweet","uri":"/a/status/5","tag":"tweet-5"}}"#;
+    const LOOKED_UP_REQUEST: &str = "GET /tweet-result?id=5&token=0 HTTP/1.1";
+
+    #[tokio::test]
+    async fn quote_and_reply_are_decided_by_the_lookup_for_history_and_filter() {
+        use notifications::NotificationKind::{Quote, Reply};
+        let cases = [
+            (
+                r#"{"__typename":"Tweet","quoted_tweet":{"id_str":"1"}}"#,
+                Quote,
+                NotificationFilter {
+                    quote: false,
+                    ..NotificationFilter::default()
+                },
+                NotificationFilter {
+                    reply: false,
+                    ..NotificationFilter::default()
+                },
+            ),
+            (
+                r#"{"__typename":"Tweet","in_reply_to_status_id_str":"1"}"#,
+                Reply,
+                NotificationFilter {
+                    reply: false,
+                    ..NotificationFilter::default()
+                },
+                NotificationFilter {
+                    quote: false,
+                    ..NotificationFilter::default()
+                },
+            ),
+        ];
+        for (n, (response, kind, disabled, other_disabled)) in cases.into_iter().enumerate() {
+            let api = MockApi::start(json_response(response)).await;
+            let lookup = TweetLookup::with_endpoint(&api.url).unwrap();
+
+            // 該当する区分を無効にすると、履歴には残るが転送されない。
+            let path = test_temp_dir().join("c.toml");
+            let (url, listener) = silent_webhook().await;
+            write_config_filtered(&path, Some(&url), disabled);
+            let (data, keys) = encrypted_message(LOOKED_UP_TWEET);
+            let id = format!("chan:8{n}");
+            let outcome = handle_notification_data(
+                &data,
+                &None,
+                &keys,
+                &path,
+                &id,
+                Some(TEST_SECRET),
+                &lookup,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, ForwardOutcome::Skipped, "{kind:?}");
+            assert!(nothing_was_sent(&listener).await, "{kind:?}");
+            let item = notifications::list(&path, None, 1).unwrap().items.remove(0);
+            assert_eq!((item.id.as_str(), item.kind), (id.as_str(), kind));
+            assert_eq!(api.requests(), [LOOKED_UP_REQUEST]);
+
+            // もう一方の区分だけを無効にしても、この区分は転送され、同じ区分で記録される。
+            let path = test_temp_dir().join("c.toml");
+            let (url, server) = mock_webhook().await;
+            write_config_filtered(&path, Some(&url), other_disabled);
+            let id = format!("chan:9{n}");
+            let outcome = handle_notification_data(
+                &data,
+                &None,
+                &keys,
+                &path,
+                &id,
+                Some(TEST_SECRET),
+                &lookup,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, ForwardOutcome::Forwarded, "{kind:?}");
+            assert!(server.await.unwrap().contains("Looked up"));
+            let item = notifications::list(&path, None, 1).unwrap().items.remove(0);
+            assert_eq!((item.id.as_str(), item.kind), (id.as_str(), kind));
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_lookup_leaves_the_notification_a_tweet() {
+        let failing = [
+            (
+                "500",
+                Some(http_response(
+                    "500 Internal Server Error",
+                    "text/plain",
+                    b"x",
+                )),
+            ),
+            ("refused", None),
+        ];
+        for (name, response) in failing {
+            let api = match response {
+                Some(response) => Some(MockApi::start(response).await),
+                None => None,
+            };
+            let lookup = match &api {
+                Some(api) => TweetLookup::with_endpoint(&api.url).unwrap(),
+                None => no_lookup(),
+            };
+            let (data, keys) = encrypted_message(LOOKED_UP_TWEET);
+
+            // quote と reply を無効にしていても、通常の投稿として転送される。
+            let path = test_temp_dir().join("c.toml");
+            let (url, server) = mock_webhook().await;
+            let filter = NotificationFilter {
+                quote: false,
+                reply: false,
+                ..NotificationFilter::default()
+            };
+            write_config_filtered(&path, Some(&url), filter);
+            let outcome = handle_notification_data(
+                &data,
+                &None,
+                &keys,
+                &path,
+                "chan:100",
+                Some(TEST_SECRET),
+                &lookup,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, ForwardOutcome::Forwarded, "{name}");
+            assert!(server.await.unwrap().contains("Looked up"));
+            let item = notifications::list(&path, None, 1).unwrap().items.remove(0);
+            assert_eq!(item.kind, notifications::NotificationKind::Tweet, "{name}");
+
+            // tweet を無効にすると、その通常の投稿として除外される。
+            let path = test_temp_dir().join("c.toml");
+            let (url, listener) = silent_webhook().await;
+            write_config_filtered(&path, Some(&url), only(false, true, true));
+            let outcome = handle_notification_data(
+                &data,
+                &None,
+                &keys,
+                &path,
+                "chan:101",
+                Some(TEST_SECRET),
+                &lookup,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, ForwardOutcome::Skipped, "{name}");
+            assert!(nothing_was_sent(&listener).await, "{name}");
+            let item = notifications::list(&path, None, 1).unwrap().items.remove(0);
+            assert_eq!(item.kind, notifications::NotificationKind::Tweet, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn only_plain_tweets_are_looked_up() {
+        use notifications::NotificationKind::{Other, Retweet, XchatMessageReceived};
+        let api = MockApi::start(json_response(
+            r#"{"__typename":"Tweet","quoted_tweet":{"id_str":"1"}}"#,
+        ))
+        .await;
+        let lookup = TweetLookup::with_endpoint(&api.url).unwrap();
+        let cases = [
+            (
+                r#"{"data":{"type":"tweet","uri":"/a/status/1","tag":"tweet-2"}}"#,
+                Retweet,
+            ),
+            (
+                r#"{"data":{"type":"xchat_message_received","tag":"tweet-3"}}"#,
+                XchatMessageReceived,
+            ),
+            (r#"{"data":{"type":"novel","tag":"tweet-4"}}"#, Other),
+            (r#"{"data":{"tag":"tweet-5"}}"#, Other),
+            (r#"{"title":"no data"}"#, Other),
+        ];
+        let path = test_temp_dir().join("c.toml");
+        write_config_with(&path, None);
+        for (n, (message, kind)) in cases.into_iter().enumerate() {
+            let (data, keys) = encrypted_message(message);
+            let id = format!("chan:11{n}");
+            let outcome = handle_notification_data(
+                &data,
+                &None,
+                &keys,
+                &path,
+                &id,
+                Some(TEST_SECRET),
+                &lookup,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, ForwardOutcome::Skipped);
+            let item = notifications::list(&path, None, 1).unwrap().items.remove(0);
+            assert_eq!(
+                (item.id.as_str(), item.kind),
+                (id.as_str(), kind),
+                "{message}"
+            );
+        }
+        assert!(api.requests().is_empty());
+    }
+
+    #[tokio::test]
     async fn only_enabled_kinds_are_forwarded() {
         let path = test_temp_dir().join("c.toml");
         let (url, server) = mock_webhook().await;
@@ -757,9 +1243,17 @@ mod tests {
         let (data, keys) =
             encrypted_message(r#"{"title":"Chat","data":{"type":"xchat_message_received"}}"#);
 
-        let outcome = handle_notification_data(&data, &None, &keys, &path, "chan:20")
-            .await
-            .unwrap();
+        let outcome = handle_notification_data(
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:20",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, ForwardOutcome::Forwarded);
         assert!(server.await.unwrap().contains("Chat"));
@@ -773,9 +1267,17 @@ mod tests {
         let (data, keys) =
             encrypted_message(r#"{"notification":{"title":"Wrapped"},"data":{"type":"tweet"}}"#);
 
-        let outcome = handle_notification_data(&data, &None, &keys, &path, "chan:21")
-            .await
-            .unwrap();
+        let outcome = handle_notification_data(
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:21",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, ForwardOutcome::Forwarded);
         assert!(server.await.unwrap().contains("Wrapped"));
@@ -793,9 +1295,17 @@ mod tests {
         .to_string();
         let (data, keys) = encrypted_message(&message);
 
-        let outcome = handle_notification_data(&data, &None, &keys, &path, "chan:22")
-            .await
-            .unwrap();
+        let outcome = handle_notification_data(
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:22",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, ForwardOutcome::Skipped);
         assert!(nothing_was_sent(&listener).await);
@@ -810,9 +1320,17 @@ mod tests {
         write_config_filtered(&path, None, only(false, true, true));
         let (data, keys) = encrypted_message(r#"{"title":"T","data":{"type":"tweet"}}"#);
 
-        let outcome = handle_notification_data(&data, &None, &keys, &path, "chan:23")
-            .await
-            .unwrap();
+        let outcome = handle_notification_data(
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:23",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, ForwardOutcome::Skipped);
         assert_eq!(notifications::list(&path, None, 10).unwrap().items.len(), 1);
@@ -824,12 +1342,281 @@ mod tests {
         std::fs::write(&path, "twitter = [broken").unwrap();
         let (data, keys) = encrypted_message(r#"{"title":"Kept","data":{"type":"tweet"}}"#);
 
-        let result = handle_notification_data(&data, &None, &keys, &path, "chan:24").await;
+        let result = handle_notification_data(
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:24",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await;
 
         assert!(result.is_err());
         assert!(!is_decryption_error(&result.unwrap_err()));
         let page = notifications::list(&path, None, 10).unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].title, "Kept");
+    }
+
+    fn hex_decode(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// `t=<秒>,v1=<hex>` を受信側として検証する。
+    fn verifies(secret: &str, header: &str, body: &[u8]) -> bool {
+        let Some((t, v1)) = header
+            .strip_prefix("t=")
+            .and_then(|rest| rest.split_once(",v1="))
+        else {
+            return false;
+        };
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(t.as_bytes());
+        mac.update(b".");
+        mac.update(body);
+        v1.len() == 64
+            && v1
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            && mac.verify_slice(&hex_decode(v1)).is_ok()
+    }
+
+    // 同じシークレット・時刻・本文を Python hmac と openssl dgst でも計算して一致を確認した既知解。
+    const VECTOR_BODY: &[u8] = "{\"body\":\"quote \\\" é\",\"title\":\"通知\\n二行目\"}".as_bytes();
+    const VECTOR_HEADER: &str =
+        "t=1700000000,v1=860c9bda7c63dd307b17465f32b8a9a3f11327f6050ca8b8c7ad70d3c764ce2b";
+
+    #[test]
+    fn signature_matches_the_known_answer() {
+        let value = signature_header(TEST_SECRET, 1_700_000_000, VECTOR_BODY).unwrap();
+
+        assert_eq!(value.to_str().unwrap(), VECTOR_HEADER);
+        assert!(value.is_sensitive());
+    }
+
+    #[test]
+    fn signature_changes_with_secret_timestamp_or_body() {
+        assert!(verifies(TEST_SECRET, VECTOR_HEADER, VECTOR_BODY));
+        assert!(!verifies("whsec_other", VECTOR_HEADER, VECTOR_BODY));
+        assert!(!verifies(
+            TEST_SECRET,
+            &VECTOR_HEADER.replace("t=1700000000", "t=1700000001"),
+            VECTOR_BODY
+        ));
+        assert!(!verifies(TEST_SECRET, VECTOR_HEADER, b"{\"body\":\"x\"}"));
+        // シークレットは trim も hex デコードもせずそのまま UTF-8 として使う。
+        let spaced = signature_header(" whsec ", 1, b"{}").unwrap();
+        assert!(verifies(" whsec ", spaced.to_str().unwrap(), b"{}"));
+        assert!(!verifies("whsec", spaced.to_str().unwrap(), b"{}"));
+    }
+
+    #[test]
+    fn webhook_url_allows_https_and_local_http_only() {
+        for ok in [
+            "https://example.com/hook?token=s",
+            "http://localhost:8080/hook",
+            "http://host.docker.internal:15175/api/webhook",
+            "http://127.0.0.1:9/hook",
+            "http://127.0.0.2/hook",
+            "http://[::1]:3000/hook",
+        ] {
+            assert!(checked_webhook_url(ok).is_ok(), "{ok}");
+        }
+        for ng in [
+            "http://example.com/hook",
+            "http://192.0.2.1/hook",
+            "http://localhost.example.com/hook",
+            "http://127.0.0.1.example.com/hook",
+            "http://127.0.0.1@example.com/hook",
+            "http://host.docker.internal.example.com/hook",
+            "http://host.docker.internal@example.com/hook",
+            "http://myhost.docker.internal/hook",
+            "ftp://host.docker.internal/hook",
+            "http://[2001:db8::1]/hook",
+            "ftp://127.0.0.1/hook",
+            "not a url",
+        ] {
+            assert!(
+                matches!(checked_webhook_url(ng), Err(AngelicAngelError::Config(_))),
+                "{ng}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_request_is_signed_over_the_exact_body_bytes() {
+        let path = test_temp_dir().join("c.toml");
+        let (url, server) = serve_once(OK_RESPONSE.to_string()).await;
+        write_config(&path, &url);
+        let message =
+            r#"{"title":"通知\n二行目","body":"quote \" é \u0000 /","data":{"type":"tweet"}}"#;
+        let (data, keys) = encrypted_message(message);
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let outcome = handle_notification_data(
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:30",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
+
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(outcome, ForwardOutcome::Forwarded);
+        let captured = server.await.unwrap();
+        assert_eq!(captured.request_line, "POST /hook HTTP/1.1");
+        assert_eq!(captured.header("content-type"), Some("application/json"));
+        let header = captured.header("webhook-signature").unwrap();
+        let t: u64 = header
+            .strip_prefix("t=")
+            .and_then(|r| r.split_once(','))
+            .unwrap()
+            .0
+            .parse()
+            .unwrap();
+        assert!(
+            (before..=after).contains(&t),
+            "{t} not in {before}..={after}"
+        );
+        assert!(verifies(TEST_SECRET, header, &captured.body));
+        assert!(!verifies("whsec_other", header, &captured.body));
+        let mut tampered = captured.body.clone();
+        tampered.push(b' ');
+        assert!(!verifies(TEST_SECRET, header, &tampered));
+        let expected =
+            serde_json::to_vec(&serde_json::from_str::<serde_json::Value>(message).unwrap())
+                .unwrap();
+        assert_eq!(captured.body, expected);
+        let text = std::str::from_utf8(&captured.body).unwrap();
+        assert!(text.contains("通知\\n二行目"));
+        assert!(text.contains("\\\" é"));
+        assert!(text.contains("\\u0000"));
+    }
+
+    #[tokio::test]
+    async fn missing_or_blank_secret_blocks_sending_but_keeps_history() {
+        for (n, secret) in [None, Some(""), Some("  \t\n")].into_iter().enumerate() {
+            let path = test_temp_dir().join("c.toml");
+            let (url, listener) = silent_webhook().await;
+            write_config(&path, &url);
+            let (data, keys) = encrypted_message(r#"{"title":"Unsigned","data":{"type":"tweet"}}"#);
+
+            let result = handle_notification_data(
+                &data,
+                &None,
+                &keys,
+                &path,
+                &format!("chan:4{n}"),
+                secret,
+                &no_lookup(),
+            )
+            .await;
+
+            let error = result.unwrap_err();
+            assert!(matches!(error, AngelicAngelError::Config(_)), "{secret:?}");
+            assert!(!is_decryption_error(&error));
+            assert!(nothing_was_sent(&listener).await, "{secret:?}");
+            let page = notifications::list(&path, None, 10).unwrap();
+            assert_eq!(page.items.len(), 1, "{secret:?}");
+            assert_eq!(page.items[0].title, "Unsigned");
+        }
+    }
+
+    #[tokio::test]
+    async fn skipped_outcomes_do_not_need_a_secret() {
+        let path = test_temp_dir().join("c.toml");
+        let (url, listener) = silent_webhook().await;
+        write_config_filtered(&path, Some(&url), only(false, true, true));
+        let (data, keys) = encrypted_message(r#"{"title":"F","data":{"type":"tweet"}}"#);
+        let outcome =
+            handle_notification_data(&data, &None, &keys, &path, "chan:50", None, &no_lookup())
+                .await
+                .unwrap();
+        assert_eq!(outcome, ForwardOutcome::Skipped);
+        assert!(nothing_was_sent(&listener).await);
+        assert_eq!(notifications::list(&path, None, 10).unwrap().items.len(), 1);
+
+        let path = test_temp_dir().join("c.toml");
+        write_config_with(&path, None);
+        let (data, keys) = encrypted_message(r#"{"title":"U"}"#);
+        let outcome = handle_notification_data(
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:51",
+            Some(" "),
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ForwardOutcome::Skipped);
+        assert_eq!(notifications::list(&path, None, 10).unwrap().items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_loopback_http_is_rejected_without_touching_the_network() {
+        let path = test_temp_dir().join("c.toml");
+        write_config(&path, "http://192.0.2.1/hook?token=secret");
+        let (data, keys) = encrypted_message(r#"{"title":"Plain","data":{"type":"tweet"}}"#);
+
+        let result = handle_notification_data(
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:60",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(matches!(error, AngelicAngelError::Config(_)));
+        assert!(!error.to_string().contains("secret"));
+        assert_eq!(notifications::list(&path, None, 10).unwrap().items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        let path = test_temp_dir().join("c.toml");
+        let (target_url, target) = silent_webhook().await;
+        let redirect = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let (url, origin) = serve_once(redirect).await;
+        write_config(&path, &url);
+        let (data, keys) = encrypted_message(r#"{"title":"Moved","data":{"type":"tweet"}}"#);
+
+        let outcome = handle_notification_data(
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:70",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, ForwardOutcome::Failed);
+        assert!(origin.await.unwrap().header("webhook-signature").is_some());
+        assert!(nothing_was_sent(&target).await);
     }
 }

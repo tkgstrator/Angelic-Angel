@@ -320,7 +320,14 @@ describe('Notifications polling', () => {
 })
 
 const rowTitles = () => rows().map((r) => r.querySelector('p')?.textContent)
-const allOff = filterOf({ tweet: false, xchat_message_received: false, other: false })
+const allOff = filterOf({
+  tweet: false,
+  retweet: false,
+  quote: false,
+  reply: false,
+  xchat_message_received: false,
+  other: false,
+})
 
 describe('Notifications filter', () => {
   it('drops excluded rows when the filter changes, brings them back and handles all disabled', async () => {
@@ -357,6 +364,41 @@ describe('Notifications filter', () => {
     expect(rowTitles()).toEqual(['title a3', 'title a2', 'title a1', 'title b1'])
 
     latest = page(['a3', 'a1'], 'a1', filterOf({ tweet: false }))
+    await tick(2000)
+    expect(rowTitles()).toEqual(['title a3', 'title a1'])
+    expect(screen.getByRole('button', { name: 'もっと見る' })).toBeEnabled()
+  })
+
+  it('treats a change of only the retweet flag as a filter change', async () => {
+    vi.useFakeTimers()
+    let latest = page(['a3', 'a2', 'a1'], 'a1')
+    mockApi({ [FIRST]: () => json(latest), [before('a1')]: () => json(page(['b1'])) })
+    render(<Notifications />)
+    await tick(0)
+    await act(async () => screen.getByRole('button', { name: 'もっと見る' }).click())
+    await tick(0)
+    expect(rowTitles()).toEqual(['title a3', 'title a2', 'title a1', 'title b1'])
+
+    latest = page(['a3', 'a1'], 'a1', filterOf({ retweet: false }))
+    await tick(2000)
+    expect(rowTitles()).toEqual(['title a3', 'title a1'])
+    expect(screen.getByRole('button', { name: 'もっと見る' })).toBeEnabled()
+  })
+
+  it.each([
+    ['quote', filterOf({ quote: false })],
+    ['reply', filterOf({ reply: false })],
+  ])('treats a change of only the %s flag as a filter change', async (_, changed) => {
+    vi.useFakeTimers()
+    const server = { latest: page(['a3', 'a2', 'a1'], 'a1') }
+    mockApi({ [FIRST]: () => json(server.latest), [before('a1')]: () => json(page(['b1'])) })
+    render(<Notifications />)
+    await tick(0)
+    await act(async () => screen.getByRole('button', { name: 'もっと見る' }).click())
+    await tick(0)
+    expect(rowTitles()).toEqual(['title a3', 'title a2', 'title a1', 'title b1'])
+
+    server.latest = page(['a3', 'a1'], 'a1', changed)
     await tick(2000)
     expect(rowTitles()).toEqual(['title a3', 'title a1'])
     expect(screen.getByRole('button', { name: 'もっと見る' })).toBeEnabled()

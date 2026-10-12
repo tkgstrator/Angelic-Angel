@@ -9,7 +9,12 @@ use std::path::PathBuf;
 )]
 pub struct Cli {
     /// Configuration file path
-    #[arg(short, long, default_value = "angelic-angel.toml")]
+    #[arg(
+        short,
+        long,
+        env = "ANGELIC_ANGEL_CONFIG",
+        default_value = "angelic-angel.toml"
+    )]
     pub config: PathBuf,
 
     /// Enable verbose output (debug logs)
@@ -58,5 +63,19 @@ mod tests {
     fn web_token_command_is_gone() {
         assert!(Cli::try_parse_from(["angelic-angel", "web-token"]).is_err());
         assert!(Cli::try_parse_from(["angelic-angel", "serve"]).is_ok());
+    }
+
+    #[test]
+    fn config_flag_is_parsed_and_backed_by_the_environment_variable() {
+        // 環境変数との優先順位は、実バイナリを使う tests/config_env.rs で確かめる。
+        let cli =
+            Cli::try_parse_from(["angelic-angel", "--config", "/tmp/c.toml", "status"]).unwrap();
+        assert_eq!(cli.config, PathBuf::from("/tmp/c.toml"));
+        let command = <Cli as clap::CommandFactory>::command();
+        let arg = command
+            .get_arguments()
+            .find(|a| a.get_id() == "config")
+            .unwrap();
+        assert_eq!(arg.get_env().unwrap(), "ANGELIC_ANGEL_CONFIG");
     }
 }

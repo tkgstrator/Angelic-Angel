@@ -4,6 +4,7 @@ target
 .env.*
 angelic-angel.toml
 data
+config
 *.swp
 *.swo
 *~

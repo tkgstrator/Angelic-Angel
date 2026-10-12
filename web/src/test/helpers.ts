@@ -37,6 +37,9 @@ export function mockApi(routes: Record<string, Handler>) {
 
 export const allowAll: NotificationFilter = {
   tweet: true,
+  retweet: true,
+  quote: true,
+  reply: true,
   xchat_message_received: true,
   other: true,
 }

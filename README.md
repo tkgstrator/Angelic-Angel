@@ -111,7 +111,6 @@ The WebUI (`angelic-angel serve`) has three screens: Notifications, Settings and
 Requires Docker Compose 2.24+. The container only needs your X credentials and a webhook in environment variables: on the first start it registers itself and stores the registration in a mounted directory.
 
 ```sh
-mkdir config && sudo chown 65532:65532 config   # the container runs as UID 65532
 cp .env.example .env   # then edit .env: TWITTER_AUTH_TOKEN, TWITTER_CSRF_TOKEN and your webhook
 
 docker compose up -d --build
@@ -120,7 +119,8 @@ docker compose stop
 ```
 
 - `TWITTER_AUTH_TOKEN` and `TWITTER_CSRF_TOKEN` are the `auth_token` and `ct0` cookie values (see [Getting `auth_token` and `ct0`](#getting-auth_token-and-ct0)).
-- The container runs as UID 65532, so `./config` must be writable by it. If Docker creates a missing `./config` itself, it is owned by root and the container fails with "cannot open lock file". To run as your own user instead, keep `./config` owned by you and add `user: "1000:1000"` (your `id -u`:`id -g`) to the service. Files in `./config` written earlier by UID 65532 must then be `chown`ed to that user.
+- No `chown` and no `user:` are needed, whoever creates `./config` (you, or Docker when it is missing). The container starts as root and, before it opens the config, switches to the owner of the existing config file, falling back to the owner of the `/config` directory when the file does not exist or root owns it, and to 65532:65532 when root owns the directory too. If root owns the directory, it also hands the directory, and the `.lock`, history database and `.tmp-*` files in it that root owns (and the config file itself when root owns it), over to that user. So a `./config` that an earlier `user: "1000:1000"` run filled keeps working even if the directory is now owned by root. If the directory belongs to another non-root user than the config file, it follows the config file's owner and does not chown the directory, so the start can still fail with "cannot open lock file" unless that user can write there. The first log line shows the result (`running as 65532:65532 owning /config`), and the process never runs as root afterwards. This needs the default `CHOWN`, `SETUID` and `SETGID` capabilities.
+- If you set `user:` (or `docker run --user`) to a non-root user, nothing is switched or chowned, and that UID must be able to write `./config`; otherwise the start fails with "cannot open lock file ... Permission denied". Files you place in `./config` yourself must end up readable by the user the container switches to: files owned by root are handed over only when root owns the directory.
 - Mount the directory, not the file: the config is saved through a temporary file and a rename, and the lock and the history database live next to it.
 - Inside a container, `localhost` is the container itself. For a webhook on the host, use a URL such as `http://host.docker.internal:8080/endpoint`. On Linux, the host service must listen on an address reachable from Docker, such as the bridge IP or `0.0.0.0`.
 - After editing `.env`, run `docker compose up -d` to recreate the container with the new values; `restart` alone does not reload them.
@@ -195,7 +195,7 @@ Do not run the same registration (config file) in two places at once. If two con
 
 ### Without environment credentials
 
-You can also bring your own config file instead. Place a registered `angelic-angel.toml` in `./config` (owned by UID 65532), or create it in the container:
+You can also bring your own config file instead. Place a registered `angelic-angel.toml` in `./config` (ownership as described above), or create it in the container:
 
 ```sh
 # Prompts for credentials, avoiding secrets in shell history
@@ -234,7 +234,7 @@ docker build -t angelic-angel:local .
 scripts/docker-smoke.sh angelic-angel:local        # offline, dummy credentials only
 ```
 
-The runtime uses Distroless with a stripped binary, without a shell, sources or build caches. `scripts/docker-smoke.sh` verifies configuration persistence, `ANGELIC_ANGEL_CONFIG`, permissions, expected errors (including a failed automatic registration, which waits 30 seconds) and SIGINT shutdown with dummy credentials and networking disabled. It pulls a separate BusyBox helper if needed and removes its own test resources.
+The runtime uses Distroless with a stripped binary, without a shell, sources or build caches. `scripts/docker-smoke.sh` verifies configuration persistence, `ANGELIC_ANGEL_CONFIG`, permissions, switching to the owner of bind-mounted directories (root-owned and owned by another UID) and an explicit `--user`, expected errors (including a failed automatic registration, which waits 30 seconds) and SIGINT shutdown with dummy credentials and networking disabled. It pulls a separate BusyBox helper if needed and removes its own test resources.
 
 To debug the image, use `docker logs` and run CLI subcommands (e.g. `docker run --rm IMAGE status`) rather than `exec`ing a shell. Published images can be pulled from GHCR: `docker pull ghcr.io/<owner>/<repo>:latest`.
 
@@ -260,7 +260,7 @@ On first create, `.codex/config.toml` (git-ignored) is seeded with project-level
 ### CI/CD
 
 - `.github/workflows/integration.yaml` runs on pull requests, non-`master` branch pushes and as a reusable workflow: commitlint over the new commit range, rustfmt, Clippy (warnings denied), `cargo test --locked`, and a Docker build plus `scripts/docker-smoke.sh`. Permissions are `contents: read`.
-- `.github/workflows/deployment.yaml` runs on `master` pushes, `v*` tags and manual dispatch (`master` only). It calls the integration workflow first, then publishes a multi-arch (`linux/amd64`, `linux/arm64`) image to `ghcr.io/<owner>/<repo>` tagged `sha-<short>`; `latest` on `master`; and `<version>` only for a `v<version>` tag in `master` history that matches `Cargo.toml`. Only the publish job has `packages: write`.
+- `.github/workflows/deployment.yaml` runs on `master` pushes, `v*` tags and manual dispatch (`master` only). It calls the integration workflow first, then publishes a multi-arch (`linux/amd64`, `linux/arm64`) image to `ghcr.io/<owner>/<repo>`. Each architecture is built natively on its own runner (`ubuntu-24.04` for amd64, `ubuntu-24.04-arm` for arm64, no QEMU) and the results are merged into a single multi-arch image. Tags are `sha-<short>`; `latest` on `master`; and `<version>` only for a `v<version>` tag in `master` history that matches `Cargo.toml`. Only the build and merge jobs have `packages: write`.
 - Commit messages follow Conventional Commits (`.commitlintrc.yaml`; types: build, chore, ci, docs, feat, fix, perf, refactor, revert, test).
 
 ## Reconnection

@@ -27,7 +27,10 @@ COPY LICENSE.x-transaction /usr/share/licenses/angelic-angel/LICENSE.x-transacti
 ENV HOME=/config
 # The config path comes from the environment; `--config` on the command line still wins.
 ENV ANGELIC_ANGEL_CONFIG=/config/angelic-angel.toml
-USER 65532:65532
+# Start as root; the app drops to the owner of the existing config file, else of /config
+# (65532 if root owns both).
+# Explicit because the :nonroot base already sets USER 65532.
+USER 0:0
 WORKDIR /config
 STOPSIGNAL SIGINT
 ENTRYPOINT ["/usr/local/bin/angelic-angel"]

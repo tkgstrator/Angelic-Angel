@@ -1,0 +1,1619 @@
+//! Local history of received notifications, persisted in SQLite next to the config file.
+//!
+//! The history lives in `<config>.notifications.sqlite3` (mode 0600) and is never pruned.
+//! Rows are ordered by a monotonically increasing sequence number, so listing is a keyset
+//! scan over that number and never loads the whole history into memory.
+
+use crate::config::NotificationFilter;
+use crate::error::{AngelicAngelError, Result};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use serde::Serialize;
+use serde_json::{Map, Value, json};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const SCHEMA_VERSION: i64 = 2;
+const BACKFILL_CHUNK: i64 = 200;
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_PAGE_LIMIT: usize = 100;
+const MAX_PAYLOAD_BYTES: usize = 16 * 1024;
+const TRUNCATED_RAW_BYTES: usize = 6 * 1024;
+const MAX_TITLE_CHARS: usize = 200;
+const MAX_BODY_CHARS: usize = 2000;
+const MAX_URL_BYTES: usize = 2048;
+const MAX_ID_BYTES: usize = 512;
+
+const LINK_HOSTS: &[&str] = &["x.com", "www.x.com", "twitter.com", "www.twitter.com"];
+const ICON_HOSTS: &[&str] = &["pbs.twimg.com", "abs.twimg.com"];
+
+fn schema_sql() -> String {
+    format!(
+        "
+CREATE TABLE IF NOT EXISTS notifications (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    received_at INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    url TEXT,
+    icon TEXT,
+    payload TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'other'
+);
+PRAGMA user_version = {SCHEMA_VERSION};
+"
+    )
+}
+
+/// `data.type` から決まる通知の区分。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationKind {
+    Tweet,
+    XchatMessageReceived,
+    Other,
+}
+
+impl NotificationKind {
+    const KNOWN: [NotificationKind; 2] = [Self::Tweet, Self::XchatMessageReceived];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tweet => "tweet",
+            Self::XchatMessageReceived => "xchat_message_received",
+            Self::Other => "other",
+        }
+    }
+
+    fn from_data_type(value: &str) -> Self {
+        Self::KNOWN
+            .into_iter()
+            .find(|kind| kind.as_str() == value)
+            .unwrap_or(Self::Other)
+    }
+}
+
+/// `notification.data.type` を優先し、文字列が無いときだけ外側の `data.type` を読む。
+/// 本文や `scribe_target` からは推定しない。
+pub fn classify(payload: &Value) -> NotificationKind {
+    let data_type = |scope: &Value| {
+        scope
+            .get("data")
+            .and_then(|data| data.get("type"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    payload
+        .get("notification")
+        .and_then(data_type)
+        .or_else(|| data_type(payload))
+        .map_or(NotificationKind::Other, |value| {
+            NotificationKind::from_data_type(&value)
+        })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NotificationItem {
+    pub id: String,
+    /// Unix time in seconds when the notification was received.
+    pub received_at: u64,
+    pub title: String,
+    pub body: String,
+    pub url: Option<String>,
+    pub icon: Option<String>,
+    pub payload: Value,
+    pub kind: NotificationKind,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NotificationPage {
+    pub items: Vec<NotificationItem>,
+    pub next_cursor: Option<String>,
+    /// この応答の抽出に実際に適用したフィルター。
+    pub notification_filter: NotificationFilter,
+}
+
+/// Records a received notification. A repeated `id` is ignored.
+pub fn append(config_path: &Path, id: &str, payload: &Value) -> Result<()> {
+    append_at(config_path, id, payload, now_secs())
+}
+
+/// フィルターを適用せずに一覧を返す。
+#[cfg(test)]
+pub fn list(config_path: &Path, before: Option<&str>, limit: usize) -> Result<NotificationPage> {
+    list_filtered(config_path, before, limit, &NotificationFilter::default())
+}
+
+/// Returns up to `limit` (clamped to 1..=100) entries older than the `before` cursor
+/// (an entry id returned as `next_cursor`), newest first. Entries whose kind is disabled in
+/// `filter` are skipped in SQL before the limit applies; the cursor may be any stored entry.
+pub fn list_filtered(
+    config_path: &Path,
+    before: Option<&str>,
+    limit: usize,
+    filter: &NotificationFilter,
+) -> Result<NotificationPage> {
+    list_with_timeout(config_path, before, limit, filter, BUSY_TIMEOUT)
+}
+
+fn list_with_timeout(
+    config_path: &Path,
+    before: Option<&str>,
+    limit: usize,
+    filter: &NotificationFilter,
+    busy_timeout: Duration,
+) -> Result<NotificationPage> {
+    let limit = limit.clamp(1, MAX_PAGE_LIMIT);
+    let path = history_path(config_path);
+    if !path.try_exists().map_err(io_error)? {
+        return match before {
+            None => Ok(NotificationPage {
+                items: Vec::new(),
+                next_cursor: None,
+                notification_filter: *filter,
+            }),
+            Some(_) => Err(unknown_cursor()),
+        };
+    }
+
+    let mut conn = open(&path, busy_timeout)?;
+    let tx = conn.transaction().map_err(db_error)?;
+    let before_seq = match before {
+        None => i64::MAX,
+        Some(cursor) => tx
+            .query_row(
+                "SELECT seq FROM notifications WHERE id = ?1",
+                [cursor],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(db_error)?
+            .ok_or_else(unknown_cursor)?,
+    };
+
+    let mut items = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT id, received_at, title, body, url, icon, payload, kind FROM notifications \
+                 WHERE seq < ?1 AND ( \
+                     (kind = 'tweet' AND ?3) \
+                     OR (kind = 'xchat_message_received' AND ?4) \
+                     OR (kind NOT IN ('tweet', 'xchat_message_received') AND ?5) \
+                 ) ORDER BY seq DESC LIMIT ?2",
+            )
+            .map_err(db_error)?;
+        let fetch = i64::try_from(limit + 1).unwrap_or(i64::MAX);
+        stmt.query_map(
+            params![
+                before_seq,
+                fetch,
+                filter.tweet,
+                filter.xchat_message_received,
+                filter.other
+            ],
+            |row| {
+                let url: Option<String> = row.get(4)?;
+                let icon: Option<String> = row.get(5)?;
+                let payload: String = row.get(6)?;
+                let kind: String = row.get(7)?;
+                Ok(NotificationItem {
+                    id: row.get(0)?,
+                    received_at: u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                    title: row.get(2)?,
+                    body: row.get(3)?,
+                    url: url.as_deref().and_then(sanitize_link),
+                    icon: icon.as_deref().and_then(sanitize_icon),
+                    payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+                    kind: NotificationKind::from_data_type(&kind),
+                })
+            },
+        )
+        .map_err(db_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(db_error)?
+    };
+
+    let next_cursor = if items.len() > limit {
+        items.truncate(limit);
+        items.last().map(|item| item.id.clone())
+    } else {
+        None
+    };
+    Ok(NotificationPage {
+        items,
+        next_cursor,
+        notification_filter: *filter,
+    })
+}
+
+fn append_at(config_path: &Path, id: &str, payload: &Value, received_at: u64) -> Result<()> {
+    append_with_timeout(config_path, id, payload, received_at, BUSY_TIMEOUT)
+}
+
+/// Stores the entry and returns `Ok` only once the transaction has committed (or the id was
+/// already stored). Locked, full, corrupt and unwritable databases are errors, never a no-op.
+fn append_with_timeout(
+    config_path: &Path,
+    id: &str,
+    payload: &Value,
+    received_at: u64,
+    busy_timeout: Duration,
+) -> Result<()> {
+    if id.is_empty() || id.len() > MAX_ID_BYTES {
+        return Err(AngelicAngelError::Config(
+            "invalid notification id".to_string(),
+        ));
+    }
+    let item = build_item(id, payload, received_at);
+    let mut conn = open(&history_path(config_path), busy_timeout)?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error)?;
+    insert(&tx, &item).map_err(db_error)?;
+    tx.commit().map_err(db_error)
+}
+
+/// Inserts `item` unless its id is already stored. Returns whether a row was added.
+/// Only a conflict on `id` is tolerated; any other constraint failure surfaces as an error.
+fn insert(conn: &Connection, item: &NotificationItem) -> rusqlite::Result<bool> {
+    let changed = conn
+        .prepare(
+            "INSERT INTO notifications \
+             (id, received_at, title, body, url, icon, payload, kind) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(id) DO NOTHING",
+        )?
+        .execute(params![
+            item.id,
+            i64::try_from(item.received_at).unwrap_or(i64::MAX),
+            item.title,
+            item.body,
+            item.url,
+            item.icon,
+            item.payload.to_string(),
+            item.kind.as_str(),
+        ])?;
+    Ok(changed == 1)
+}
+
+/// Opens the history database, creating the file (mode 0600) and the schema when missing.
+fn open(path: &Path, busy_timeout: Duration) -> Result<Connection> {
+    ensure_private_file(path).map_err(io_error)?;
+    let mut conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(db_error)?;
+    conn.busy_timeout(busy_timeout).map_err(db_error)?;
+
+    let version = user_version(&conn)?;
+    if !(0..=SCHEMA_VERSION).contains(&version) {
+        return Err(unsupported_schema());
+    }
+    if version != SCHEMA_VERSION {
+        migrate(&mut conn)?;
+    }
+    Ok(conn)
+}
+
+fn user_version(conn: &Connection) -> Result<i64> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(db_error)
+}
+
+/// 新規作成と v1→v2 を単一の書き込みトランザクションで行う。
+/// 他プロセスの完了を待つ間に状況が変わるため、ロック取得後に版を読み直す。
+fn migrate(conn: &mut Connection) -> Result<()> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error)?;
+    match user_version(&tx)? {
+        0 => tx.execute_batch(&schema_sql()).map_err(db_error)?,
+        1 => migrate_v1_to_v2(&tx)?,
+        SCHEMA_VERSION => {},
+        _ => return Err(unsupported_schema()),
+    }
+    tx.commit().map_err(db_error)
+}
+
+fn unsupported_schema() -> AngelicAngelError {
+    AngelicAngelError::Config("notification history has an unsupported schema version".to_string())
+}
+
+/// `kind` 列を足し、既存の payload を分類して埋める。行は小分けに読み、履歴全体をメモリに載せない。
+/// 不正な JSON や切り詰め済みで復元できない payload は `other` のまま残る。
+fn migrate_v1_to_v2(tx: &Connection) -> Result<()> {
+    tx.execute_batch("ALTER TABLE notifications ADD COLUMN kind TEXT NOT NULL DEFAULT 'other'")
+        .map_err(db_error)?;
+    let mut last_seq = 0_i64;
+    loop {
+        let chunk = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT seq, payload FROM notifications WHERE seq > ?1 \
+                     ORDER BY seq LIMIT ?2",
+                )
+                .map_err(db_error)?;
+            stmt.query_map(params![last_seq, BACKFILL_CHUNK], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(db_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)?
+        };
+        let Some((newest, _)) = chunk.last() else {
+            break;
+        };
+        last_seq = *newest;
+        let mut update = tx
+            .prepare("UPDATE notifications SET kind = ?1 WHERE seq = ?2")
+            .map_err(db_error)?;
+        for (seq, payload) in &chunk {
+            let kind = serde_json::from_str::<Value>(payload)
+                .map_or(NotificationKind::Other, |value| classify(&value));
+            if kind != NotificationKind::Other {
+                update
+                    .execute(params![kind.as_str(), seq])
+                    .map_err(db_error)?;
+            }
+        }
+    }
+    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+        .map_err(db_error)
+}
+
+/// Creates the file with mode 0600 when absent and tightens an existing file to 0600.
+/// SQLite gives its rollback journal the main file's mode, and the default journal mode
+/// creates no WAL/SHM files. SQLite owns those sidecar files; they are never deleted here.
+fn ensure_private_file(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    drop(file);
+    Ok(())
+}
+
+fn unknown_cursor() -> AngelicAngelError {
+    AngelicAngelError::Config("unknown notification cursor".to_string())
+}
+
+/// Maps a database failure to a fixed message; the cause is only logged at debug level.
+fn db_error(e: rusqlite::Error) -> AngelicAngelError {
+    tracing::debug!(error = %e, "notification history database error");
+    let message = match e.sqlite_error_code() {
+        Some(ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt) => {
+            "notification history is unreadable"
+        },
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => "notification history is busy",
+        _ => "notification history is unavailable",
+    };
+    AngelicAngelError::Config(message.to_string())
+}
+
+fn io_error(e: std::io::Error) -> AngelicAngelError {
+    tracing::debug!(error = %e, "notification history file error");
+    AngelicAngelError::Config("notification history is unavailable".to_string())
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn history_path(config_path: &Path) -> PathBuf {
+    let mut name = config_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| "angelic-angel.toml".into());
+    name.push(".notifications.sqlite3");
+    config_path.with_file_name(name)
+}
+
+fn build_item(id: &str, payload: &Value, received_at: u64) -> NotificationItem {
+    let summary = summarize(payload);
+    NotificationItem {
+        id: id.to_string(),
+        received_at,
+        title: summary.title,
+        body: summary.body,
+        url: summary.url,
+        icon: summary.icon,
+        kind: classify(payload),
+        payload: bound_payload(payload),
+    }
+}
+
+struct Summary {
+    title: String,
+    body: String,
+    url: Option<String>,
+    icon: Option<String>,
+}
+
+/// Derives display fields from a payload of the shape
+/// `{title, body, icon, data: {url}}`, optionally wrapped in a `notification` object.
+/// Anything that does not fit is left empty; the original payload is kept separately.
+fn summarize(payload: &Value) -> Summary {
+    let mut summary = Summary {
+        title: String::new(),
+        body: String::new(),
+        url: None,
+        icon: None,
+    };
+    let map = match payload {
+        Value::Object(map) => map,
+        Value::String(text) => {
+            summary.body = bounded(text.trim(), MAX_BODY_CHARS);
+            return summary;
+        },
+        Value::Null => return summary,
+        other => {
+            summary.body = bounded(&other.to_string(), MAX_BODY_CHARS);
+            return summary;
+        },
+    };
+
+    let nested = map.get("notification").and_then(Value::as_object);
+    let scopes: Vec<&Map<String, Value>> = nested.into_iter().chain(Some(map)).collect();
+    let text = |key: &str| {
+        scopes
+            .iter()
+            .find_map(|scope| scope.get(key).and_then(Value::as_str))
+    };
+
+    summary.title = bounded(text("title").unwrap_or_default().trim(), MAX_TITLE_CHARS);
+    summary.body = bounded(text("body").unwrap_or_default().trim(), MAX_BODY_CHARS);
+    if summary.title.is_empty()
+        && summary.body.is_empty()
+        && let Some(raw) = map.get("raw").and_then(Value::as_str)
+    {
+        summary.body = bounded(raw.trim(), MAX_BODY_CHARS);
+    }
+
+    summary.icon = scopes
+        .iter()
+        .filter_map(|scope| scope.get("icon").and_then(Value::as_str))
+        .find_map(sanitize_icon);
+
+    let mut links: Vec<&str> = Vec::new();
+    for scope in &scopes {
+        if let Some(data) = scope.get("data").and_then(Value::as_object) {
+            links.extend(
+                ["url", "uri"]
+                    .iter()
+                    .filter_map(|key| data.get(*key))
+                    .filter_map(Value::as_str),
+            );
+        }
+    }
+    for scope in &scopes {
+        links.extend(scope.get("url").and_then(Value::as_str));
+    }
+    summary.url = links.into_iter().find_map(sanitize_link);
+
+    summary
+}
+
+/// Keeps the payload verbatim when it fits, otherwise replaces it with a truncation marker
+/// carrying a bounded preview of its compact JSON.
+fn bound_payload(payload: &Value) -> Value {
+    let raw = payload.to_string();
+    if raw.len() <= MAX_PAYLOAD_BYTES {
+        return payload.clone();
+    }
+    let mut end = TRUNCATED_RAW_BYTES;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    json!({
+        "truncated": true,
+        "original_bytes": raw.len(),
+        "raw": &raw[..end],
+    })
+}
+
+fn bounded(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn sanitize_link(raw: &str) -> Option<String> {
+    sanitize_https(raw, LINK_HOSTS)
+}
+
+fn sanitize_icon(raw: &str) -> Option<String> {
+    sanitize_https(raw, ICON_HOSTS)
+}
+
+/// Accepts only `https://<host>[/...]` where `<host>` is exactly one of `hosts`:
+/// no userinfo, port, backslash, whitespace, control or non-ASCII characters.
+fn sanitize_https(raw: &str, hosts: &[&str]) -> Option<String> {
+    let url = raw.trim();
+    if url.is_empty() || url.len() > MAX_URL_BYTES || !url.bytes().all(|b| b.is_ascii_graphic()) {
+        return None;
+    }
+    if url.contains('\\') {
+        return None;
+    }
+    let (scheme, rest) = url.split_at_checked("https://".len())?;
+    if !scheme.eq_ignore_ascii_case("https://") {
+        return None;
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.contains(['@', ':']) {
+        return None;
+    }
+    let host = authority.to_ascii_lowercase();
+    hosts.contains(&host.as_str()).then(|| url.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::test_temp_dir;
+
+    fn config_path() -> PathBuf {
+        test_temp_dir().join("c.toml")
+    }
+
+    fn db_file(config: &Path) -> PathBuf {
+        config.with_file_name("c.toml.notifications.sqlite3")
+    }
+
+    fn sample(n: usize) -> Value {
+        json!({ "title": format!("t{n}"), "body": format!("b{n}") })
+    }
+
+    fn ids(page: &NotificationPage) -> Vec<&str> {
+        page.items.iter().map(|i| i.id.as_str()).collect()
+    }
+
+    fn assert_private(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{}", path.display());
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+    }
+
+    #[test]
+    fn lists_newest_first_and_ignores_duplicate_ids() {
+        let path = config_path();
+        append_at(&path, "c:1", &sample(1), 100).unwrap();
+        append_at(&path, "c:2", &sample(2), 200).unwrap();
+        append_at(&path, "c:1", &sample(9), 300).unwrap();
+
+        let page = list(&path, None, 50).unwrap();
+        assert_eq!(ids(&page), ["c:2", "c:1"]);
+        assert_eq!(page.items[1].title, "t1");
+        assert_eq!(page.items[1].received_at, 100);
+        assert!(page.next_cursor.is_none());
+
+        let value = serde_json::to_value(&page).unwrap();
+        let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["items", "next_cursor", "notification_filter"]);
+        let mut item_keys: Vec<_> = value["items"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        item_keys.sort();
+        assert_eq!(
+            item_keys,
+            [
+                "body",
+                "icon",
+                "id",
+                "kind",
+                "payload",
+                "received_at",
+                "title",
+                "url"
+            ]
+        );
+    }
+
+    #[test]
+    fn listing_without_history_creates_nothing() {
+        let path = config_path();
+        let page = list(&path, None, 50).unwrap();
+        assert!(page.items.is_empty());
+        assert!(page.next_cursor.is_none());
+        assert!(!db_file(&path).exists());
+        assert!(list(&path, Some("c:1"), 50).is_err());
+        assert!(!db_file(&path).exists());
+    }
+
+    #[test]
+    fn cursor_walks_pages_without_overlap() {
+        let path = config_path();
+        for n in 1..=5 {
+            append_at(&path, &format!("c:{n}"), &sample(n), n as u64).unwrap();
+        }
+        let first = list(&path, None, 2).unwrap();
+        assert_eq!(ids(&first), ["c:5", "c:4"]);
+        assert_eq!(first.next_cursor.as_deref(), Some("c:4"));
+
+        let second = list(&path, first.next_cursor.as_deref(), 2).unwrap();
+        assert_eq!(ids(&second), ["c:3", "c:2"]);
+        assert_eq!(second.next_cursor.as_deref(), Some("c:2"));
+
+        let third = list(&path, second.next_cursor.as_deref(), 2).unwrap();
+        assert_eq!(ids(&third), ["c:1"]);
+        assert!(third.next_cursor.is_none());
+
+        let exact = list(&path, Some("c:3"), 2).unwrap();
+        assert_eq!(ids(&exact), ["c:2", "c:1"]);
+        assert!(exact.next_cursor.is_none());
+    }
+
+    #[test]
+    fn order_follows_arrival_not_received_at() {
+        let path = config_path();
+        append_at(&path, "c:1", &sample(1), 900).unwrap();
+        append_at(&path, "c:2", &sample(2), 100).unwrap();
+        assert_eq!(ids(&list(&path, None, 10).unwrap()), ["c:2", "c:1"]);
+    }
+
+    #[test]
+    fn unknown_cursor_is_a_fixed_config_error() {
+        let path = config_path();
+        append_at(&path, "c:1", &sample(1), 1).unwrap();
+        let err = list(&path, Some("secret-looking-cursor"), 10).unwrap_err();
+        assert!(matches!(err, AngelicAngelError::Config(_)));
+        assert_eq!(err.to_string(), "config error: unknown notification cursor");
+    }
+
+    #[test]
+    fn cursor_is_bound_as_a_value_not_sql() {
+        let path = config_path();
+        append_at(&path, "c:1", &sample(1), 1).unwrap();
+        let err = list(&path, Some("x' OR '1'='1"), 10).unwrap_err();
+        assert_eq!(err.to_string(), "config error: unknown notification cursor");
+    }
+
+    #[test]
+    fn limit_is_clamped() {
+        let path = config_path();
+        let mut conn = open(&history_path(&path), BUSY_TIMEOUT).unwrap();
+        let tx = conn.transaction().unwrap();
+        for n in 0..120 {
+            insert(&tx, &build_item(&format!("c:{n}"), &sample(n), n as u64)).unwrap();
+        }
+        tx.commit().unwrap();
+
+        let page = list(&path, None, 10_000).unwrap();
+        assert_eq!(page.items.len(), 100);
+        assert_eq!(page.next_cursor.as_deref(), Some("c:20"));
+        assert_eq!(list(&path, None, 0).unwrap().items.len(), 1);
+    }
+
+    #[test]
+    fn history_is_not_capped_and_pages_through_everything() {
+        const TOTAL: usize = 2500;
+        let path = config_path();
+        let mut conn = open(&history_path(&path), BUSY_TIMEOUT).unwrap();
+        let tx = conn.transaction().unwrap();
+        for n in 0..TOTAL {
+            assert!(insert(&tx, &build_item(&format!("c:{n}"), &sample(n), n as u64)).unwrap());
+        }
+        tx.commit().unwrap();
+        drop(conn);
+
+        append_at(&path, "c:new", &sample(0), 1).unwrap();
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = list(&path, cursor.as_deref(), 100).unwrap();
+            seen.extend(page.items.iter().map(|i| i.id.clone()));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), TOTAL + 1);
+        assert_eq!(seen[0], "c:new");
+        assert_eq!(seen[1], format!("c:{}", TOTAL - 1));
+        assert_eq!(seen[TOTAL], "c:0");
+        let unique: std::collections::HashSet<_> = seen.iter().collect();
+        assert_eq!(unique.len(), TOTAL + 1);
+    }
+
+    #[test]
+    fn history_persists_privately_next_to_the_config() {
+        let path = config_path();
+        append_at(&path, "c:1", &sample(1), 1).unwrap();
+        append_at(&path, "c:2", &sample(2), 2).unwrap();
+
+        let file = db_file(&path);
+        assert!(file.is_file());
+        assert_private(&file);
+
+        let siblings: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("notifications")
+            })
+            .collect();
+        assert_eq!(siblings, std::slice::from_ref(&file));
+
+        let reloaded = list(&path, None, 50).unwrap();
+        assert_eq!(ids(&reloaded), ["c:2", "c:1"]);
+    }
+
+    #[test]
+    fn existing_loose_permissions_are_tightened() {
+        let path = config_path();
+        let file = db_file(&path);
+        std::fs::write(&file, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        append_at(&path, "c:1", &sample(1), 1).unwrap();
+        assert_private(&file);
+        assert_eq!(ids(&list(&path, None, 10).unwrap()), ["c:1"]);
+    }
+
+    #[test]
+    fn legacy_json_history_is_left_alone() {
+        let path = config_path();
+        let legacy = path.with_file_name("c.toml.notifications.json");
+        std::fs::write(&legacy, "{\"items\":[]}").unwrap();
+        append_at(&path, "c:1", &sample(1), 1).unwrap();
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "{\"items\":[]}");
+    }
+
+    #[test]
+    fn oversized_payload_is_replaced_by_a_bounded_marker() {
+        let path = config_path();
+        let huge = json!({
+            "title": "T".repeat(5000),
+            "body": "あ".repeat(50_000),
+            "data": { "url": "https://x.com/i/status/1", "blob": "\"\\".repeat(40_000) },
+        });
+        append_at(&path, "c:1", &huge, 1).unwrap();
+
+        let item = list(&path, None, 1).unwrap().items.remove(0);
+        assert_eq!(item.payload["truncated"], json!(true));
+        assert!(item.payload["original_bytes"].as_u64().unwrap() > MAX_PAYLOAD_BYTES as u64);
+        assert!(item.payload.to_string().len() <= MAX_PAYLOAD_BYTES);
+        assert_eq!(item.title.chars().count(), MAX_TITLE_CHARS);
+        assert!(item.title.ends_with('…'));
+        assert_eq!(item.body.chars().count(), MAX_BODY_CHARS);
+        assert_eq!(item.url.as_deref(), Some("https://x.com/i/status/1"));
+    }
+
+    #[test]
+    fn payload_at_the_limit_is_kept_verbatim() {
+        let filler = "a".repeat(MAX_PAYLOAD_BYTES - json!({ "body": "" }).to_string().len());
+        let payload = json!({ "body": filler });
+        assert_eq!(payload.to_string().len(), MAX_PAYLOAD_BYTES);
+        assert_eq!(bound_payload(&payload), payload);
+    }
+
+    #[test]
+    fn extracts_nested_and_top_level_fields() {
+        let nested = json!({
+            "notification": {
+                "title": "Nested",
+                "body": "Body",
+                "icon": "https://pbs.twimg.com/profile_images/1/a.jpg",
+                "data": { "url": "https://x.com/i/status/42" },
+            },
+            "title": "Outer",
+        });
+        let s = summarize(&nested);
+        assert_eq!(s.title, "Nested");
+        assert_eq!(s.body, "Body");
+        assert_eq!(
+            s.icon.as_deref(),
+            Some("https://pbs.twimg.com/profile_images/1/a.jpg")
+        );
+        assert_eq!(s.url.as_deref(), Some("https://x.com/i/status/42"));
+
+        let flat = json!({ "title": "Flat", "data": { "url": "https://twitter.com/a" } });
+        let s = summarize(&flat);
+        assert_eq!(s.title, "Flat");
+        assert_eq!(s.body, "");
+        assert_eq!(s.url.as_deref(), Some("https://twitter.com/a"));
+    }
+
+    #[test]
+    fn unsafe_link_falls_through_to_the_next_candidate() {
+        let payload = json!({
+            "data": { "url": "javascript:alert(1)", "uri": "https://x.com/i/notifications" },
+            "url": "https://www.x.com/home",
+        });
+        assert_eq!(
+            summarize(&payload).url.as_deref(),
+            Some("https://x.com/i/notifications")
+        );
+        let only_unsafe =
+            json!({ "data": { "url": "https://evil.example/x" }, "url": "twitter://home" });
+        assert!(summarize(&only_unsafe).url.is_none());
+    }
+
+    #[test]
+    fn malformed_and_primitive_payloads_still_produce_entries() {
+        let path = config_path();
+        let cases = [
+            json!("plain text"),
+            json!(42),
+            json!(true),
+            json!(null),
+            json!([1, 2, 3]),
+            json!({}),
+            json!({ "raw": "not json {" }),
+            json!({ "title": 5, "body": ["x"], "icon": 1, "data": "oops", "notification": 7 }),
+        ];
+        for (n, payload) in cases.iter().enumerate() {
+            append_at(&path, &format!("c:{n}"), payload, n as u64).unwrap();
+        }
+        let page = list(&path, None, 50).unwrap();
+        assert_eq!(page.items.len(), cases.len());
+        let by_id = |id: &str| page.items.iter().find(|i| i.id == id).unwrap();
+        assert_eq!(by_id("c:0").body, "plain text");
+        assert_eq!(by_id("c:1").body, "42");
+        assert_eq!(by_id("c:3").payload, Value::Null);
+        assert_eq!(by_id("c:4").body, "[1,2,3]");
+        assert_eq!(by_id("c:6").body, "not json {");
+        assert_eq!(by_id("c:6").payload, json!({ "raw": "not json {" }));
+        let odd = by_id("c:7");
+        assert_eq!((odd.title.as_str(), odd.body.as_str()), ("", ""));
+        assert!(odd.url.is_none() && odd.icon.is_none());
+        assert_eq!(odd.payload, cases[7]);
+    }
+
+    #[test]
+    fn link_filter_allows_only_https_x_hosts() {
+        for ok in [
+            "https://x.com/i/status/1",
+            "https://www.x.com",
+            "https://twitter.com/a?b=c#d",
+            "https://www.twitter.com/a",
+            "HTTPS://X.COM/a",
+            "  https://x.com/a  ",
+        ] {
+            assert!(sanitize_link(ok).is_some(), "{ok}");
+        }
+        for bad in [
+            "",
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "twitter://home",
+            "/i/notifications",
+            "//x.com/a",
+            "http://x.com/a",
+            "https://evil.com/x.com",
+            "https://x.com.evil.com/a",
+            "https://evilx.com/a",
+            "https://mobile.twitter.com/a",
+            "https://x.com@evil.com/a",
+            "https://evil.com@x.com/a",
+            "https://x.com:443/a",
+            "https://x.com:80@evil.com/",
+            "https://x.com\\@evil.com/",
+            "https://x.com/a b",
+            "https://x.com/a\nb",
+            "https://x.com/\u{e9}",
+            "https://x.com.",
+            "https://",
+        ] {
+            assert!(sanitize_link(bad).is_none(), "{bad:?}");
+        }
+        let long = format!("https://x.com/{}", "a".repeat(MAX_URL_BYTES));
+        assert!(sanitize_link(&long).is_none());
+    }
+
+    #[test]
+    fn icon_filter_allows_only_twimg_hosts() {
+        assert!(sanitize_icon("https://pbs.twimg.com/profile_images/1/a.jpg").is_some());
+        assert!(sanitize_icon("https://abs.twimg.com/a.png").is_some());
+        for bad in [
+            "https://x.com/a.png",
+            "https://video.twimg.com/a.png",
+            "https://twimg.com/a.png",
+            "http://pbs.twimg.com/a.png",
+            "https://evil.com/pbs.twimg.com/a.png",
+            "https://pbs.twimg.com.evil.com/a.png",
+            "data:image/png;base64,AAAA",
+        ] {
+            assert!(sanitize_icon(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn list_refilters_links_read_from_disk() {
+        let path = config_path();
+        let conn = open(&history_path(&path), BUSY_TIMEOUT).unwrap();
+        conn.execute(
+            "INSERT INTO notifications (id, received_at, title, body, url, icon, payload) \
+             VALUES ('c:1', 1, '', '', 'javascript:alert(1)', 'https://evil.com/a.png', 'null')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let item = list(&path, None, 1).unwrap().items.remove(0);
+        assert!(item.url.is_none() && item.icon.is_none());
+    }
+
+    #[test]
+    fn invalid_ids_are_rejected() {
+        let path = config_path();
+        assert!(append_at(&path, "", &sample(1), 1).is_err());
+        assert!(append_at(&path, &"x".repeat(MAX_ID_BYTES + 1), &sample(1), 1).is_err());
+        assert!(list(&path, None, 1).unwrap().items.is_empty());
+    }
+
+    #[test]
+    fn corrupt_database_is_reported_with_fixed_messages_and_kept_intact() {
+        let path = config_path();
+        let file = db_file(&path);
+        let garbage = "this is definitely not a sqlite database ".repeat(40);
+        std::fs::write(&file, &garbage).unwrap();
+
+        let read = list(&path, None, 10).unwrap_err();
+        assert_eq!(
+            read.to_string(),
+            "config error: notification history is unreadable"
+        );
+        let write = append_at(&path, "c:1", &sample(1), 1).unwrap_err();
+        assert_eq!(
+            write.to_string(),
+            "config error: notification history is unreadable"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), garbage);
+    }
+
+    #[test]
+    fn newer_schema_versions_are_refused() {
+        let path = config_path();
+        let conn = open(&history_path(&path), BUSY_TIMEOUT).unwrap();
+        conn.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1))
+            .unwrap();
+        drop(conn);
+        let err = list(&path, None, 10).unwrap_err();
+        assert!(err.to_string().contains("unsupported schema version"));
+        assert!(append_at(&path, "c:1", &sample(1), 1).is_err());
+        let conn = Connection::open(db_file(&path)).unwrap();
+        assert_eq!(
+            user_version(&conn).unwrap(),
+            SCHEMA_VERSION + 1,
+            "an unknown newer schema must be left untouched"
+        );
+    }
+
+    #[test]
+    fn unusable_storage_location_fails_with_a_fixed_message() {
+        let path = config_path();
+        std::fs::create_dir(db_file(&path)).unwrap();
+        let err = append_at(&path, "c:1", &sample(1), 1).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "config error: notification history is unavailable"
+        );
+        assert!(list(&path, None, 1).is_err());
+    }
+
+    #[test]
+    fn concurrent_appends_are_serialized_and_deduplicated() {
+        let path = config_path();
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for n in 0..15 {
+                        append_at(&path, &format!("c:{t}-{n}"), &sample(n), 1).unwrap();
+                        append_at(&path, &format!("shared:{n}"), &sample(n), 1).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut count = 0;
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = list(&path, cursor.as_deref(), 100).unwrap();
+            count += page.items.len();
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(count, 8 * 15 + 15);
+    }
+
+    #[test]
+    fn readers_and_writers_do_not_block_each_other() {
+        let path = config_path();
+        append_at(&path, "c:0", &sample(0), 1).unwrap();
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for n in 1..=40 {
+                    append_at(&path, &format!("c:{n}"), &sample(n), 1).unwrap();
+                }
+            })
+        };
+        for _ in 0..40 {
+            assert!(!list(&path, None, 10).unwrap().items.is_empty());
+        }
+        writer.join().unwrap();
+        assert_eq!(list(&path, None, 1).unwrap().items[0].id, "c:40");
+    }
+
+    const SHORT_TIMEOUT: Duration = Duration::from_millis(50);
+
+    fn lock_exclusively(path: &Path) -> Connection {
+        let conn = open(&history_path(path), BUSY_TIMEOUT).unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        conn
+    }
+
+    #[test]
+    fn a_locked_database_is_busy_not_empty_or_duplicate() {
+        let path = config_path();
+        append_at(&path, "c:1", &sample(1), 1).unwrap();
+        let holder = lock_exclusively(&path);
+
+        let read = list_with_timeout(
+            &path,
+            None,
+            10,
+            &NotificationFilter::default(),
+            SHORT_TIMEOUT,
+        )
+        .unwrap_err();
+        assert_eq!(
+            read.to_string(),
+            "config error: notification history is busy"
+        );
+        let read_cursor = list_with_timeout(
+            &path,
+            Some("c:1"),
+            10,
+            &NotificationFilter::default(),
+            SHORT_TIMEOUT,
+        )
+        .unwrap_err();
+        assert_eq!(
+            read_cursor.to_string(),
+            "config error: notification history is busy"
+        );
+        // The id is already stored, but a locked database must still not report success.
+        let write = append_with_timeout(&path, "c:1", &sample(1), 1, SHORT_TIMEOUT).unwrap_err();
+        assert_eq!(
+            write.to_string(),
+            "config error: notification history is busy"
+        );
+        let fresh = append_with_timeout(&path, "c:2", &sample(2), 1, SHORT_TIMEOUT).unwrap_err();
+        assert_eq!(
+            fresh.to_string(),
+            "config error: notification history is busy"
+        );
+
+        holder.execute_batch("ROLLBACK").unwrap();
+        drop(holder);
+        assert_eq!(ids(&list(&path, None, 10).unwrap()), ["c:1"]);
+        append_at(&path, "c:2", &sample(2), 1).unwrap();
+        assert_eq!(ids(&list(&path, None, 10).unwrap()), ["c:2", "c:1"]);
+    }
+
+    #[test]
+    fn only_an_id_conflict_counts_as_a_duplicate() {
+        let path = config_path();
+        let mut conn = open(&history_path(&path), BUSY_TIMEOUT).unwrap();
+        let tx = conn.transaction().unwrap();
+        let item = build_item("c:1", &sample(1), 1);
+        assert!(insert(&tx, &item).unwrap());
+        assert!(!insert(&tx, &item).unwrap());
+
+        let null_title = tx.execute(
+            "INSERT INTO notifications (id, received_at, title, body, payload) \
+             VALUES ('c:3', 1, NULL, '', 'null') ON CONFLICT(id) DO NOTHING",
+            [],
+        );
+        assert!(
+            null_title.is_err(),
+            "a NOT NULL violation must fail, not be skipped"
+        );
+        tx.commit().unwrap();
+        assert_eq!(list(&path, None, 10).unwrap().items.len(), 1);
+    }
+
+    #[test]
+    fn corrupt_database_is_never_recreated_or_treated_as_empty() {
+        let path = config_path();
+        append_at(&path, "c:1", &sample(1), 1).unwrap();
+        let file = db_file(&path);
+        let mut bytes = std::fs::read(&file).unwrap();
+        bytes[..16].copy_from_slice(b"not a sqlite db!");
+        std::fs::write(&file, &bytes).unwrap();
+
+        for _ in 0..2 {
+            assert!(list(&path, None, 10).is_err());
+            assert!(list(&path, Some("c:1"), 10).is_err());
+            assert!(append_at(&path, "c:2", &sample(2), 1).is_err());
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
+    }
+
+    #[test]
+    fn journal_is_private_while_a_write_is_in_flight() {
+        let path = config_path();
+        append_at(&path, "c:1", &sample(1), 1).unwrap();
+        let mut conn = open(&history_path(&path), BUSY_TIMEOUT).unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(insert(&tx, &build_item("c:2", &sample(2), 2)).unwrap());
+
+        let journal = path.with_file_name("c.toml.notifications.sqlite3-journal");
+        assert!(
+            journal.is_file(),
+            "expected a rollback journal during the write"
+        );
+        assert_private(&journal);
+        tx.commit().unwrap();
+        assert!(!journal.exists());
+        assert!(
+            !path
+                .with_file_name("c.toml.notifications.sqlite3-wal")
+                .exists()
+        );
+        assert!(
+            !path
+                .with_file_name("c.toml.notifications.sqlite3-shm")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn a_hot_journal_left_by_a_crash_is_not_deleted_by_us() {
+        let path = config_path();
+        append_at(&path, "c:1", &sample(1), 1).unwrap();
+        let journal = path.with_file_name("c.toml.notifications.sqlite3-journal");
+        // A stray, non-hot journal (zero length) must be left for SQLite to deal with.
+        std::fs::write(&journal, b"").unwrap();
+        append_at(&path, "c:2", &sample(2), 2).unwrap();
+        assert_eq!(ids(&list(&path, None, 10).unwrap()), ["c:2", "c:1"]);
+    }
+
+    fn typed(data_type: &str, n: usize) -> Value {
+        json!({ "title": format!("t{n}"), "data": { "type": data_type } })
+    }
+
+    fn filter(tweet: bool, xchat_message_received: bool, other: bool) -> NotificationFilter {
+        NotificationFilter {
+            tweet,
+            xchat_message_received,
+            other,
+        }
+    }
+
+    fn list_with(
+        path: &Path,
+        f: NotificationFilter,
+        before: Option<&str>,
+        limit: usize,
+    ) -> NotificationPage {
+        list_filtered(path, before, limit, &f).unwrap()
+    }
+
+    #[test]
+    fn classify_reads_only_data_type_with_inner_precedence() {
+        use NotificationKind::{Other, Tweet, XchatMessageReceived};
+        let cases = [
+            (json!({ "data": { "type": "tweet" } }), Tweet),
+            (
+                json!({ "data": { "type": "xchat_message_received" } }),
+                XchatMessageReceived,
+            ),
+            (
+                json!({ "notification": { "data": { "type": "tweet" } } }),
+                Tweet,
+            ),
+            (
+                json!({ "notification": { "data": { "type": "xchat_message_received" } },
+                        "data": { "type": "tweet" } }),
+                XchatMessageReceived,
+            ),
+            // 内側が未知の文字列なら、外側が既知でも採用しない。
+            (
+                json!({ "notification": { "data": { "type": "recommendation" } },
+                        "data": { "type": "tweet" } }),
+                Other,
+            ),
+            // 内側に文字列が無いときだけ外側を読む。
+            (
+                json!({ "notification": { "data": { "type": 5 } }, "data": { "type": "tweet" } }),
+                Tweet,
+            ),
+            (
+                json!({ "notification": { "title": "x" }, "data": { "type": "xchat_message_received" } }),
+                XchatMessageReceived,
+            ),
+            (json!({ "data": { "type": "TWEET" } }), Other),
+            (json!({ "data": { "type": "" } }), Other),
+            (json!({ "data": { "type": 1 } }), Other),
+            (json!({ "data": { "type": null } }), Other),
+            (json!({ "data": "tweet" }), Other),
+            (json!({ "data": {} }), Other),
+            (json!({ "type": "tweet" }), Other),
+            (
+                json!({ "notification": "tweet", "data": { "type": "tweet" } }),
+                Tweet,
+            ),
+            (
+                json!({ "title": "tweet", "body": "tweet", "scribe_target": "tweet" }),
+                Other,
+            ),
+            (json!("tweet"), Other),
+            (json!(null), Other),
+            (json!([{ "data": { "type": "tweet" } }]), Other),
+            (
+                json!({ "truncated": true, "raw": "{\"data\":{\"type\":\"tweet\"}}" }),
+                Other,
+            ),
+        ];
+        for (payload, expected) in cases {
+            assert_eq!(classify(&payload), expected, "{payload}");
+        }
+    }
+
+    #[test]
+    fn kind_is_serialized_as_the_data_type_name() {
+        let path = config_path();
+        append_at(&path, "c:1", &typed("tweet", 1), 1).unwrap();
+        append_at(&path, "c:2", &typed("xchat_message_received", 2), 2).unwrap();
+        append_at(&path, "c:3", &typed("something_new", 3), 3).unwrap();
+        let value = serde_json::to_value(list(&path, None, 10).unwrap()).unwrap();
+        assert_eq!(value["items"][0]["kind"], "other");
+        assert_eq!(value["items"][1]["kind"], "xchat_message_received");
+        assert_eq!(value["items"][2]["kind"], "tweet");
+        assert_eq!(
+            value["notification_filter"],
+            json!({ "tweet": true, "xchat_message_received": true, "other": true })
+        );
+    }
+
+    #[test]
+    fn kind_is_taken_before_the_payload_is_truncated() {
+        let path = config_path();
+        let huge = json!({
+            "title": "T",
+            "data": { "type": "xchat_message_received", "blob": "x".repeat(40_000) },
+        });
+        append_at(&path, "c:1", &huge, 1).unwrap();
+        let item = list(&path, None, 1).unwrap().items.remove(0);
+        assert_eq!(item.payload["truncated"], json!(true));
+        assert_eq!(item.kind, NotificationKind::XchatMessageReceived);
+        assert!(
+            list_filtered(&path, None, 10, &filter(true, false, true))
+                .unwrap()
+                .items
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn all_eight_filter_combinations_select_the_matching_kinds() {
+        let path = config_path();
+        append_at(&path, "tweet", &typed("tweet", 1), 1).unwrap();
+        append_at(&path, "chat", &typed("xchat_message_received", 2), 2).unwrap();
+        append_at(&path, "other", &typed("unknown", 3), 3).unwrap();
+        append_at(&path, "missing", &sample(4), 4).unwrap();
+
+        for bits in 0..8_u8 {
+            let f = filter(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+            let mut expected = Vec::new();
+            if f.other {
+                expected.push("missing");
+                expected.push("other");
+            }
+            if f.xchat_message_received {
+                expected.push("chat");
+            }
+            if f.tweet {
+                expected.push("tweet");
+            }
+            expected.sort_by_key(|id| {
+                std::cmp::Reverse(
+                    ["tweet", "chat", "other", "missing"]
+                        .iter()
+                        .position(|x| x == id),
+                )
+            });
+            let page = list_with(&path, f, None, 50);
+            assert_eq!(ids(&page), expected, "{f:?}");
+            assert_eq!(page.notification_filter, f);
+            assert!(page.next_cursor.is_none());
+        }
+    }
+
+    #[test]
+    fn a_page_with_nothing_visible_is_empty_with_no_cursor() {
+        let path = config_path();
+        for n in 0..5 {
+            append_at(&path, &format!("c:{n}"), &typed("tweet", n), n as u64).unwrap();
+        }
+        let none = filter(false, false, false);
+        let page = list_with(&path, none, None, 2);
+        assert!(page.items.is_empty());
+        assert!(page.next_cursor.is_none());
+        assert_eq!(page.notification_filter, none);
+        // 履歴自体は残っており、設定を戻せばすべて見える。
+        assert_eq!(list(&path, None, 50).unwrap().items.len(), 5);
+
+        let missing_db = config_path();
+        let empty = list_with(&missing_db, none, None, 10);
+        assert!(empty.items.is_empty());
+        assert_eq!(empty.notification_filter, none);
+    }
+
+    #[test]
+    fn many_excluded_rows_never_produce_an_empty_page_or_lose_rows() {
+        let path = config_path();
+        append_at(&path, "old-tweet", &typed("tweet", 0), 1).unwrap();
+        for n in 0..250 {
+            append_at(
+                &path,
+                &format!("chat:{n}"),
+                &typed("xchat_message_received", n),
+                1,
+            )
+            .unwrap();
+        }
+        append_at(&path, "mid-tweet", &typed("tweet", 1), 1).unwrap();
+        for n in 0..250 {
+            append_at(&path, &format!("noise:{n}"), &typed("unknown", n), 1).unwrap();
+        }
+        append_at(&path, "new-tweet", &typed("tweet", 2), 1).unwrap();
+
+        let tweets_only = filter(true, false, false);
+        let first = list_with(&path, tweets_only, None, 1);
+        assert_eq!(ids(&first), ["new-tweet"]);
+        assert_eq!(first.next_cursor.as_deref(), Some("new-tweet"));
+
+        let second = list_with(&path, tweets_only, first.next_cursor.as_deref(), 1);
+        assert_eq!(ids(&second), ["mid-tweet"]);
+        assert_eq!(second.next_cursor.as_deref(), Some("mid-tweet"));
+
+        let third = list_with(&path, tweets_only, second.next_cursor.as_deref(), 1);
+        assert_eq!(ids(&third), ["old-tweet"]);
+        assert!(third.next_cursor.is_none());
+
+        let all = list_with(&path, tweets_only, None, 100);
+        assert_eq!(ids(&all), ["new-tweet", "mid-tweet", "old-tweet"]);
+        assert!(all.next_cursor.is_none());
+    }
+
+    #[test]
+    fn a_cursor_may_point_at_a_row_the_filter_hides() {
+        let path = config_path();
+        append_at(&path, "t1", &typed("tweet", 1), 1).unwrap();
+        append_at(&path, "hidden", &typed("xchat_message_received", 2), 2).unwrap();
+        append_at(&path, "t2", &typed("tweet", 3), 3).unwrap();
+
+        let tweets_only = filter(true, false, false);
+        let page = list_with(&path, tweets_only, Some("hidden"), 10);
+        assert_eq!(ids(&page), ["t1"]);
+        // 設定変更後に、以前の応答にあった cursor を持ち越してもエラーにならない。
+        let page = list_with(&path, filter(false, false, true), Some("t2"), 10);
+        assert!(page.items.is_empty());
+        assert!(list_filtered(&path, Some("never-stored"), 10, &tweets_only).is_err());
+    }
+
+    fn create_v1(config: &Path, rows: &[(String, String)]) {
+        let db = history_path(config);
+        ensure_private_file(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notifications (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                received_at INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                url TEXT,
+                icon TEXT,
+                payload TEXT NOT NULL
+            );
+            PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        for (n, (id, payload)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO notifications (id, received_at, title, body, payload) \
+                 VALUES (?1, ?2, ?3, '', ?4)",
+                params![id, n as i64, format!("title-{n}"), payload],
+            )
+            .unwrap();
+        }
+    }
+
+    fn snapshot(config: &Path) -> Vec<(i64, String, String)> {
+        let conn = Connection::open(history_path(config)).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT seq, id, payload FROM notifications ORDER BY seq")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn v1_history_is_migrated_in_place_with_classified_kinds() {
+        let path = config_path();
+        let truncated = json!({ "truncated": true, "original_bytes": 99999,
+            "raw": "{\"data\":{\"type\":\"tweet\"}" })
+        .to_string();
+        let rows: Vec<(String, String)> = vec![
+            ("a".into(), typed("tweet", 1).to_string()),
+            ("b".into(), typed("xchat_message_received", 2).to_string()),
+            ("c".into(), typed("novel", 3).to_string()),
+            ("d".into(), "this is {not json".to_string()),
+            ("e".into(), truncated),
+            (
+                "f".into(),
+                json!({ "notification": { "data": { "type": "tweet" } } }).to_string(),
+            ),
+            ("g".into(), json!({ "title": "no type" }).to_string()),
+            ("h".into(), "null".to_string()),
+        ];
+        create_v1(&path, &rows);
+        let before = snapshot(&path);
+
+        let page = list(&path, None, 50).unwrap();
+        let kinds: Vec<_> = page
+            .items
+            .iter()
+            .rev()
+            .map(|i| (i.id.as_str(), i.kind))
+            .collect();
+        use NotificationKind::{Other, Tweet, XchatMessageReceived};
+        assert_eq!(
+            kinds,
+            [
+                ("a", Tweet),
+                ("b", XchatMessageReceived),
+                ("c", Other),
+                ("d", Other),
+                ("e", Other),
+                ("f", Tweet),
+                ("g", Other),
+                ("h", Other),
+            ]
+        );
+        assert_eq!(
+            snapshot(&path),
+            before,
+            "seq, id and payload must be preserved"
+        );
+        let conn = Connection::open(db_file(&path)).unwrap();
+        assert_eq!(user_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // 再度開いても何も変わらず、保存した履歴は移行後もフィルターできる。
+        let again = list_with(&path, filter(true, false, false), None, 50);
+        assert_eq!(ids(&again), ["f", "a"]);
+        assert_eq!(snapshot(&path), before);
+        append_at(&path, "new", &typed("tweet", 9), 9).unwrap();
+        assert_eq!(
+            ids(&list_with(&path, filter(true, false, false), None, 50))[0],
+            "new"
+        );
+    }
+
+    #[test]
+    fn migration_walks_the_history_in_chunks() {
+        let path = config_path();
+        let total = (BACKFILL_CHUNK as usize) * 2 + 37;
+        let rows: Vec<(String, String)> = (0..total)
+            .map(|n| {
+                let kind = match n % 3 {
+                    0 => "tweet",
+                    1 => "xchat_message_received",
+                    _ => "novel",
+                };
+                (format!("r:{n}"), typed(kind, n).to_string())
+            })
+            .collect();
+        create_v1(&path, &rows);
+
+        let conn = open(&history_path(&path), BUSY_TIMEOUT).unwrap();
+        let count = |kind: &str| -> usize {
+            conn.query_row(
+                "SELECT COUNT(*) FROM notifications WHERE kind = ?1",
+                [kind],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap() as usize
+        };
+        assert_eq!(count("tweet"), total.div_ceil(3));
+        assert_eq!(count("xchat_message_received"), (total + 1) / 3);
+        assert_eq!(count("other"), total / 3);
+        assert_eq!(user_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn concurrent_opens_of_a_v1_history_migrate_exactly_once() {
+        let path = config_path();
+        let rows: Vec<(String, String)> = (0..300)
+            .map(|n| (format!("r:{n}"), typed("tweet", n).to_string()))
+            .collect();
+        create_v1(&path, &rows);
+
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let conn = open(&history_path(&path), BUSY_TIMEOUT).unwrap();
+                    user_version(&conn).unwrap()
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), SCHEMA_VERSION);
+        }
+        let page = list_with(&path, filter(true, false, false), None, 100);
+        assert_eq!(page.items.len(), 100);
+        assert!(page.next_cursor.is_some());
+    }
+
+    #[test]
+    fn a_failed_migration_leaves_the_v1_history_intact() {
+        let path = config_path();
+        create_v1(&path, &[("a".into(), typed("tweet", 1).to_string())]);
+        // 列が先に存在すると ALTER が失敗する。途中までの変更が残ってはならない。
+        let conn = Connection::open(history_path(&path)).unwrap();
+        conn.execute_batch("ALTER TABLE notifications ADD COLUMN kind TEXT")
+            .unwrap();
+        drop(conn);
+
+        assert!(list(&path, None, 10).is_err());
+        let conn = Connection::open(history_path(&path)).unwrap();
+        assert_eq!(user_version(&conn).unwrap(), 1);
+        assert_eq!(snapshot(&path).len(), 1);
+    }
+}

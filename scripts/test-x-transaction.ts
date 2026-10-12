@@ -7,6 +7,7 @@ import {
 } from "../vendor/x-transaction/src/transaction.ts";
 
 const VECTORS_PATH = new URL("./x-transaction-vectors.json", import.meta.url);
+const UPSTREAM_FIXTURES = new URL("../vendor/x-transaction/src/fixtures/", import.meta.url).pathname;
 
 // ---- 上流の内部挙動を観測するプローブ (結果は変えない) ------------------------------------
 
@@ -385,8 +386,16 @@ const coverage = {
 
 async function generate(): Promise<Case[]> {
 	const cases: Case[] = [];
+	// 現行の x-web 署名モジュール (上流 fixtures)。名前は実フィクスチャ由来であることを示す。
+	const current = {
+		spec: undefined,
+		name: "current-x-web-sign-o",
+		html: readFileSync(UPSTREAM_FIXTURES + "x-web-home.html", "utf8"),
+		ondemand: readFileSync(UPSTREAM_FIXTURES + "x-web-sign.js", "utf8"),
+	};
 	const inputs = [
 		...specs.map((spec) => ({ spec, ...build(spec) })),
+		current,
 		...failures().map((f) => ({ spec: undefined, ...f })),
 	];
 
@@ -399,9 +408,10 @@ async function generate(): Promise<Case[]> {
 		} catch {
 			transaction = undefined;
 		}
-		if (input.spec && !transaction)
+		const mustConstruct = input.spec !== undefined || name === "current-x-web-sign-o";
+		if (mustConstruct && !transaction)
 			throw new Error(`${name}: 上流が構築に失敗した`);
-		if (!input.spec && transaction)
+		if (!mustConstruct && transaction)
 			throw new Error(`${name}: 失敗するはずの入力を上流が受理した`);
 
 		const ids: Id[] = [];

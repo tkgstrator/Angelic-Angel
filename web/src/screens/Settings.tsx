@@ -28,6 +28,9 @@ const SOURCE_LABEL = {
 
 const FILTER_OPTIONS: readonly { key: keyof NotificationFilter; label: string }[] = [
   { key: 'tweet', label: '投稿（tweet）' },
+  { key: 'retweet', label: 'リツイート（RT）' },
+  { key: 'quote', label: '引用RT' },
+  { key: 'reply', label: 'リプライ' },
   { key: 'xchat_message_received', label: 'チャット（xchat_message_received）' },
   { key: 'other', label: 'その他・未指定' },
 ]

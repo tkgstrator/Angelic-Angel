@@ -28,7 +28,7 @@ Twitter/X  ──push──▶  Mozilla AutoPush サーバ  ◀──WebSocket�
 ### 重要事項
 
 - **データの取得元**: すべての通知データは Mozilla の Web Push サーバ (`push.services.mozilla.com`) から受信しています。通知データの取得のために Twitter/X に直接アクセスすることはありません。
-- **API の使用は最小限**: Twitter/X の API はプッシュサブスクリプションの初回登録時 (`register` コマンド) と、WebUI の一括通知設定を明示的に開始したときにのみ使用されます。通知の受信中に API コールは発生しません。
+- **API の使用は最小限**: Twitter/X の API はプッシュサブスクリプションの初回登録時 (`register` コマンド、または認証情報を環境変数で渡した最初の `listen` による自動登録) と、WebUI の一括通知設定を明示的に開始したときにのみ使用されます。通知の受信中に API コールは発生しません。
 - **スクレイピング不使用**: このツールは Web スクレイピングを一切行いません。ブラウザがプッシュ通知を配信するのと同じ、標準的な W3C Push API のフローを利用しています。
 
 ## 必要環境
@@ -78,6 +78,8 @@ WEBHOOK_ENDPOINT=https://your-webhook.example.com/endpoint angelic-angel listen
 
 `WEBHOOK_ENDPOINT` 環境変数で、復号された通知ペイロードの HTTP POST 送信先を指定します。
 
+手順 1 と 2 を省略することもできます。`TWITTER_AUTH_TOKEN` と `TWITTER_CSRF_TOKEN`（`auth_token` と `ct0` の Cookie）を設定しておくと、登録がまだ無いときは最初の `listen` が登録まで行います。値は環境変数から読み取られ、設定ファイルには書き込まれません。詳しくは [Docker](#docker) を参照してください。
+
 ### その他のコマンド
 
 ```sh
@@ -101,33 +103,124 @@ WebUI（`angelic-angel serve`）は「通知」「設定」「受信状況」の
 
 | フラグ | 説明 |
 |--------|------|
-| `-c, --config <PATH>` | 設定ファイルのパス (デフォルト: `angelic-angel.toml`) |
+| `-c, --config <PATH>` | 設定ファイルのパス (環境変数: `ANGELIC_ANGEL_CONFIG`、デフォルト: `angelic-angel.toml`) |
 | `-v, --verbose` | デバッグログを有効化 |
 
 ## Docker
 
-Docker Compose 2.24 以上が必要です。
+Docker Compose 2.24 以上が必要です。コンテナに必要なのは、環境変数で渡す X の認証情報と Webhook だけです。初回起動時に自分で登録を済ませ、登録情報をマウントしたディレクトリに保存します。
 
 ```sh
-docker compose build
-cp .env.example .env   # 編集して実際の Webhook URL を設定
+mkdir config && sudo chown 65532:65532 config   # コンテナは UID 65532 で動作します
+cp .env.example .env   # 編集して TWITTER_AUTH_TOKEN、TWITTER_CSRF_TOKEN、Webhook を設定
 
-# 認証情報は対話入力（シェル履歴に秘密情報を残さないため）
-docker compose run --rm -it angelic-angel init
-docker compose run --rm angelic-angel register
-docker compose run --rm angelic-angel status
-
-docker compose up -d
+docker compose up -d --build
 docker compose logs -f
 docker compose stop
 ```
 
-- コンテナは `/data/angelic-angel.toml` に認証情報と登録情報を保存します。名前付きボリュームは `docker compose down` では保持され、`docker compose down -v` で削除されます。
-- 通知の転送には `WEBHOOK_ENDPOINT` が必要ですが、`init` と `status` に `.env` は不要です。
+- `TWITTER_AUTH_TOKEN` と `TWITTER_CSRF_TOKEN` は、`auth_token` と `ct0` の Cookie の値です（[`auth_token` と `ct0` の取得方法](#auth_token-と-ct0-の取得方法)）。
+- コンテナは UID 65532 で動作するため、`./config` はその UID が書き込める必要があります。存在しない `./config` を Docker が自動で作ると所有者が root になり、コンテナは "cannot open lock file" で失敗します。自分のユーザーで動かす場合は、`./config` を自分の所有にして、サービスに `user: "1000:1000"`（`id -u`:`id -g` の値）を追加してください。それまでに UID 65532 が `./config` に作ったファイルは、そのユーザーに `chown` する必要があります。
+- ファイルではなくディレクトリをマウントしてください。設定は一時ファイルに書いてからリネームして保存され、ロックと履歴データベースも同じディレクトリに置かれます。
 - コンテナ内の `localhost` はコンテナ自身を指します。ホスト上の Webhook には `http://host.docker.internal:8080/endpoint` のような URL を使ってください。Linux では、ホスト側のサービスをブリッジ IP や `0.0.0.0` など、Docker から到達できるアドレスで待ち受ける必要があります。
 - `.env` を編集したら `docker compose up -d` でコンテナを再作成してください。`restart` だけでは新しい値は反映されません。
-- デフォルトのコマンドは `listen` です。他のコマンドで置き換えられます（例: `docker compose run --rm angelic-angel unregister`）。
-- `init` と `register` の前に `up` を実行しないでください。失敗して再起動ポリシーによりループします。
+- デフォルトのコマンドは `listen` です。他のコマンドで置き換えられます（例: `docker compose run --rm angelic-angel status`）。設定は同時に 1 つのプロセスしか使えないため、先に動作中のコンテナを止めてください（`docker compose stop`）。
+
+### 配布イメージを使う
+
+ビルドせずに GHCR のイメージを使えます。環境変数は、`compose.yaml` と同じディレクトリの `.env` から補間されます。
+
+```yaml
+services:
+  angelic-angel:
+    image: ghcr.io/tkgstrator/angelic-angel:latest
+    restart: unless-stopped
+    stop_signal: SIGINT
+    environment:
+      TWITTER_AUTH_TOKEN: ${TWITTER_AUTH_TOKEN}
+      TWITTER_CSRF_TOKEN: ${TWITTER_CSRF_TOKEN}
+      WEBHOOK_ENDPOINT: ${WEBHOOK_ENDPOINT}
+      WEBHOOK_SECRET_KEY: ${WEBHOOK_SECRET_KEY}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./config:/config
+```
+
+```sh
+# .env（コミットしないこと）
+TWITTER_AUTH_TOKEN=your-auth_token-cookie-value
+TWITTER_CSRF_TOKEN=your-ct0-cookie-value
+WEBHOOK_ENDPOINT=https://your-webhook.example.com/endpoint
+WEBHOOK_SECRET_KEY=your-shared-secret
+```
+
+- 環境変数での認証情報の指定と自動登録には、これらを含むリリース以降のイメージが必要です。それ以前のリリース（v0.1.1 まで）には含まれていません。`latest` が古いイメージのままのときは、`docker compose pull` で最新を取得してください。
+- 再現性が必要な運用では、`latest` ではなくバージョンタグ（`X.Y.Z` の形式。例: `ghcr.io/tkgstrator/angelic-angel:0.2.0`）に固定できます。
+
+### 環境変数
+
+| 変数 | 説明 |
+|------|------|
+| `TWITTER_AUTH_TOKEN` | `auth_token` Cookie。`TWITTER_CSRF_TOKEN` と一緒に設定します |
+| `TWITTER_CSRF_TOKEN` | `ct0` Cookie。`TWITTER_AUTH_TOKEN` と一緒に設定します |
+| `WEBHOOK_ENDPOINT` | Webhook の URL。空白でない値は設定ファイルより優先されます |
+| `WEBHOOK_SECRET_KEY` | Webhook リクエストの署名に使う共有シークレット。Webhook URL を設定する場合は必須です |
+| `ANGELIC_ANGEL_CONFIG` | 設定ファイルのパス。イメージは `/config/angelic-angel.toml` を設定済みで、`--config` が優先されます |
+
+- 認証情報の 2 つは対です。両方が設定されている（空白でない）ときは設定ファイルの `[twitter]` の代わりに使われ、両方とも無いときは設定ファイルが使われます。**片方だけが設定されているとエラーで失敗します**（設定ファイルの値へは戻りません）。
+- 認証情報の値が設定ファイルに書き込まれることはありません。AutoPush が登録を無効化したときの登録の更新（数日後に起きることがあります）でも使われるため、コンテナが動いている間は設定したままにしてください。`status` は、値を表示せずに環境変数から取得していることだけを示します。
+
+### 初回起動と保存される状態
+
+- 登録が無く、認証情報が両方設定されていると、`listen` は AutoPush と X に登録して結果を保存し、受信を始めます。既存の設定ファイルのほかの設定（Webhook、通知フィルタ、`[twitter]`）は保持され、ファイルが無ければ権限 `0600` で作成されます。X に登録する前に保存できることを確かめるため、読み取り専用のマウントでは X 側に登録が残らないまま失敗します。
+- 登録情報（UAID と鍵）は `./config/angelic-angel.toml`、通知の履歴は `./config/angelic-angel.toml.notifications.sqlite3` に保存されます。再起動をまたいで `./config` を残してください。認証情報と同様に扱ってください。
+- 自動登録に失敗した場合（Cookie が無効になっているなど）は、エラーを出力してから 30 秒待って、0 以外の終了コードで終了します。`restart: unless-stopped` によって X のログイン用エンドポイントへ短い間隔で繰り返しアクセスしないためです。待機中に `docker stop`（SIGINT）を実行すると、すぐに終了します。X に接続する前に分かるエラー（認証情報が片方だけ、`./config` に書き込めないなど）はすぐに終了します。
+- 認証情報も登録も無い場合、`listen` は "No registration found" で終了し、再起動ポリシーにより再試行を続けます。認証情報を設定するか、登録済みの設定ファイルを `./config` に置いてください。
+
+### 認証情報を差し替える
+
+```sh
+docker compose stop
+docker compose run --rm angelic-angel unregister
+sudo rm config/angelic-angel.toml     # そのあと .env を新しい値に編集
+docker compose up -d
+```
+
+`unregister` で AutoPush の登録を解除し、設定ファイルを消すと、次の起動で新しい認証情報により登録し直されます。そのファイルに保存されていた Webhook やフィルタの設定も消えます。履歴データベースは残ります。
+
+### 複数の場所で動かさない
+
+同じ登録（設定ファイル）を 2 か所で同時に動かさないでください。2 つのコンテナがそれぞれ環境変数から自動登録すると UAID が別々になり、同じアカウントの通知が 2 系統届いて、Webhook にすべて二重に転送されます。設定ディレクトリごとにコンテナは 1 つにしてください。
+
+### 環境変数を使わない場合
+
+設定ファイルを持ち込むこともできます。登録済みの `angelic-angel.toml` を `./config`（所有者は UID 65532）に置くか、コンテナ内で作成します。
+
+```sh
+# 認証情報は対話入力（シェル履歴に秘密情報を残さないため）
+docker compose run --rm -it angelic-angel init
+docker compose run --rm angelic-angel register
+docker compose run --rm angelic-angel status
+docker compose up -d
+```
+
+登録ができる前に `up` を実行しないでください。失敗して再起動ポリシーによりループします。
+
+### `/data` ボリュームからの移行
+
+以前のバージョンは、`/data` にマウントした名前付きボリューム `angelic-angel-data` にすべてを保存していました。切り替える前に `./config` へコピーしてください。
+
+```sh
+docker compose down                       # ボリュームは残ります（-v は付けない）
+docker volume ls | grep angelic-angel-data   # 名前は <プロジェクト名>_angelic-angel-data
+mkdir config
+docker run --rm -v <プロジェクト名>_angelic-angel-data:/from:ro -v "$PWD/config":/to busybox:1.37.0 \
+  sh -c 'cp -a /from/. /to/ && chown -R 65532:65532 /to && chmod 700 /to'
+docker compose up -d
+```
+
+`./config` で動くことを確認したら、古いボリュームを `docker volume rm` で削除してください。
 
 ## 開発
 
@@ -141,7 +234,7 @@ docker build -t angelic-angel:local .
 scripts/docker-smoke.sh angelic-angel:local        # オフライン・ダミー認証情報のみ
 ```
 
-ランタイムは strip 済みバイナリを載せた Distroless で、シェル・ソース・ビルドキャッシュを含みません。`scripts/docker-smoke.sh` はダミーの認証情報とネットワーク無効化を使い、設定の永続化、権限、エラー時の終了コード、SIGINT による停止を検証します。必要に応じて別の BusyBox ヘルパーを pull し、作成したテスト用リソースを削除します。
+ランタイムは strip 済みバイナリを載せた Distroless で、シェル・ソース・ビルドキャッシュを含みません。`scripts/docker-smoke.sh` はダミーの認証情報とネットワーク無効化を使い、設定の永続化、`ANGELIC_ANGEL_CONFIG`、権限、エラー時の終了コード（30 秒待機する自動登録の失敗を含む）、SIGINT による停止を検証します。必要に応じて別の BusyBox ヘルパーを pull し、作成したテスト用リソースを削除します。
 
 イメージのデバッグには、シェルへの `exec` ではなく `docker logs` と CLI サブコマンド（例: `docker run --rm IMAGE status`）を使ってください。公開イメージは GHCR から取得できます: `docker pull ghcr.io/<owner>/<repo>:latest`。
 

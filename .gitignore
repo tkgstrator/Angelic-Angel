@@ -26,6 +26,9 @@ angelic-angel.toml.*
 *.toml.notifications.sqlite3*
 *.toml.tmp-*
 
+# Docker bind-mounted config directory (credentials, registration, history)
+/config/
+
 # Local environment files (keep the example)
 .env
 .env.*

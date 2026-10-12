@@ -17,6 +17,9 @@ export const emptyFeed: Feed = { items: [], cursor: null, filter: null, generati
 export function sameFilter(a: NotificationFilter, b: NotificationFilter): boolean {
   return (
     a.tweet === b.tweet &&
+    a.retweet === b.retweet &&
+    a.quote === b.quote &&
+    a.reply === b.reply &&
     a.xchat_message_received === b.xchat_message_received &&
     a.other === b.other
   )

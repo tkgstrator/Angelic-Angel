@@ -8,6 +8,9 @@ export type WebhookSource = 'environment' | 'config' | 'none'
 
 export const notificationFilterSchema = z.object({
   tweet: z.boolean(),
+  retweet: z.boolean(),
+  quote: z.boolean(),
+  reply: z.boolean(),
   xchat_message_received: z.boolean(),
   other: z.boolean(),
 })

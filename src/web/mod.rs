@@ -966,6 +966,9 @@ mod tests {
                 "next_cursor": null,
                 "notification_filter": {
                     "tweet": true,
+                    "retweet": true,
+                    "quote": true,
+                    "reply": true,
                     "xchat_message_received": true,
                     "other": true
                 }
@@ -1037,7 +1040,14 @@ mod tests {
     #[tokio::test]
     async fn notification_filter_is_saved_applied_and_retained_over_http() {
         let h = harness(true).await;
-        let all_on = json!({"tweet": true, "xchat_message_received": true, "other": true});
+        let all_on = json!({
+            "tweet": true,
+            "retweet": true,
+            "quote": true,
+            "reply": true,
+            "xchat_message_received": true,
+            "other": true
+        });
 
         let first = json_of(
             h.req(reqwest::Method::PUT, "/api/settings")
@@ -1063,8 +1073,14 @@ mod tests {
         }
 
         let mut body = setup_body();
-        body["notification_filter"] =
-            json!({"tweet": false, "xchat_message_received": true, "other": false});
+        body["notification_filter"] = json!({
+            "tweet": false,
+            "retweet": false,
+            "quote": false,
+            "reply": true,
+            "xchat_message_received": true,
+            "other": false
+        });
         let saved = json_of(
             h.req(reqwest::Method::PUT, "/api/settings")
                 .json(&body)
@@ -1110,10 +1126,32 @@ mod tests {
         .await;
         assert_eq!(got["notification_filter"], body["notification_filter"]);
 
+        let full = json!({
+            "tweet": true, "retweet": true, "quote": true, "reply": true,
+            "xchat_message_received": true, "other": true
+        });
+        let without = |key: &str| {
+            let mut value = full.clone();
+            value.as_object_mut().unwrap().remove(key);
+            value
+        };
+        let with = |key: &str, value: serde_json::Value| {
+            let mut full = full.clone();
+            full[key] = value;
+            full
+        };
         for bad in [
             json!({"tweet": false}),
-            json!({"tweet": "no", "xchat_message_received": true, "other": true}),
-            json!({"tweet": true, "xchat_message_received": true, "other": true, "extra": 1}),
+            json!({"tweet": true, "xchat_message_received": true, "other": true}),
+            json!({"tweet": true, "retweet": true, "xchat_message_received": true, "other": true}),
+            without("retweet"),
+            without("quote"),
+            without("reply"),
+            with("tweet", json!("no")),
+            with("retweet", json!("no")),
+            with("quote", json!("no")),
+            with("reply", json!(1)),
+            with("extra", json!(1)),
             json!(null),
         ] {
             let mut request = setup_body();

@@ -10,6 +10,7 @@ export const notificationFilterSchema = z.object({
   tweet: z.boolean(),
   retweet: z.boolean(),
   quote: z.boolean(),
+  quote_self: z.boolean(),
   reply: z.boolean(),
   xchat_message_received: z.boolean(),
   other: z.boolean(),

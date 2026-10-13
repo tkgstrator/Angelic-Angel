@@ -23,20 +23,53 @@ pub struct Config {
 
 /// 通知の区分（`data.type`、および投稿のうちリツイート・引用RT・リプライの別）ごとに、
 /// 一覧表示と Webhook 転送を有効にするか。
+///
+/// 引用RT は `quote`（他のアカウントの投稿の引用）と `quote_self`（自分自身の投稿の引用）に分かれる。
+/// 設定ファイルに `quote_self` が無いときは、同じファイルの `quote` の値に従う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "RawNotificationFilter")]
 pub struct NotificationFilter {
-    #[serde(default = "enabled")]
     pub tweet: bool,
-    #[serde(default = "enabled")]
     pub retweet: bool,
-    #[serde(default = "enabled")]
     pub quote: bool,
-    #[serde(default = "enabled")]
+    pub quote_self: bool,
     pub reply: bool,
-    #[serde(default = "enabled")]
     pub xchat_message_received: bool,
-    #[serde(default = "enabled")]
     pub other: bool,
+}
+
+/// 設定ファイルに書かれたままの形。省略されたキーの既定値を `NotificationFilter` へ移す前に決める。
+#[derive(Deserialize)]
+struct RawNotificationFilter {
+    #[serde(default = "enabled")]
+    tweet: bool,
+    #[serde(default = "enabled")]
+    retweet: bool,
+    #[serde(default = "enabled")]
+    quote: bool,
+    #[serde(default)]
+    quote_self: Option<bool>,
+    #[serde(default = "enabled")]
+    reply: bool,
+    #[serde(default = "enabled")]
+    xchat_message_received: bool,
+    #[serde(default = "enabled")]
+    other: bool,
+}
+
+impl From<RawNotificationFilter> for NotificationFilter {
+    fn from(raw: RawNotificationFilter) -> Self {
+        Self {
+            tweet: raw.tweet,
+            retweet: raw.retweet,
+            quote: raw.quote,
+            // `quote_self` の導入前に保存された設定は、引用RT の扱いを変えない。
+            quote_self: raw.quote_self.unwrap_or(raw.quote),
+            reply: raw.reply,
+            xchat_message_received: raw.xchat_message_received,
+            other: raw.other,
+        }
+    }
 }
 
 fn enabled() -> bool {
@@ -49,6 +82,7 @@ impl Default for NotificationFilter {
             tweet: true,
             retweet: true,
             quote: true,
+            quote_self: true,
             reply: true,
             xchat_message_received: true,
             other: true,
@@ -62,6 +96,7 @@ impl NotificationFilter {
             NotificationKind::Tweet => self.tweet,
             NotificationKind::Retweet => self.retweet,
             NotificationKind::Quote => self.quote,
+            NotificationKind::SelfQuote => self.quote_self,
             NotificationKind::Reply => self.reply,
             NotificationKind::XchatMessageReceived => self.xchat_message_received,
             NotificationKind::Other => self.other,
@@ -395,6 +430,7 @@ ct0 = "b"
             config.notification_filter.tweet
                 && config.notification_filter.retweet
                 && config.notification_filter.quote
+                && config.notification_filter.quote_self
                 && config.notification_filter.reply
                 && config.notification_filter.xchat_message_received
                 && config.notification_filter.other
@@ -453,6 +489,7 @@ ct0 = "b"
                 tweet: false,
                 retweet: false,
                 quote: false,
+                quote_self: true,
                 reply: true,
                 xchat_message_received: true,
                 other: false,
@@ -461,6 +498,7 @@ ct0 = "b"
         config.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.notification_filter, config.notification_filter);
+        assert!(!loaded.notification_filter.quote && loaded.notification_filter.quote_self);
         assert!(loaded.registration.is_some());
         assert_eq!(
             loaded.webhook_endpoint.as_deref(),
@@ -474,6 +512,7 @@ ct0 = "b"
             tweet: false,
             retweet: true,
             quote: false,
+            quote_self: true,
             reply: true,
             xchat_message_received: true,
             other: false,
@@ -481,9 +520,72 @@ ct0 = "b"
         assert!(!filter.allows(NotificationKind::Tweet));
         assert!(filter.allows(NotificationKind::Retweet));
         assert!(!filter.allows(NotificationKind::Quote));
+        assert!(filter.allows(NotificationKind::SelfQuote));
         assert!(filter.allows(NotificationKind::Reply));
         assert!(filter.allows(NotificationKind::XchatMessageReceived));
         assert!(!filter.allows(NotificationKind::Other));
+
+        // quote_self と quote は互いに影響しない。
+        let swapped = NotificationFilter {
+            quote: true,
+            quote_self: false,
+            ..filter
+        };
+        assert!(swapped.allows(NotificationKind::Quote));
+        assert!(!swapped.allows(NotificationKind::SelfQuote));
+    }
+
+    #[test]
+    fn a_missing_quote_self_follows_quote_in_the_same_file() {
+        let base = "[twitter]\nauth_token = \"a\"\nct0 = \"b\"\n";
+        let load = |filter: &str| -> NotificationFilter {
+            let config: Config = toml::from_str(&format!("{base}{filter}")).unwrap();
+            config.notification_filter
+        };
+
+        // quote の値に従う。quote を無効にしていた既存の設定は、自己引用も転送しないまま。
+        let off = load("[notification_filter]\nquote = false\n");
+        assert!(!off.quote && !off.quote_self);
+        let on = load("[notification_filter]\nquote = true\n");
+        assert!(on.quote && on.quote_self);
+
+        // quote も無いとき（または表自体が無いとき）は、既定の有効に従う。
+        assert!(load("[notification_filter]\ntweet = false\n").quote_self);
+        assert!(load("").quote_self);
+
+        // quote_self があれば、quote とは独立にそれを使う。
+        let only_self = load("[notification_filter]\nquote = false\nquote_self = true\n");
+        assert!(!only_self.quote && only_self.quote_self);
+        let only_other = load("[notification_filter]\nquote = true\nquote_self = false\n");
+        assert!(only_other.quote && !only_other.quote_self);
+        let self_alone = load("[notification_filter]\nquote_self = false\n");
+        assert!(self_alone.quote && !self_alone.quote_self);
+    }
+
+    #[test]
+    fn the_filter_is_written_with_both_quote_keys() {
+        let dir = temp_dir();
+        let path = dir.join("c.toml");
+        let legacy =
+            "[twitter]\nauth_token = \"a\"\nct0 = \"b\"\n[notification_filter]\nquote = false\n";
+        std::fs::write(&path, legacy).unwrap();
+
+        // 読み込んで保存し直すと、省略されていた quote_self も書き出される。
+        let loaded = Config::load(&path).unwrap();
+        loaded.save(&path).unwrap();
+        let written: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let filter = written["notification_filter"].as_table().unwrap();
+        assert_eq!(filter["quote"].as_bool(), Some(false));
+        assert_eq!(filter["quote_self"].as_bool(), Some(false));
+
+        // 書き出した値は、再び quote に引きずられず、そのまま読み戻せる。
+        let mut changed = Config::load(&path).unwrap();
+        changed.notification_filter.quote_self = true;
+        changed.save(&path).unwrap();
+        let reloaded = Config::load(&path).unwrap();
+        assert!(!reloaded.notification_filter.quote && reloaded.notification_filter.quote_self);
+        assert_eq!(reloaded.notification_filter, changed.notification_filter);
     }
 
     #[test]

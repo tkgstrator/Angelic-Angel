@@ -4,6 +4,8 @@ import { allowAll, json, mockApi, page, settings } from './test/helpers'
 
 const FIRST = 'GET /api/notifications?limit=50'
 
+const { quote_self: _quoteSelf, ...legacyFilter } = allowAll
+
 const invalid = [
   ['missing', undefined],
   ['null', null],
@@ -13,6 +15,8 @@ const invalid = [
   ['missing retweet', { tweet: true, xchat_message_received: true, other: true }],
   ['missing quote and reply', { ...allowAll, quote: undefined, reply: undefined }],
   ['missing quote', { ...allowAll, quote: undefined }],
+  ['missing quote_self', { ...allowAll, quote_self: undefined }],
+  ['a filter from before quote_self existed', legacyFilter],
   ['missing reply', { ...allowAll, reply: undefined }],
   ['string instead of boolean', { ...allowAll, other: 'true' }],
   ['number instead of boolean', { ...allowAll, tweet: 1 }],
@@ -21,21 +25,24 @@ const invalid = [
   ['string retweet', { ...allowAll, retweet: 'false' }],
   ['null quote', { ...allowAll, quote: null }],
   ['string quote', { ...allowAll, quote: 'false' }],
+  ['null quote_self', { ...allowAll, quote_self: null }],
+  ['string quote_self', { ...allowAll, quote_self: 'false' }],
   ['null reply', { ...allowAll, reply: null }],
   ['number reply', { ...allowAll, reply: 0 }],
 ] as const
 
 describe('notificationFilterSchema', () => {
   it('accepts all boolean combinations', () => {
-    for (const bits of Array.from({ length: 64 }, (_, n) => n)) {
+    for (const bits of Array.from({ length: 128 }, (_, n) => n)) {
       const on = (bit: number) => (bits & (1 << bit)) !== 0
       const filter = {
         tweet: on(0),
         retweet: on(1),
         quote: on(2),
-        reply: on(3),
-        xchat_message_received: on(4),
-        other: on(5),
+        quote_self: on(3),
+        reply: on(4),
+        xchat_message_received: on(5),
+        other: on(6),
       }
       expect(notificationFilterSchema.parse(filter)).toEqual(filter)
     }
@@ -83,6 +90,7 @@ describe('notification_filter at the API boundary', () => {
       tweet: false,
       retweet: false,
       quote: false,
+      quote_self: true,
       reply: true,
       xchat_message_received: true,
       other: false,

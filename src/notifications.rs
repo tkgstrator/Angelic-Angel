@@ -49,20 +49,22 @@ PRAGMA user_version = {SCHEMA_VERSION};
 }
 
 /// 通知の区分。`data.type` から決まるが、`Retweet` は X の `data.type` に無く、投稿の中身から導く。
-/// `Quote` と `Reply` は payload だけでは判別できず、[`resolve_kind`] が公開 API への照会で決める。
+/// `Quote`・`SelfQuote`・`Reply` は payload だけでは判別できず、[`resolve_kind`] が公開 API への照会で決める。
+/// `Quote` は他のアカウントの投稿の引用RT、`SelfQuote` は自分自身の投稿の引用RT。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationKind {
     Tweet,
     Retweet,
     Quote,
+    SelfQuote,
     Reply,
     XchatMessageReceived,
     Other,
 }
 
 impl NotificationKind {
-    /// X が `data.type` に載せる値。`Retweet`・`Quote`・`Reply` は含まない。
+    /// X が `data.type` に載せる値。`Retweet`・`Quote`・`SelfQuote`・`Reply` は含まない。
     const DATA_TYPES: [NotificationKind; 2] = [Self::Tweet, Self::XchatMessageReceived];
 
     fn as_str(self) -> &'static str {
@@ -70,13 +72,14 @@ impl NotificationKind {
             Self::Tweet => "tweet",
             Self::Retweet => "retweet",
             Self::Quote => "quote",
+            Self::SelfQuote => "self_quote",
             Self::Reply => "reply",
             Self::XchatMessageReceived => "xchat_message_received",
             Self::Other => "other",
         }
     }
 
-    /// payload の `data.type` を読む。`"retweet"`・`"quote"`・`"reply"` という `data.type` は存在しないので `Other` にする。
+    /// payload の `data.type` を読む。`"retweet"`・`"quote"`・`"self_quote"`・`"reply"` という `data.type` は存在しないので `Other` にする。
     fn from_data_type(value: &str) -> Self {
         Self::DATA_TYPES
             .into_iter()
@@ -86,7 +89,7 @@ impl NotificationKind {
 
     /// DB の `kind` 列に保存した文字列を戻す。
     fn from_stored(value: &str) -> Self {
-        [Self::Retweet, Self::Quote, Self::Reply]
+        [Self::Retweet, Self::Quote, Self::SelfQuote, Self::Reply]
             .into_iter()
             .find(|kind| kind.as_str() == value)
             .unwrap_or_else(|| Self::from_data_type(value))
@@ -163,6 +166,7 @@ pub async fn resolve_kind(payload: &Value, lookup: &TweetLookup) -> Notification
     match lookup.shape(&id).await {
         Some(TweetShape::Reply) => NotificationKind::Reply,
         Some(TweetShape::Quote) => NotificationKind::Quote,
+        Some(TweetShape::SelfQuote) => NotificationKind::SelfQuote,
         Some(TweetShape::Plain) | None => kind,
     }
 }
@@ -267,8 +271,10 @@ fn list_with_timeout(
                      OR (kind = 'quote' AND ?5) \
                      OR (kind = 'reply' AND ?6) \
                      OR (kind = 'xchat_message_received' AND ?7) \
+                     OR (kind = 'self_quote' AND ?9) \
                      OR (kind NOT IN ( \
-                         'tweet', 'retweet', 'quote', 'reply', 'xchat_message_received' \
+                         'tweet', 'retweet', 'quote', 'self_quote', 'reply', \
+                         'xchat_message_received' \
                      ) AND ?8) \
                  ) ORDER BY seq DESC LIMIT ?2",
             )
@@ -283,7 +289,8 @@ fn list_with_timeout(
                 filter.quote,
                 filter.reply,
                 filter.xchat_message_received,
-                filter.other
+                filter.other,
+                filter.quote_self
             ],
             |row| {
                 let url: Option<String> = row.get(4)?;
@@ -1412,7 +1419,7 @@ mod tests {
         )
     }
 
-    /// `quote` と `reply` は有効のまま。この 2 区分を変えるときは構造体を直接作る。
+    /// `quote`・`quote_self`・`reply` は有効のまま。この 3 区分を変えるときは構造体を直接作る。
     fn filter(
         tweet: bool,
         retweet: bool,
@@ -1423,6 +1430,7 @@ mod tests {
             tweet,
             retweet,
             quote: true,
+            quote_self: true,
             reply: true,
             xchat_message_received,
             other,
@@ -1634,6 +1642,7 @@ mod tests {
         for (name, kind) in [
             ("retweet", NotificationKind::Retweet),
             ("quote", NotificationKind::Quote),
+            ("self_quote", NotificationKind::SelfQuote),
             ("reply", NotificationKind::Reply),
         ] {
             assert_eq!(NotificationKind::from_stored(name), kind);
@@ -1647,6 +1656,7 @@ mod tests {
             NotificationKind::Tweet,
             NotificationKind::Retweet,
             NotificationKind::Quote,
+            NotificationKind::SelfQuote,
             NotificationKind::Reply,
             NotificationKind::XchatMessageReceived,
             NotificationKind::Other,
@@ -1680,19 +1690,28 @@ mod tests {
             NotificationKind::Reply,
             6,
         );
+        append_kind(
+            &path,
+            "c:7",
+            &plain_tweet_payload(),
+            NotificationKind::SelfQuote,
+            7,
+        );
         let value = serde_json::to_value(list(&path, None, 10).unwrap()).unwrap();
-        assert_eq!(value["items"][0]["kind"], "reply");
-        assert_eq!(value["items"][1]["kind"], "quote");
-        assert_eq!(value["items"][2]["kind"], "retweet");
-        assert_eq!(value["items"][3]["kind"], "other");
-        assert_eq!(value["items"][4]["kind"], "xchat_message_received");
-        assert_eq!(value["items"][5]["kind"], "tweet");
+        assert_eq!(value["items"][0]["kind"], "self_quote");
+        assert_eq!(value["items"][1]["kind"], "reply");
+        assert_eq!(value["items"][2]["kind"], "quote");
+        assert_eq!(value["items"][3]["kind"], "retweet");
+        assert_eq!(value["items"][4]["kind"], "other");
+        assert_eq!(value["items"][5]["kind"], "xchat_message_received");
+        assert_eq!(value["items"][6]["kind"], "tweet");
         assert_eq!(
             value["notification_filter"],
             json!({
                 "tweet": true,
                 "retweet": true,
                 "quote": true,
+                "quote_self": true,
                 "reply": true,
                 "xchat_message_received": true,
                 "other": true
@@ -1738,34 +1757,37 @@ mod tests {
 
     #[test]
     fn every_filter_combination_selects_the_matching_kinds() {
-        use NotificationKind::{Quote, Reply};
+        use NotificationKind::{Quote, Reply, SelfQuote};
         let path = config_path();
         append_at(&path, "tweet", &typed("tweet", 1), 1).unwrap();
         append_at(&path, "retweet", &retweet_payload(), 2).unwrap();
         append_kind(&path, "quote", &plain_tweet_payload(), Quote, 3);
-        append_kind(&path, "reply", &plain_tweet_payload(), Reply, 4);
-        append_at(&path, "chat", &typed("xchat_message_received", 5), 5).unwrap();
-        append_at(&path, "other", &typed("unknown", 6), 6).unwrap();
-        append_at(&path, "missing", &sample(7), 7).unwrap();
+        append_kind(&path, "self_quote", &plain_tweet_payload(), SelfQuote, 4);
+        append_kind(&path, "reply", &plain_tweet_payload(), Reply, 5);
+        append_at(&path, "chat", &typed("xchat_message_received", 6), 6).unwrap();
+        append_at(&path, "other", &typed("unknown", 7), 7).unwrap();
+        append_at(&path, "missing", &sample(8), 8).unwrap();
         type Shown = fn(&NotificationFilter) -> bool;
-        let rows: [(&str, Shown); 7] = [
+        let rows: [(&str, Shown); 8] = [
             ("tweet", |f| f.tweet),
             ("retweet", |f| f.retweet),
             ("quote", |f| f.quote),
+            ("self_quote", |f| f.quote_self),
             ("reply", |f| f.reply),
             ("chat", |f| f.xchat_message_received),
             ("other", |f| f.other),
             ("missing", |f| f.other),
         ];
 
-        for bits in 0..64_u8 {
+        for bits in 0..128_u8 {
             let f = NotificationFilter {
                 tweet: bits & 1 != 0,
                 retweet: bits & 2 != 0,
                 quote: bits & 4 != 0,
-                reply: bits & 8 != 0,
-                xchat_message_received: bits & 16 != 0,
-                other: bits & 32 != 0,
+                quote_self: bits & 8 != 0,
+                reply: bits & 16 != 0,
+                xchat_message_received: bits & 32 != 0,
+                other: bits & 64 != 0,
             };
             let expected: Vec<&str> = rows
                 .iter()
@@ -1790,6 +1812,7 @@ mod tests {
             tweet: false,
             retweet: false,
             quote: false,
+            quote_self: false,
             reply: false,
             xchat_message_received: false,
             other: false,
@@ -2343,9 +2366,18 @@ mod tests {
 
         #[tokio::test]
         async fn a_plain_tweet_becomes_a_quote_or_a_reply_by_the_lookup() {
+            // 引用元の投稿者が同じなら自己引用、違うか判別できなければ他アカウントの引用。
             let cases = [
                 (
                     r#"{"__typename":"Tweet","quoted_tweet":{"id_str":"1"}}"#,
+                    NotificationKind::Quote,
+                ),
+                (
+                    r#"{"__typename":"Tweet","user":{"id_str":"7"},"quoted_tweet":{"user":{"id_str":"7"}}}"#,
+                    NotificationKind::SelfQuote,
+                ),
+                (
+                    r#"{"__typename":"Tweet","user":{"id_str":"7"},"quoted_tweet":{"user":{"id_str":"8"}}}"#,
                     NotificationKind::Quote,
                 ),
                 (
@@ -2354,6 +2386,10 @@ mod tests {
                 ),
                 (
                     r#"{"__typename":"Tweet","in_reply_to_status_id_str":"1","quoted_tweet":{}}"#,
+                    NotificationKind::Reply,
+                ),
+                (
+                    r#"{"__typename":"Tweet","in_reply_to_status_id_str":"1","user":{"id_str":"7"},"quoted_tweet":{"user":{"id_str":"7"}}}"#,
                     NotificationKind::Reply,
                 ),
                 (r#"{"__typename":"Tweet"}"#, NotificationKind::Tweet),

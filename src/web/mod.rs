@@ -968,6 +968,7 @@ mod tests {
                     "tweet": true,
                     "retweet": true,
                     "quote": true,
+                    "quote_self": true,
                     "reply": true,
                     "xchat_message_received": true,
                     "other": true
@@ -1044,6 +1045,7 @@ mod tests {
             "tweet": true,
             "retweet": true,
             "quote": true,
+            "quote_self": true,
             "reply": true,
             "xchat_message_received": true,
             "other": true
@@ -1077,6 +1079,7 @@ mod tests {
             "tweet": false,
             "retweet": false,
             "quote": false,
+            "quote_self": true,
             "reply": true,
             "xchat_message_received": true,
             "other": false
@@ -1127,8 +1130,8 @@ mod tests {
         assert_eq!(got["notification_filter"], body["notification_filter"]);
 
         let full = json!({
-            "tweet": true, "retweet": true, "quote": true, "reply": true,
-            "xchat_message_received": true, "other": true
+            "tweet": true, "retweet": true, "quote": true, "quote_self": true,
+            "reply": true, "xchat_message_received": true, "other": true
         });
         let without = |key: &str| {
             let mut value = full.clone();
@@ -1146,10 +1149,12 @@ mod tests {
             json!({"tweet": true, "retweet": true, "xchat_message_received": true, "other": true}),
             without("retweet"),
             without("quote"),
+            without("quote_self"),
             without("reply"),
             with("tweet", json!("no")),
             with("retweet", json!("no")),
             with("quote", json!("no")),
+            with("quote_self", json!("no")),
             with("reply", json!(1)),
             with("extra", json!(1)),
             json!(null),

@@ -26,14 +26,55 @@ const SOURCE_LABEL = {
   none: '未設定',
 } as const
 
-const FILTER_OPTIONS: readonly { key: keyof NotificationFilter; label: string }[] = [
+type FilterKey = keyof NotificationFilter
+type FilterLeaf = { key: FilterKey; label: string }
+/** 子を持つ項目は、キーを持たず子の状態をまとめて表す。 */
+type FilterNode = FilterLeaf | { id: string; label: string; children: readonly FilterLeaf[] }
+type CheckedState = boolean | 'indeterminate'
+
+const FILTER_OPTIONS: readonly FilterNode[] = [
   { key: 'tweet', label: '投稿（tweet）' },
   { key: 'retweet', label: 'リツイート（RT）' },
-  { key: 'quote', label: '引用RT' },
+  {
+    id: 'quote-group',
+    label: '引用RT',
+    children: [
+      { key: 'quote_self', label: '自分自身の引用（quote_self）' },
+      { key: 'quote', label: '他アカウントの引用（quote）' },
+    ],
+  },
   { key: 'reply', label: 'リプライ' },
   { key: 'xchat_message_received', label: 'チャット（xchat_message_received）' },
   { key: 'other', label: 'その他・未指定' },
 ]
+
+/** すべて有効ならチェック、一部だけなら indeterminate、すべて無効なら未チェック。 */
+function groupState(filter: NotificationFilter, children: readonly FilterLeaf[]): CheckedState {
+  const enabled = children.filter(({ key }) => filter[key]).length
+  if (enabled === children.length) return true
+  return enabled === 0 ? false : 'indeterminate'
+}
+
+function FilterCheckbox({
+  id,
+  label,
+  checked,
+  onCheckedChange,
+}: {
+  id: string
+  label: string
+  checked: CheckedState
+  onCheckedChange: (checked: CheckedState) => void
+}) {
+  return (
+    <div className="flex items-center gap-3">
+      <Checkbox id={id} checked={checked} onCheckedChange={onCheckedChange} />
+      <Label id={`${id}-label`} htmlFor={id}>
+        {label}
+      </Label>
+    </div>
+  )
+}
 
 export interface SettingsInput {
   authToken: string
@@ -210,6 +251,10 @@ function SettingsForm({
   const saving = lock.active === 'save' && !checking
   const dirty = authToken.trim() !== '' || ct0.trim() !== ''
 
+  function setFilterKeys(keys: readonly FilterKey[], enabled: boolean) {
+    setFilter((prev) => keys.reduce((next, key) => ({ ...next, [key]: enabled }), prev))
+  }
+
   async function runCheck() {
     setCheck({ kind: 'checking' })
     try {
@@ -376,18 +421,46 @@ function SettingsForm({
           disabled={busy}
         >
           <div className="space-y-4">
-            {FILTER_OPTIONS.map(({ key, label }) => (
-              <div key={key} className="flex items-center gap-3">
-                <Checkbox
-                  id={`${id}-filter-${key}`}
-                  checked={filter[key]}
-                  onCheckedChange={(checked) =>
-                    setFilter((prev) => ({ ...prev, [key]: checked === true }))
-                  }
-                />
-                <Label htmlFor={`${id}-filter-${key}`}>{label}</Label>
-              </div>
-            ))}
+            {FILTER_OPTIONS.map((node) => {
+              if (!('children' in node)) {
+                return (
+                  <FilterCheckbox
+                    key={node.key}
+                    id={`${id}-filter-${node.key}`}
+                    label={node.label}
+                    checked={filter[node.key]}
+                    onCheckedChange={(checked) => setFilterKeys([node.key], checked === true)}
+                  />
+                )
+              }
+              const groupId = `${id}-filter-${node.id}`
+              return (
+                <div key={groupId} className="space-y-4">
+                  <FilterCheckbox
+                    id={groupId}
+                    label={node.label}
+                    checked={groupState(filter, node.children)}
+                    onCheckedChange={(checked) =>
+                      setFilterKeys(
+                        node.children.map(({ key }) => key),
+                        checked === true,
+                      )
+                    }
+                  />
+                  <div role="group" aria-labelledby={`${groupId}-label`} className="ml-7 space-y-4">
+                    {node.children.map((child) => (
+                      <FilterCheckbox
+                        key={child.key}
+                        id={`${id}-filter-${child.key}`}
+                        label={child.label}
+                        checked={filter[child.key]}
+                        onCheckedChange={(checked) => setFilterKeys([child.key], checked === true)}
+                      />
+                    ))}
+                  </div>
+                </div>
+              )
+            })}
           </div>
         </Section>
         <SectionActions>

@@ -39,6 +39,7 @@ export const allowAll: NotificationFilter = {
   tweet: true,
   retweet: true,
   quote: true,
+  quote_self: true,
   reply: true,
   xchat_message_received: true,
   other: true,

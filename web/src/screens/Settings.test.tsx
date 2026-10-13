@@ -197,22 +197,25 @@ describe('Settings', () => {
 })
 
 const checkbox = (name: string | RegExp) => screen.getByRole('checkbox', { name })
-const FILTER_NAMES = [
-  /投稿（tweet）/,
-  /リツイート（RT）/,
-  /引用RT/,
-  /リプライ/,
-  /チャット（xchat_message_received）/,
-  /その他・未指定/,
-] as const
+const KIND = {
+  tweet: /投稿（tweet）/,
+  retweet: /リツイート（RT）/,
+  quote: /引用RT/,
+  quoteSelf: /自分自身の引用（quote_self）/,
+  quoteOther: /他アカウントの引用（quote）/,
+  reply: /リプライ/,
+  chat: /チャット（xchat_message_received）/,
+  other: /その他・未指定/,
+} as const
+const FILTER_NAMES = Object.values(KIND)
 
 describe('Settings notification filter', () => {
-  it('lists the six kinds, all enabled by default, with the explanation', async () => {
+  it('lists the kinds with quotes nested, all enabled by default, with the explanation', async () => {
     mockApi(settingsRoutes())
     render(<Settings />)
     await screen.findByLabelText(/auth_token/)
     const group = screen.getByRole('group', { name: '通知フィルター' })
-    expect(within(group).getAllByRole('checkbox')).toHaveLength(6)
+    expect(within(group).getAllByRole('checkbox')).toHaveLength(8)
     for (const name of FILTER_NAMES) expect(checkbox(name)).toBeChecked()
     expect(
       within(group).getByText(
@@ -229,9 +232,10 @@ describe('Settings notification filter', () => {
     })
     render(<Settings />)
     await screen.findByLabelText(/auth_token/)
-    const chat = FILTER_NAMES[4]
-    for (const name of FILTER_NAMES.filter((n) => n !== chat)) expect(checkbox(name)).toBeChecked()
-    expect(checkbox(chat)).not.toBeChecked()
+    for (const name of FILTER_NAMES.filter((n) => n !== KIND.chat)) {
+      expect(checkbox(name)).toBeChecked()
+    }
+    expect(checkbox(KIND.chat)).not.toBeChecked()
   })
 
   it('toggles quotes and replies independently of each other and of retweets', async () => {
@@ -257,6 +261,7 @@ describe('Settings notification filter', () => {
     expect(checkbox(/リツイート（RT）/)).toBeChecked()
     expect(checkbox(/投稿（tweet）/)).toBeChecked()
 
+    // 片方だけ無効の親は indeterminate。操作すると子が両方有効になる
     await userEvent.click(checkbox(/引用RT/))
     await save()
     await screen.findByText('保存しました。')
@@ -299,18 +304,19 @@ describe('Settings notification filter', () => {
     })
     const first = render(<Settings />)
     await screen.findByLabelText(/auth_token/)
-    await userEvent.click(checkbox(FILTER_NAMES[0]))
-    await userEvent.click(checkbox(FILTER_NAMES[1]))
-    await userEvent.click(checkbox(FILTER_NAMES[2]))
-    await userEvent.click(checkbox(FILTER_NAMES[3]))
-    await userEvent.click(checkbox(FILTER_NAMES[4]))
-    await userEvent.click(checkbox(FILTER_NAMES[5]))
+    await userEvent.click(checkbox(KIND.tweet))
+    await userEvent.click(checkbox(KIND.retweet))
+    await userEvent.click(checkbox(KIND.quote))
+    await userEvent.click(checkbox(KIND.reply))
+    await userEvent.click(checkbox(KIND.chat))
+    await userEvent.click(checkbox(KIND.other))
     await save()
     await screen.findByText('保存しました。')
     expect(body.notification_filter).toEqual({
       tweet: false,
       retweet: false,
       quote: false,
+      quote_self: false,
       reply: false,
       xchat_message_received: false,
       other: false,
@@ -321,11 +327,18 @@ describe('Settings notification filter', () => {
     render(<Settings />)
     await screen.findByLabelText(/auth_token/)
     for (const name of FILTER_NAMES) expect(checkbox(name)).not.toBeChecked()
-    await userEvent.click(checkbox(FILTER_NAMES[4]))
+    await userEvent.click(checkbox(KIND.chat))
     await save()
     await waitFor(() =>
       expect(body.notification_filter).toEqual(
-        filterOf({ tweet: false, retweet: false, quote: false, reply: false, other: false }),
+        filterOf({
+          tweet: false,
+          retweet: false,
+          quote: false,
+          quote_self: false,
+          reply: false,
+          other: false,
+        }),
       ),
     )
   })
@@ -339,18 +352,18 @@ describe('Settings notification filter', () => {
     await screen.findByLabelText(/auth_token/)
     await save()
     await screen.findByText('保存しました。')
-    expect(checkbox(FILTER_NAMES[5])).not.toBeChecked()
-    expect(checkbox(FILTER_NAMES[0])).toBeChecked()
+    expect(checkbox(KIND.other)).not.toBeChecked()
+    expect(checkbox(KIND.tweet)).toBeChecked()
   })
 
   it('keeps the edit when saving fails', async () => {
     mockApi({ ...settingsRoutes(), [PUT]: () => apiError(500, 'x', '保存失敗') })
     render(<Settings />)
     await screen.findByLabelText(/auth_token/)
-    await userEvent.click(checkbox(FILTER_NAMES[0]))
+    await userEvent.click(checkbox(KIND.tweet))
     await save()
     expect(await screen.findByRole('alert')).toHaveTextContent('保存失敗')
-    expect(checkbox(FILTER_NAMES[0])).not.toBeChecked()
+    expect(checkbox(KIND.tweet)).not.toBeChecked()
   })
 
   it('stays editable when registered or when the webhook comes from the environment', async () => {
@@ -375,7 +388,7 @@ describe('Settings notification filter', () => {
     expect(await screen.findByLabelText(/auth_token/)).toBeDisabled()
     expect(screen.getByLabelText('Webhook URL')).toBeDisabled()
     for (const name of FILTER_NAMES) expect(checkbox(name)).toBeEnabled()
-    await userEvent.click(checkbox(FILTER_NAMES[0]))
+    await userEvent.click(checkbox(KIND.tweet))
     await save()
     await screen.findByText('保存しました。')
     expect(body).toEqual({
@@ -397,6 +410,123 @@ describe('Settings notification filter', () => {
     release(json(settings()))
     await screen.findByText('Cookie は有効です（@alice）。')
     for (const name of FILTER_NAMES) expect(checkbox(name)).toBeEnabled()
+  })
+})
+
+const state = (name: string | RegExp) => checkbox(name).getAttribute('aria-checked')
+
+describe('Settings quote filter', () => {
+  async function renderWith(notification_filter: NotificationFilter) {
+    const body = { current: {} as { notification_filter?: NotificationFilter } }
+    mockApi({
+      ...settingsRoutes(),
+      'GET /api/settings': () => json(settings({ notification_filter })),
+      [PUT]: (init) => {
+        body.current = JSON.parse(String(init.body))
+        return json(settings({ notification_filter: body.current.notification_filter }))
+      },
+    })
+    render(<Settings />)
+    await screen.findByLabelText(/auth_token/)
+    return body
+  }
+
+  it('nests the two quote kinds under the parent and never hides them', async () => {
+    await renderWith(filterOf())
+    const children = screen.getByRole('group', { name: '引用RT' })
+    expect(within(children).getAllByRole('checkbox')).toEqual([
+      checkbox(KIND.quoteSelf),
+      checkbox(KIND.quoteOther),
+    ])
+    expect(within(children).queryByRole('checkbox', { name: KIND.quote })).not.toBeInTheDocument()
+
+    await userEvent.click(checkbox(KIND.quote))
+    expect(state(KIND.quote)).toBe('false')
+    expect(checkbox(KIND.quoteSelf)).toBeVisible()
+    expect(checkbox(KIND.quoteOther)).toBeVisible()
+  })
+
+  it.each([
+    [true, true, 'true'],
+    [true, false, 'mixed'],
+    [false, true, 'mixed'],
+    [false, false, 'false'],
+  ])('shows the parent for quote_self=%s and quote=%s as %s', async (quoteSelf, quote, parent) => {
+    await renderWith(filterOf({ quote_self: quoteSelf, quote }))
+    expect(state(KIND.quote)).toBe(parent)
+    expect(state(KIND.quoteSelf)).toBe(String(quoteSelf))
+    expect(state(KIND.quoteOther)).toBe(String(quote))
+    expect(checkbox(KIND.quote).dataset.state).toBe(
+      { true: 'checked', mixed: 'indeterminate', false: 'unchecked' }[parent],
+    )
+  })
+
+  it('switches both children together from the parent', async () => {
+    await renderWith(filterOf())
+    await userEvent.click(checkbox(KIND.quote))
+    expect([KIND.quote, KIND.quoteSelf, KIND.quoteOther].map(state)).toEqual([
+      'false',
+      'false',
+      'false',
+    ])
+    await userEvent.click(checkbox(KIND.quote))
+    expect([KIND.quote, KIND.quoteSelf, KIND.quoteOther].map(state)).toEqual([
+      'true',
+      'true',
+      'true',
+    ])
+  })
+
+  it.each([
+    ['quote_self', filterOf({ quote_self: false })],
+    ['quote', filterOf({ quote: false })],
+  ])('enables both children when the parent is partly off (%s off)', async (_, partial) => {
+    const body = await renderWith(partial)
+    expect(state(KIND.quote)).toBe('mixed')
+    await userEvent.click(checkbox(KIND.quote))
+    expect([KIND.quote, KIND.quoteSelf, KIND.quoteOther].map(state)).toEqual([
+      'true',
+      'true',
+      'true',
+    ])
+    await save()
+    await screen.findByText('保存しました。')
+    expect(body.current.notification_filter).toEqual(filterOf())
+  })
+
+  it('follows the children one by one and leaves the other kinds alone', async () => {
+    await renderWith(filterOf())
+    await userEvent.click(checkbox(KIND.quoteSelf))
+    expect(state(KIND.quote)).toBe('mixed')
+    expect(state(KIND.quoteOther)).toBe('true')
+    await userEvent.click(checkbox(KIND.quoteOther))
+    expect(state(KIND.quote)).toBe('false')
+    await userEvent.click(checkbox(KIND.quoteSelf))
+    expect(state(KIND.quote)).toBe('mixed')
+    expect(state(KIND.quoteSelf)).toBe('true')
+    expect(state(KIND.quoteOther)).toBe('false')
+    await userEvent.click(checkbox(KIND.quoteOther))
+    expect(state(KIND.quote)).toBe('true')
+    for (const name of [KIND.tweet, KIND.retweet, KIND.reply, KIND.chat, KIND.other]) {
+      expect(checkbox(name)).toBeChecked()
+    }
+  })
+
+  it('saves quote and quote_self independently of each other', async () => {
+    const body = await renderWith(filterOf())
+    await userEvent.click(checkbox(KIND.quoteOther))
+    await save()
+    await screen.findByText('保存しました。')
+    expect(body.current.notification_filter).toEqual(filterOf({ quote: false }))
+    expect(state(KIND.quoteSelf)).toBe('true')
+    expect(state(KIND.quoteOther)).toBe('false')
+
+    await userEvent.click(checkbox(KIND.quoteOther))
+    await userEvent.click(checkbox(KIND.quoteSelf))
+    await save()
+    await waitFor(() =>
+      expect(body.current.notification_filter).toEqual(filterOf({ quote_self: false })),
+    )
   })
 })
 

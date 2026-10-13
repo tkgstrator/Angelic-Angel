@@ -324,6 +324,7 @@ const allOff = filterOf({
   tweet: false,
   retweet: false,
   quote: false,
+  quote_self: false,
   reply: false,
   xchat_message_received: false,
   other: false,
@@ -387,6 +388,7 @@ describe('Notifications filter', () => {
 
   it.each([
     ['quote', filterOf({ quote: false })],
+    ['quote_self', filterOf({ quote_self: false })],
     ['reply', filterOf({ reply: false })],
   ])('treats a change of only the %s flag as a filter change', async (_, changed) => {
     vi.useFakeTimers()

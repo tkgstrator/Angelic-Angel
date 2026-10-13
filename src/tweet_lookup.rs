@@ -17,11 +17,14 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BODY_BYTES: usize = 256 * 1024;
 const MAX_ID_DIGITS: usize = 20;
 
-/// 照会で分かったツイートの形。リプライを優先する。
+/// 照会で分かったツイートの形。リプライを優先し、引用RT は引用元の投稿者が同じかで分ける。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TweetShape {
     Reply,
+    /// 他のアカウントの投稿の引用RT。投稿者を比べられなかったときもこちらにする。
     Quote,
+    /// 自分自身の投稿の引用RT。
+    SelfQuote,
     Plain,
 }
 
@@ -151,12 +154,34 @@ fn shape_of(value: &Value) -> Option<TweetShape> {
         .get("in_reply_to_status_id_str")
         .and_then(Value::as_str)
         .is_some_and(|id| !id.is_empty());
-    let is_quote = value.get("quoted_tweet").is_some_and(Value::is_object);
-    Some(match (is_reply, is_quote) {
+    let quoted = value
+        .get("quoted_tweet")
+        .filter(|quoted| quoted.is_object());
+    Some(match (is_reply, quoted) {
         (true, _) => TweetShape::Reply,
-        (false, true) => TweetShape::Quote,
-        (false, false) => TweetShape::Plain,
+        (false, Some(quoted)) if same_author(value, quoted) => TweetShape::SelfQuote,
+        (false, Some(_)) => TweetShape::Quote,
+        (false, None) => TweetShape::Plain,
     })
+}
+
+/// 二つのツイートの投稿者が同じか。`user.id_str` を優先し、どちらかに無いときだけ
+/// `user.screen_name` を大文字小文字を無視して比べる。判別できなければ別人として扱う。
+fn same_author(a: &Value, b: &Value) -> bool {
+    fn user_field<'a>(tweet: &'a Value, name: &str) -> Option<&'a str> {
+        tweet
+            .get("user")?
+            .get(name)?
+            .as_str()
+            .filter(|value| !value.is_empty())
+    }
+    match (user_field(a, "id_str"), user_field(b, "id_str")) {
+        (Some(a), Some(b)) => a == b,
+        _ => match (user_field(a, "screen_name"), user_field(b, "screen_name")) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            _ => false,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -312,6 +337,139 @@ mod tests {
             "quoted_tweet": { "id_str": "2" },
         });
         assert_eq!(shape_from(&both).await, Some(TweetShape::Reply));
+    }
+
+    fn quote_by(quoting: Value, quoted: Value) -> Value {
+        json!({
+            "__typename": "Tweet",
+            "user": quoting,
+            "quoted_tweet": { "id_str": "1", "user": quoted },
+        })
+    }
+
+    #[tokio::test]
+    async fn a_quote_of_the_same_author_is_a_self_quote() {
+        // id_str が一致すれば、screen_name が違っていても（改名など）自己引用。
+        let same_id = quote_by(
+            json!({ "id_str": "42", "screen_name": "new_name" }),
+            json!({ "id_str": "42", "screen_name": "old_name" }),
+        );
+        assert_eq!(shape_from(&same_id).await, Some(TweetShape::SelfQuote));
+
+        // id_str が両方にあって食い違えば、screen_name が同じでも他アカウント。
+        let other_id = quote_by(
+            json!({ "id_str": "42", "screen_name": "same" }),
+            json!({ "id_str": "43", "screen_name": "same" }),
+        );
+        assert_eq!(shape_from(&other_id).await, Some(TweetShape::Quote));
+
+        let other = quote_by(
+            json!({ "id_str": "42", "screen_name": "alice" }),
+            json!({ "id_str": "43", "screen_name": "bob" }),
+        );
+        assert_eq!(shape_from(&other).await, Some(TweetShape::Quote));
+    }
+
+    #[tokio::test]
+    async fn the_screen_name_decides_only_when_an_id_is_missing() {
+        let cases = [
+            (
+                "id missing on the quoting side",
+                json!({ "screen_name": "Alice_JP" }),
+                json!({ "id_str": "42", "screen_name": "alice_jp" }),
+                TweetShape::SelfQuote,
+            ),
+            (
+                "id missing on the quoted side",
+                json!({ "id_str": "42", "screen_name": "alice_jp" }),
+                json!({ "screen_name": "ALICE_JP" }),
+                TweetShape::SelfQuote,
+            ),
+            (
+                "ids missing on both sides",
+                json!({ "screen_name": "alice_jp" }),
+                json!({ "screen_name": "Alice_Jp" }),
+                TweetShape::SelfQuote,
+            ),
+            (
+                "empty or non-string ids count as missing",
+                json!({ "id_str": "", "screen_name": "alice" }),
+                json!({ "id_str": 42, "screen_name": "alice" }),
+                TweetShape::SelfQuote,
+            ),
+            (
+                "different screen names",
+                json!({ "screen_name": "alice" }),
+                json!({ "id_str": "42", "screen_name": "bob" }),
+                TweetShape::Quote,
+            ),
+            (
+                "an id on one side and a name on the other cannot be compared",
+                json!({ "id_str": "42" }),
+                json!({ "screen_name": "alice" }),
+                TweetShape::Quote,
+            ),
+            (
+                "nothing to compare",
+                json!({}),
+                json!({}),
+                TweetShape::Quote,
+            ),
+            (
+                "empty names count as missing",
+                json!({ "screen_name": "" }),
+                json!({ "screen_name": "" }),
+                TweetShape::Quote,
+            ),
+            (
+                "non-string names count as missing",
+                json!({ "screen_name": 1 }),
+                json!({ "screen_name": 1 }),
+                TweetShape::Quote,
+            ),
+        ];
+        for (name, quoting, quoted, expected) in cases {
+            let body = quote_by(quoting, quoted);
+            assert_eq!(shape_from(&body).await, Some(expected), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_quote_without_user_data_is_another_accounts_quote() {
+        let no_user_anywhere = json!({ "__typename": "Tweet", "quoted_tweet": {} });
+        assert_eq!(shape_from(&no_user_anywhere).await, Some(TweetShape::Quote));
+
+        let only_quoting = json!({
+            "__typename": "Tweet",
+            "user": { "id_str": "42", "screen_name": "alice" },
+            "quoted_tweet": { "id_str": "1" },
+        });
+        assert_eq!(shape_from(&only_quoting).await, Some(TweetShape::Quote));
+
+        let user_not_an_object = json!({
+            "__typename": "Tweet",
+            "user": "alice",
+            "quoted_tweet": { "user": "alice" },
+        });
+        assert_eq!(
+            shape_from(&user_not_an_object).await,
+            Some(TweetShape::Quote)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_wins_over_a_self_quote_and_a_plain_tweet_stays_plain() {
+        let same = json!({ "id_str": "42", "screen_name": "alice" });
+        let reply = json!({
+            "__typename": "Tweet",
+            "in_reply_to_status_id_str": "1",
+            "user": same,
+            "quoted_tweet": { "user": same },
+        });
+        assert_eq!(shape_from(&reply).await, Some(TweetShape::Reply));
+
+        let plain = json!({ "__typename": "Tweet", "user": same });
+        assert_eq!(shape_from(&plain).await, Some(TweetShape::Plain));
     }
 
     #[tokio::test]

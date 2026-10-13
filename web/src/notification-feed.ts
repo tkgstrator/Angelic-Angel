@@ -19,6 +19,7 @@ export function sameFilter(a: NotificationFilter, b: NotificationFilter): boolea
     a.tweet === b.tweet &&
     a.retweet === b.retweet &&
     a.quote === b.quote &&
+    a.quote_self === b.quote_self &&
     a.reply === b.reply &&
     a.xchat_message_received === b.xchat_message_received &&
     a.other === b.other

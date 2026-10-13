@@ -192,6 +192,7 @@ pub struct NotificationFilterInput {
     pub tweet: bool,
     pub retweet: bool,
     pub quote: bool,
+    pub quote_self: bool,
     pub reply: bool,
     pub xchat_message_received: bool,
     pub other: bool,
@@ -203,6 +204,7 @@ impl From<NotificationFilterInput> for NotificationFilter {
             tweet: input.tweet,
             retweet: input.retweet,
             quote: input.quote,
+            quote_self: input.quote_self,
             reply: input.reply,
             xchat_message_received: input.xchat_message_received,
             other: input.other,
@@ -1377,12 +1379,13 @@ mod tests {
         assert_eq!(err.code, "invalid_cursor");
     }
 
-    /// `retweet`・`quote`・`reply` は `tweet` に揃える。個別に変える場合は構造体を直接作る。
+    /// `retweet`・`quote`・`quote_self`・`reply` は `tweet` に揃える。個別に変える場合は構造体を直接作る。
     fn filter_input(tweet: bool, chat: bool, other: bool) -> Option<NotificationFilterInput> {
         Some(NotificationFilterInput {
             tweet,
             retweet: tweet,
             quote: tweet,
+            quote_self: tweet,
             reply: tweet,
             xchat_message_received: chat,
             other,
@@ -1540,6 +1543,7 @@ mod tests {
                     tweet: true,
                     retweet: false,
                     quote: true,
+                    quote_self: true,
                     reply: true,
                     xchat_message_received: true,
                     other: true,
@@ -1555,18 +1559,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quotes_and_replies_are_filtered_independently() {
-        use crate::notifications::NotificationKind::{Quote, Reply, Tweet};
+    async fn quotes_self_quotes_and_replies_are_filtered_independently() {
+        use crate::notifications::NotificationKind::{Quote, Reply, SelfQuote, Tweet};
         let (_, service, path) = setup();
         service.update_settings(first_setup()).await.unwrap();
         let payload = serde_json::json!({"data": {"type": "tweet"}});
-        for (id, kind) in [("tweet", Tweet), ("quote", Quote), ("reply", Reply)] {
+        for (id, kind) in [
+            ("tweet", Tweet),
+            ("quote", Quote),
+            ("self_quote", SelfQuote),
+            ("reply", Reply),
+        ] {
             notifications::append_as(&path, id, &payload, kind).unwrap();
         }
         let ids = |page: NotificationPage| -> Vec<String> {
             page.items.into_iter().map(|item| item.id).collect()
         };
-        let update = |quote, reply| SettingsUpdate {
+        let update = |quote, quote_self, reply| SettingsUpdate {
             auth_token: None,
             ct0: None,
             webhook_endpoint: String::new(),
@@ -1574,6 +1583,7 @@ mod tests {
                 tweet: true,
                 retweet: true,
                 quote,
+                quote_self,
                 reply,
                 xchat_message_received: true,
                 other: true,
@@ -1581,25 +1591,46 @@ mod tests {
         };
         assert_eq!(
             ids(service.notifications(None, 10).await.unwrap()),
+            ["reply", "self_quote", "quote", "tweet"]
+        );
+
+        let dto = service
+            .update_settings(update(false, true, true))
+            .await
+            .unwrap();
+        assert!(!dto.notification_filter.quote && dto.notification_filter.quote_self);
+        assert!(dto.notification_filter.reply);
+        let saved = Config::load(&path).unwrap().notification_filter;
+        assert!(!saved.quote && saved.quote_self && saved.reply);
+        assert_eq!(
+            ids(service.notifications(None, 10).await.unwrap()),
+            ["reply", "self_quote", "tweet"]
+        );
+
+        service
+            .update_settings(update(true, false, true))
+            .await
+            .unwrap();
+        let saved = Config::load(&path).unwrap().notification_filter;
+        assert!(saved.quote && !saved.quote_self);
+        assert_eq!(
+            ids(service.notifications(None, 10).await.unwrap()),
             ["reply", "quote", "tweet"]
         );
 
-        let dto = service.update_settings(update(false, true)).await.unwrap();
-        assert!(!dto.notification_filter.quote && dto.notification_filter.reply);
-        let saved = Config::load(&path).unwrap().notification_filter;
-        assert!(!saved.quote && saved.reply);
+        service
+            .update_settings(update(true, true, false))
+            .await
+            .unwrap();
         assert_eq!(
             ids(service.notifications(None, 10).await.unwrap()),
-            ["reply", "tweet"]
+            ["self_quote", "quote", "tweet"]
         );
 
-        service.update_settings(update(true, false)).await.unwrap();
-        assert_eq!(
-            ids(service.notifications(None, 10).await.unwrap()),
-            ["quote", "tweet"]
-        );
-
-        service.update_settings(update(false, false)).await.unwrap();
+        service
+            .update_settings(update(false, false, false))
+            .await
+            .unwrap();
         assert_eq!(
             ids(service.notifications(None, 10).await.unwrap()),
             ["tweet"]

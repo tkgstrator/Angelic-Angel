@@ -927,6 +927,7 @@ mod tests {
             tweet,
             retweet: true,
             quote: true,
+            quote_self: true,
             reply: true,
             xchat_message_received: chat,
             other,
@@ -1111,6 +1112,90 @@ mod tests {
             .unwrap();
             assert_eq!(outcome, ForwardOutcome::Forwarded, "{kind:?}");
             assert!(server.await.unwrap().contains("Looked up"));
+            let item = notifications::list(&path, None, 1).unwrap().items.remove(0);
+            assert_eq!((item.id.as_str(), item.kind), (id.as_str(), kind));
+        }
+    }
+
+    /// 引用した側 (`alice`) の引用RT。引用元の投稿者だけを変える。
+    fn quote_by_alice_of(quoted_user_id: &str) -> String {
+        serde_json::json!({
+            "__typename": "Tweet",
+            "user": { "id_str": "100", "screen_name": "alice" },
+            "quoted_tweet": { "id_str": "1", "user": { "id_str": quoted_user_id } },
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn self_quotes_and_other_quotes_are_filtered_separately() {
+        use notifications::NotificationKind::{Quote, SelfQuote};
+        let self_quote = quote_by_alice_of("100");
+        let other_quote = quote_by_alice_of("200");
+        let only_self = NotificationFilter {
+            quote: false,
+            quote_self: true,
+            ..NotificationFilter::default()
+        };
+        let only_other = NotificationFilter {
+            quote: true,
+            quote_self: false,
+            ..NotificationFilter::default()
+        };
+        // (照会の応答, 期待する区分, 転送される設定, 転送されない設定)
+        let cases = [
+            (&self_quote, SelfQuote, only_self, only_other),
+            (&other_quote, Quote, only_other, only_self),
+        ];
+        for (n, (response, kind, forwarded, skipped)) in cases.into_iter().enumerate() {
+            let api = MockApi::start(json_response(response)).await;
+            let lookup = TweetLookup::with_endpoint(&api.url).unwrap();
+            let (data, keys) = encrypted_message(LOOKED_UP_TWEET);
+
+            // 無効にした側は履歴に残るが転送されない。
+            let path = test_temp_dir().join("c.toml");
+            let (url, listener) = silent_webhook().await;
+            write_config_filtered(&path, Some(&url), skipped);
+            let id = format!("chan:12{n}");
+            let outcome = handle_notification_data(
+                &data,
+                &None,
+                &keys,
+                &path,
+                &id,
+                Some(TEST_SECRET),
+                &lookup,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, ForwardOutcome::Skipped, "{kind:?}");
+            assert!(nothing_was_sent(&listener).await, "{kind:?}");
+            let item = notifications::list(&path, None, 1).unwrap().items.remove(0);
+            assert_eq!((item.id.as_str(), item.kind), (id.as_str(), kind));
+
+            // 有効にした側は転送され、同じ区分で記録される。
+            let path = test_temp_dir().join("c.toml");
+            let (url, server) = mock_webhook().await;
+            write_config_filtered(&path, Some(&url), forwarded);
+            let id = format!("chan:13{n}");
+            let outcome = handle_notification_data(
+                &data,
+                &None,
+                &keys,
+                &path,
+                &id,
+                Some(TEST_SECRET),
+                &lookup,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, ForwardOutcome::Forwarded, "{kind:?}");
+            // Webhook 本文は受信した payload のままで、区分は載らない。
+            let body = server.await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+                serde_json::from_str::<serde_json::Value>(LOOKED_UP_TWEET).unwrap()
+            );
             let item = notifications::list(&path, None, 1).unwrap().items.remove(0);
             assert_eq!((item.id.as_str(), item.kind), (id.as_str(), kind));
         }

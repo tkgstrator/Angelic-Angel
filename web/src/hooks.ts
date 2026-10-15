@@ -127,21 +127,3 @@ export function usePoll<T>(fn: () => Promise<T>, intervalMs: number) {
   const refresh = useCallback(() => tickRef.current(), [])
   return { data, error, loaded, setData, refresh }
 }
-
-export type Screen = 'notifications' | 'settings' | 'status'
-export const SCREENS: readonly Screen[] = ['notifications', 'settings', 'status']
-
-function parseHash(): Screen {
-  const name = window.location.hash.replace(/^#\/?/, '')
-  return SCREENS.find((s) => s === name) ?? 'settings'
-}
-
-export function useScreen(): Screen {
-  const [screen, setScreen] = useState<Screen>(parseHash)
-  useEffect(() => {
-    const on = () => setScreen(parseHash())
-    window.addEventListener('hashchange', on)
-    return () => window.removeEventListener('hashchange', on)
-  }, [])
-  return screen
-}

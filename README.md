@@ -14,6 +14,8 @@ Angelic Angel emulates a browser's Web Push client to receive Twitter/X push not
 
 You will receive notifications for tweets from users that you **follow** and have **tweet notifications turned on** for on Twitter/X.
 
+One process can receive for several X accounts at once. Each account has its own cookies, push registration, webhook (endpoint and secret), notification filter and notification history. See [Multiple accounts](#multiple-accounts).
+
 ### How It Works
 
 ```
@@ -34,7 +36,7 @@ Twitter/X  ──push──▶  Mozilla AutoPush Server  ◀──WebSocket─�
 ## Requirements
 
 - Rust (edition 2024)
-- Twitter/X account credentials (`auth_token` and `ct0` cookies)
+- Twitter/X account credentials (`auth_token` and `ct0` cookies), for each account you want to receive for
 
 ### Getting `auth_token` and `ct0`
 
@@ -60,7 +62,7 @@ angelic-angel init
 angelic-angel init --auth-token YOUR_AUTH_TOKEN --ct0 YOUR_CT0
 ```
 
-This creates `angelic-angel.toml` with your Twitter credentials.
+This creates `angelic-angel.toml` with your Twitter credentials, as the account `default`. To set up another account, pass `--account <id>` (see [Multiple accounts](#multiple-accounts)); the other accounts in the file are left untouched. `init` refuses to overwrite a config file that cannot be parsed.
 
 ### 2. Register push subscription
 
@@ -68,7 +70,7 @@ This creates `angelic-angel.toml` with your Twitter credentials.
 angelic-angel register
 ```
 
-This registers a new push subscription with Mozilla AutoPush and then registers the endpoint with Twitter's push notification API.
+This registers a new push subscription with Mozilla AutoPush and then registers the endpoint with Twitter's push notification API. It acts on the `default` account unless you pass `--account <id>`.
 
 ### 3. Start listening
 
@@ -76,36 +78,93 @@ This registers a new push subscription with Mozilla AutoPush and then registers 
 WEBHOOK_ENDPOINT=https://your-webhook.example.com/endpoint angelic-angel listen
 ```
 
-The `WEBHOOK_ENDPOINT` environment variable specifies where decrypted notification payloads are sent via HTTP POST.
+The `WEBHOOK_ENDPOINT` environment variable specifies where decrypted notification payloads are sent via HTTP POST. Like the other environment variables, it applies to the `default` account only; see [Environment variables](#environment-variables).
 
-Alternatively, skip steps 1 and 2: with `TWITTER_AUTH_TOKEN` and `TWITTER_CSRF_TOKEN` (the `auth_token` and `ct0` cookies) set, `listen` registers on its first start when there is no registration yet. The values are read from the environment and never written to the config file. See [Docker](#docker).
+`listen` runs every registered account in one process.
+
+Alternatively, skip steps 1 and 2: with `TWITTER_AUTH_TOKEN` and `TWITTER_CSRF_TOKEN` (the `auth_token` and `ct0` cookies) set, `listen` registers the `default` account on its first start when it has no registration yet. The values are read from the environment and never written to the config file. See [Docker](#docker).
 
 ### Other commands
 
 ```sh
-# Check current configuration and registration status
+# Check current configuration and registration status (every account)
 angelic-angel status
+
+# Check a single account
+angelic-angel status --account shop
 
 # Remove push subscription
 angelic-angel unregister
+
+# ... of a single account
+angelic-angel unregister --account shop
 ```
+
+### Multiple accounts
+
+One config file can hold any number of accounts, and one process (`listen` or `serve`) receives for all of them. The file is a list of `[[accounts]]` entries:
+
+```toml
+[[accounts]]
+id = "default"
+webhook_endpoint = "https://example.com/hook"
+webhook_secret = "..."
+
+[accounts.twitter]
+auth_token = "..."
+ct0 = "..."
+
+# Registering the account makes the tool add an [accounts.registration] table
+# here (endpoint, AutoPush session, keys). Do not write or edit it by hand.
+
+[[accounts]]
+id = "shop"
+webhook_endpoint = "https://example.com/hook-shop"
+webhook_secret = "..."
+
+[accounts.twitter]
+auth_token = "..."
+ct0 = "..."
+
+[accounts.notification_filter]
+quote = false
+quote_self = true
+```
+
+- `id` must match `^[a-z0-9][a-z0-9_-]{0,31}$` and be unique. It is a stable name: it appears in file names (the history database) and in WebUI URLs, so do not rename it afterwards. `default` is special: the CLI uses it when `--account` is omitted, and the [environment variables](#environment-variables) apply to it only.
+- Each account has its own webhook: its own `webhook_endpoint` and `webhook_secret`. The signature scheme and the request body are unchanged. If the same post reaches several of your accounts, every account forwards it to its own webhook; notifications are not de-duplicated across accounts. Give each account its own endpoint if you need to tell them apart.
+- Each account has its own notification history database: `<config>.notifications.sqlite3` for `default` (the same file as before) and `<config>.<id>.notifications.sqlite3` for any other account. Both are created with mode `0600` and never pruned.
+- Subcommands that act on one account take `--account <id>` (default `default`): `init`, `register`, `unregister` and `status`. `status` without the flag lists every account (a config with a single account prints as before).
+- `listen` runs every registered account in one process. An account that fails stops alone and the others keep running; the process exits with a non-zero code only when all accounts have failed. An account other than `default` that has no registration is skipped with a warning: register it with `register --account <id>`, or from the WebUI.
+- While `serve` runs, the config is locked by that process, so CLI commands that change it cannot run. Add and remove accounts from the WebUI instead.
+- All accounts register with the same device identifier. Whether X accepts several registrations that share it has not been verified here; confirm it with your own accounts.
+
+#### Upgrading a single-account config
+
+A config file in the earlier single-account layout (top-level `[twitter]`, `registration`, `webhook_endpoint` and `notification_filter`) is read as the account `default`. Reading never rewrites the file.
+
+- The first time the config is saved, it is converted to the `[[accounts]]` layout. Just before that, the original is copied to `<config>.legacy.bak` (mode `0600`, never overwritten once it exists).
+- The conversion is one-way: **earlier images and versions cannot read the converted file.** To roll back, stop the process, restore `<config>.legacy.bak` over the config file and run the earlier image. Back up the whole config directory before upgrading.
+- A file that mixes `[[accounts]]` with the earlier top-level keys is rejected with an error; it is never merged silently.
 
 ### WebUI operations
 
-The WebUI (`angelic-angel serve`) has three screens: Notifications, Settings and Status. Besides the Cookie and Webhook settings, it offers:
+The WebUI (`angelic-angel serve`) has three screens: Notifications, Settings and Status. Every screen works on one account at a time: Notifications, Settings, Status, the receiver registration and the bulk notification job are all per account. Besides the Cookie and Webhook settings, it offers:
 
+- **Accounts** (header): the switcher in the header chooses the account the screens show. "Add account" asks for an id (same rule as above) and creates an empty account; then enter its cookies and webhook in Settings and register it. Deleting an account asks for confirmation; it unregisters the account (as the `unregister` command does) if it is registered, stops its receiving, removes its entry from the config file and deletes its notification history database. If the unregistration fails, the account is kept and the error is shown. Exceptions: while both cookie [environment variables](#environment-variables) are set, `default` cannot be deleted (409 `account_from_environment`); unset them and restart the process first. If only the deletion of the history database fails after the entry has been removed, the error is a 500 `history_cleanup_failed`: the account is already gone from the config file, and the leftover history database file has to be deleted by hand; until then, creating an account with the same id is refused (409 `history_cleanup_required`) so that it does not inherit that history. The address is `#/<id>/<screen>`; an old address such as `#/settings` opens the `default` account (or the first account when there is none named `default`). Operations of one account never block another account's: a bulk notification job running for one account does not stop you from registering or editing another.
+- **Webhook** (Settings screen): the endpoint and the secret of the selected account. The secret is write-only: the screen never shows the saved value, only whether one is set.
 - **Cookie check** (Settings screen): the "確認" button, and an automatic check after every save, ask X whether the *saved* cookies still work and show the account name. A result of "could not check" (network error, rate limit, X outage) is shown as such and is never reported as an invalid cookie. Unsaved input is not checked; save it first.
-- **Receiver registration** (Settings screen, below the cookies): registers or unregisters the Web Push subscription. Cookies cannot be changed while registered.
-- **Turn on notifications for everyone you follow** (Settings screen, below the registration): after an inline confirmation, it enables post notifications for every account you follow on X. This changes settings on X for all of them, and cancelling midway does not undo the accounts already changed. It runs one job at a time, shows progress (total, succeeded, failed, remaining), reports failures and partial results as they are, and never retries by itself; running it again needs a new confirmation. It needs the saved cookies but not a Web Push registration.
+- **Receiver registration** (Settings screen, below the cookies): registers or unregisters the Web Push subscription. Cookies cannot be changed while registered, nor while they come from environment variables (409 `credentials_from_environment`; see [Environment variables](#environment-variables)).
+- **Turn on notifications for everyone you follow** (Settings screen, below the registration): after an inline confirmation, it enables post notifications for every account you follow on X. This changes settings on X for all of them, and cancelling midway does not undo the accounts already changed. It runs one job at a time per account, shows progress (total, succeeded, failed, remaining), reports failures and partial results as they are, and never retries by itself; running it again needs a new confirmation. It needs the saved cookies but not a Web Push registration.
 - **Notification filter** (Settings screen, below the webhook): turns each kind of notification on or off, for the Notifications list and for Webhook forwarding alike: post (`tweet`), retweet, quote, reply, chat (`xchat_message_received`) and other. Disabled kinds are still recorded in the history. Quotes are split in two, nested under "引用RT": a quote of your own earlier post (`quote_self`) and a quote of another account's post (`quote`). This lets you forward a store account's status updates, which it posts as quotes of its own earlier posts, without forwarding its quotes of other accounts. Ticking or clearing "引用RT" switches both at once, and it shows a mixed state when only one is on. Whether a post is a quote, a self-quote or a reply is looked up on X's public embed API; when that lookup fails the post counts as a plain `tweet`. History entries recorded before `quote_self` existed stay `quote`, since their author can no longer be told. The Webhook body is the received payload as is, so it does not name the kind.
-  The same switches are the keys of the `[notification_filter]` table in the config file, and every kind is on when its key is missing. The one exception is `quote_self`: **when it is missing it follows the `quote` value of the same file**, so a config saved before `quote_self` existed keeps behaving as it did (`quote = false` still skips every quote). Saving writes both keys.
+  The filter belongs to the selected account. The same switches are the keys of that account's `[accounts.notification_filter]` table in the config file (`[notification_filter]` in a config that has not been converted yet), and every kind is on when its key is missing. The one exception is `quote_self`: **when it is missing it follows the `quote` value of the same file**, so a config saved before `quote_self` existed keeps behaving as it did (`quote = false` still skips every quote). Saving writes both keys.
 
   ```toml
-  [notification_filter]
+  [accounts.notification_filter]
   quote = false       # quotes of other accounts' posts
   quote_self = true   # quotes of the account's own posts; when omitted, same as `quote`
   ```
-- **Notifications** (Notifications screen): lists received notifications newest first, with the icon, text, a link to the post and the original payload. Every received notification is kept: they are stored in a local SQLite database, `<config>.notifications.sqlite3` (for example `angelic-angel.toml.notifications.sqlite3`), created with mode `0600` and never pruned. It contains the received payloads, so treat it like the config. Older entries are loaded on demand with the "もっと見る" (show more) button.
+- **Notifications** (Notifications screen): lists received notifications newest first, with the icon, text, a link to the post and the original payload. Every received notification is kept: they are stored in a local SQLite database per account, `<config>.notifications.sqlite3` for `default` (for example `angelic-angel.toml.notifications.sqlite3`) and `<config>.<id>.notifications.sqlite3` for any other account, created with mode `0600` and never pruned. It contains the received payloads, so treat it like the config. Older entries are loaded on demand with the "もっと見る" (show more) button.
 
 ### Options
 
@@ -113,10 +172,11 @@ The WebUI (`angelic-angel serve`) has three screens: Notifications, Settings and
 |------|-------------|
 | `-c, --config <PATH>` | Configuration file path (env: `ANGELIC_ANGEL_CONFIG`, default: `angelic-angel.toml`) |
 | `-v, --verbose` | Enable debug logging |
+| `--account <ID>` | `init`, `register`, `unregister` and `status` only: the account to act on (default: `default`; `status` lists every account when it is omitted) |
 
 ## Docker
 
-Requires Docker Compose 2.24+. The container only needs your X credentials and a webhook in environment variables: on the first start it registers itself and stores the registration in a mounted directory.
+Requires Docker Compose 2.24+. The container only needs your X credentials and a webhook in environment variables: on the first start it registers itself and stores the registration in a mounted directory. With environment variables alone you get a single account, `default`; to receive for more accounts, see [Adding accounts in Docker](#adding-accounts-in-docker).
 
 ```sh
 cp .env.example .env   # then edit .env: TWITTER_AUTH_TOKEN, TWITTER_CSRF_TOKEN and your webhook
@@ -132,7 +192,7 @@ docker compose stop
 - Mount the directory, not the file: the config is saved through a temporary file and a rename, and the lock and the history database live next to it.
 - Inside a container, `localhost` is the container itself. For a webhook on the host, use a URL such as `http://host.docker.internal:8080/endpoint`. On Linux, the host service must listen on an address reachable from Docker, such as the bridge IP or `0.0.0.0`.
 - After editing `.env`, run `docker compose up -d` to recreate the container with the new values; `restart` alone does not reload them.
-- The default command is `listen`; other commands replace it, e.g. `docker compose run --rm angelic-angel status`. Stop the running container first (`docker compose stop`): a config is locked by one process at a time.
+- The default command is `listen`; other commands replace it, e.g. `docker compose run --rm angelic-angel status`. Stop the running container first (`docker compose stop`): a config is locked by one process at a time, and that one process covers all accounts in it.
 
 ### Using the published image
 
@@ -170,21 +230,24 @@ WEBHOOK_SECRET_KEY=your-shared-secret
 
 | Variable | Description |
 |----------|-------------|
-| `TWITTER_AUTH_TOKEN` | The `auth_token` cookie. Set it together with `TWITTER_CSRF_TOKEN` |
-| `TWITTER_CSRF_TOKEN` | The `ct0` cookie. Set it together with `TWITTER_AUTH_TOKEN` |
-| `WEBHOOK_ENDPOINT` | Webhook URL. A non-blank value takes precedence over the config file |
-| `WEBHOOK_SECRET_KEY` | Shared secret used to sign webhook requests. Required when a webhook URL is set |
+| `TWITTER_AUTH_TOKEN` | The `auth_token` cookie of the `default` account. Set it together with `TWITTER_CSRF_TOKEN` |
+| `TWITTER_CSRF_TOKEN` | The `ct0` cookie of the `default` account. Set it together with `TWITTER_AUTH_TOKEN` |
+| `WEBHOOK_ENDPOINT` | Webhook URL of the `default` account. A non-blank value takes precedence over the config file |
+| `WEBHOOK_SECRET_KEY` | Shared secret used to sign the `default` account's webhook requests. Required when a webhook URL is set |
 | `ANGELIC_ANGEL_CONFIG` | Config file path. The image sets `/config/angelic-angel.toml`; `--config` takes precedence |
 
-- The two credentials are a pair. When both are set (non-blank) they are used instead of `[twitter]` in the config file; when neither is, the config file is used; **when only one is set, the command fails with an error** (it never falls back to the file).
+- **`TWITTER_AUTH_TOKEN`, `TWITTER_CSRF_TOKEN`, `WEBHOOK_ENDPOINT` and `WEBHOOK_SECRET_KEY` apply to the `default` account only.** Any other account takes its cookies, endpoint and secret from the config file (or the WebUI), so an account is never registered by mistake with cookies meant for another one. `ANGELIC_ANGEL_CONFIG` is about the file and is not tied to an account.
+- The two credentials are a pair. When both are set (non-blank) they are used instead of `[accounts.twitter]` of `default` in the config file; when neither is, the config file is used; **when only one is set, the command fails with an error** (it never falls back to the file).
+- `serve` applies the same rule at startup: with only one of the two set, it fails to start. The variables are read once, when the process starts. While both are set, the `default` account's cookies cannot be changed in the WebUI and the account cannot be deleted from it (409 `credentials_from_environment` and `account_from_environment`); to change or remove them, change the variables and restart the process.
 - The credential values are never written to the config file. They are also used when a registration is renewed after AutoPush invalidates it (this can happen days later), so keep them set for as long as the container runs. `status` shows that they come from the environment without printing the values.
 
 ### First start and stored state
 
-- If there is no registration and both credentials are set, `listen` registers with AutoPush and X, saves the registration, and starts receiving. An existing config file keeps its other settings (webhook, notification filter, `[twitter]`); a missing one is created with mode `0600`. Before contacting X it checks that the config can be saved, so a read-only mount fails without leaving registrations behind on X's side.
-- The registration (UAID and keys) is stored in `./config/angelic-angel.toml`, and the notification history in `./config/angelic-angel.toml.notifications.sqlite3`. Keep `./config` across restarts; treat it like a credential.
+- If the `default` account has no registration and both credentials are set, `listen` registers it with AutoPush and X, saves the registration, and starts receiving. When the config has no `default` account yet, it is created implicitly, so the environment-only setup needs no config file. An existing config file keeps its other settings (webhook, notification filter, `[accounts.twitter]`, and any other accounts); a missing one is created with mode `0600`. Before contacting X it checks that the config can be saved, so a read-only mount fails without leaving registrations behind on X's side.
+- The registration (UAID and keys) of each account is stored in `./config/angelic-angel.toml`, and the notification history of `default` in `./config/angelic-angel.toml.notifications.sqlite3` (other accounts: `./config/angelic-angel.toml.<id>.notifications.sqlite3`). Keep `./config` across restarts; treat it like a credential.
 - If the automatic registration fails (for example because the cookies are no longer valid), the error is logged and the process waits 30 seconds before exiting with a non-zero code, so that `restart: unless-stopped` does not hit X's login endpoints in a tight loop. `docker stop` (SIGINT) ends the wait immediately. Errors found before contacting X (half-set credentials, an unwritable `./config`) exit at once.
 - Without credentials and without a registration, `listen` exits with "No registration found" and the restart policy keeps retrying. Set the credentials, or place a registered config file in `./config`.
+- With several accounts, an account that fails stops alone and the others keep receiving; the process exits non-zero (and the restart policy applies) only when every account has failed. A non-`default` account without a registration is skipped with a warning.
 
 ### Changing the credentials
 
@@ -195,11 +258,25 @@ sudo rm config/angelic-angel.toml     # then edit .env with the new values
 docker compose up -d
 ```
 
-`unregister` removes the AutoPush subscription; deleting the config file makes the next start register again with the new credentials. This also drops the webhook and filter stored in that file. The history database is kept.
+`unregister` removes the AutoPush subscription of the `default` account (pass `--account <id>` for another one); deleting the config file makes the next start register again with the new credentials. This also drops the webhook and filter stored in that file, **and every other account in it**, along with their registrations. The history databases are kept.
+
+To change the cookies of only one account, use the WebUI: unregister that account, edit its cookies in the Settings screen (cookies cannot be changed while registered) and register it again. The other accounts are not affected. This does not apply to `default` while the cookie environment variables are set: it takes its cookies from them, so change `.env` and restart instead.
+
+### Adding accounts in Docker
+
+The environment variables describe the `default` account only; the Docker setup with environment variables alone is unchanged and keeps working as a single `default` account. To receive for another account, either:
+
+- put it in the mounted config file as an `[[accounts]]` entry with its own `[accounts.twitter]`, `webhook_endpoint` and `webhook_secret`, as in [Multiple accounts](#multiple-accounts), or
+- add it from the WebUI (`angelic-angel serve`) against the same config directory. The config is locked by one process at a time, so the container must be stopped first.
+
+An account other than `default` that has no registration is skipped with a warning at `listen`; register it with `docker compose run --rm angelic-angel register --account <id>` (with the container stopped) or from the WebUI. One container then receives for all of them.
 
 ### Running more than one instance
 
-Do not run the same registration (config file) in two places at once. If two containers each register automatically from the environment, they get different UAIDs, so the same account's notifications arrive twice and your webhook receives every one of them twice. Run a single container per config directory.
+Two different things are easy to confuse:
+
+- **Several accounts in one process: supported.** One `listen` (or `serve`) process receives for every account in the config. The lock on the config covers all accounts, so this is the way to receive for more than one account.
+- **The same registration (config file) in two processes: do not.** If two containers each register automatically from the environment, they get different UAIDs, so the same account's notifications arrive twice and your webhook receives every one of them twice. Run a single container per config directory.
 
 ### Without environment credentials
 
@@ -242,7 +319,7 @@ docker build -t angelic-angel:local .
 scripts/docker-smoke.sh angelic-angel:local        # offline, dummy credentials only
 ```
 
-The runtime uses Distroless with a stripped binary, without a shell, sources or build caches. `scripts/docker-smoke.sh` verifies configuration persistence, `ANGELIC_ANGEL_CONFIG`, permissions, switching to the owner of bind-mounted directories (root-owned and owned by another UID) and an explicit `--user`, expected errors (including a failed automatic registration, which waits 30 seconds) and SIGINT shutdown with dummy credentials and networking disabled. It pulls a separate BusyBox helper if needed and removes its own test resources.
+The runtime uses Distroless with a stripped binary, without a shell, sources or build caches. `scripts/docker-smoke.sh` verifies configuration persistence, `ANGELIC_ANGEL_CONFIG`, the multi-account layout (`status` of an `[[accounts]]` config, the `.legacy.bak` copy made when a single-account file is converted, environment variables together with `[[accounts]]`, and no secret values in the output), permissions, switching to the owner of bind-mounted directories (root-owned and owned by another UID) and an explicit `--user`, expected errors (including a failed automatic registration, which waits 30 seconds) and SIGINT shutdown with dummy credentials and networking disabled. It pulls a separate BusyBox helper if needed and removes its own test resources.
 
 To debug the image, use `docker logs` and run CLI subcommands (e.g. `docker run --rm IMAGE status`) rather than `exec`ing a shell. Published images can be pulled from GHCR: `docker pull ghcr.io/<owner>/<repo>:latest`.
 
@@ -251,7 +328,7 @@ To debug the image, use `docker logs` and run CLI subcommands (e.g. `docker run 
 `bun dev` from the repository root builds the receiver (`cargo build --locked`), then runs two child processes: `angelic-angel serve` (the API on `127.0.0.1:8080`) and the Vite dev server for `web/` (`http://localhost:11475/`, which proxies `/api` and `/health` to the API). Install the frontend dependencies once with `bun install --cwd web --frozen-lockfile`.
 
 - It uses `angelic-angel.toml` in the repository root. `serve` starts the real receiver when that config already holds a registration, so point `DEV_CONFIG` at a scratch file (for example `DEV_CONFIG=.cache/dev/angelic-angel.toml bun dev`) when you only want to try the UI. The launcher prints the config in use.
-- The WebUI is local-only and needs no authentication or login: it opens straight onto the three screens. The `.lock` file is stored next to the config and is git-ignored.
+- The WebUI is local-only and needs no authentication or login: it opens straight onto the three screens (a config without accounts shows an empty state; add an account from the header). The `.lock` file is stored next to the config and is git-ignored.
 - Nothing is watched or restarted: frontend edits hot-reload, but Rust changes need a restart of `bun dev`. If either child exits, the other is stopped too. `Ctrl+C` (SIGINT/SIGTERM) stops only the processes it started and waits for them; a second `Ctrl+C` forces it.
 - Vite and the API both listen on `127.0.0.1` only. The WebUI has no authentication, so do not expose these ports to other hosts or networks.
 - The proxy keeps the browser's `Host` and `Origin` headers (`changeOrigin: false`), so the API's same-origin check for `PUT`/`POST`/`DELETE` passes only for the page served by Vite itself. Open the UI at the printed URL, not through another origin.

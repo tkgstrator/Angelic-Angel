@@ -25,15 +25,17 @@ const DESCRIPTION = 'X の通知を受け取るための Web Push 登録を管�
 
 /** `onChanged` runs after a successful change so the parent can refresh what depends on it. */
 export function Registration({
+  accountId,
   configured,
   lock,
   onChanged,
 }: {
+  accountId: string
   configured: boolean
   lock: Exclusive
   onChanged: () => Promise<void>
 }) {
-  const reg = useLoad(api.getRegistration)
+  const reg = useLoad(() => api.getRegistration(accountId))
   const [confirming, setConfirming] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
   const [lastAction, setLastAction] = useState<Kind | null>(null)
@@ -62,7 +64,9 @@ export function Registration({
     setConfirming(false)
     return lock.run(kind, async () => {
       try {
-        reg.setData(await (kind === 'register' ? api.register() : api.unregister()))
+        reg.setData(
+          await (kind === 'register' ? api.register(accountId) : api.unregister(accountId)),
+        )
         await onChanged()
       } catch (e) {
         setActionError(errorText(e))

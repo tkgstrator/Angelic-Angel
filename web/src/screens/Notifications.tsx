@@ -106,12 +106,12 @@ function useMounted() {
   return mounted
 }
 
-export function Notifications() {
+export function Notifications({ accountId }: { accountId: string }) {
   const [feed, dispatch] = useReducer(feedReducer, emptyFeed)
   const [moreState, setMore] = useState<More>({ generation: 0, pending: false, error: null })
   const mounted = useMounted()
   const poll = usePoll(async () => {
-    const page = await api.getNotifications()
+    const page = await api.getNotifications(accountId)
     if (mounted.current) dispatch({ type: 'latest', page })
   }, POLL_MS)
 
@@ -132,7 +132,7 @@ export function Notifications() {
       )
     }
     try {
-      const page = await api.getNotifications(from)
+      const page = await api.getNotifications(accountId, from)
       if (!mounted.current) return
       if (sameFilter(page.notification_filter, filter)) {
         dispatch({ type: 'older', from, generation, page })

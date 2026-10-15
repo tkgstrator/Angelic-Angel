@@ -1,10 +1,11 @@
 //! Local history of received notifications, persisted in SQLite next to the config file.
 //!
-//! The history lives in `<config>.notifications.sqlite3` (mode 0600) and is never pruned.
+//! The history lives in `<config>.notifications.sqlite3` (`<config>.<id>.notifications.sqlite3` for
+//! accounts other than `default`; mode 0600) and is never pruned.
 //! Rows are ordered by a monotonically increasing sequence number, so listing is a keyset
 //! scan over that number and never loads the whole history into memory.
 
-use crate::config::NotificationFilter;
+use crate::config::{self, NotificationFilter};
 use crate::error::{AngelicAngelError, Result};
 use crate::tweet_lookup::{TweetLookup, TweetShape};
 use regex::Regex;
@@ -192,14 +193,28 @@ pub struct NotificationPage {
     pub notification_filter: NotificationFilter,
 }
 
-/// Records a received notification as `kind`. A repeated `id` is ignored.
+/// Records a received notification as `kind` in the history of `account_id`. A repeated `id` is
+/// ignored.
+pub fn append_as_for(
+    config_path: &Path,
+    account_id: &str,
+    id: &str,
+    payload: &Value,
+    kind: NotificationKind,
+) -> Result<()> {
+    let db = history_path_for(config_path, account_id);
+    append_to(&db, id, payload, kind, now_secs(), BUSY_TIMEOUT)
+}
+
+/// Records a received notification as `kind` in the `default` account's history.
+#[cfg(test)]
 pub fn append_as(
     config_path: &Path,
     id: &str,
     payload: &Value,
     kind: NotificationKind,
 ) -> Result<()> {
-    append_with_timeout(config_path, id, payload, kind, now_secs(), BUSY_TIMEOUT)
+    append_as_for(config_path, config::DEFAULT_ACCOUNT_ID, id, payload, kind)
 }
 
 /// payload から `classify` した区分で記録する。
@@ -214,9 +229,28 @@ pub fn list(config_path: &Path, before: Option<&str>, limit: usize) -> Result<No
     list_filtered(config_path, before, limit, &NotificationFilter::default())
 }
 
-/// Returns up to `limit` (clamped to 1..=100) entries older than the `before` cursor
-/// (an entry id returned as `next_cursor`), newest first. Entries whose kind is disabled in
-/// `filter` are skipped in SQL before the limit applies; the cursor may be any stored entry.
+/// Returns up to `limit` (clamped to 1..=100) entries of `account_id`'s history older than the
+/// `before` cursor (an entry id returned as `next_cursor`), newest first. Entries whose kind is
+/// disabled in `filter` are skipped in SQL before the limit applies; the cursor may be any entry
+/// stored for that account, and an id from another account's history is unknown.
+pub fn list_filtered_for(
+    config_path: &Path,
+    account_id: &str,
+    before: Option<&str>,
+    limit: usize,
+    filter: &NotificationFilter,
+) -> Result<NotificationPage> {
+    list_in(
+        &history_path_for(config_path, account_id),
+        before,
+        limit,
+        filter,
+        BUSY_TIMEOUT,
+    )
+}
+
+/// [`list_filtered_for`] for the `default` account.
+#[cfg(test)]
 pub fn list_filtered(
     config_path: &Path,
     before: Option<&str>,
@@ -226,6 +260,7 @@ pub fn list_filtered(
     list_with_timeout(config_path, before, limit, filter, BUSY_TIMEOUT)
 }
 
+#[cfg(test)]
 fn list_with_timeout(
     config_path: &Path,
     before: Option<&str>,
@@ -233,8 +268,23 @@ fn list_with_timeout(
     filter: &NotificationFilter,
     busy_timeout: Duration,
 ) -> Result<NotificationPage> {
+    list_in(
+        &history_path(config_path),
+        before,
+        limit,
+        filter,
+        busy_timeout,
+    )
+}
+
+fn list_in(
+    path: &Path,
+    before: Option<&str>,
+    limit: usize,
+    filter: &NotificationFilter,
+    busy_timeout: Duration,
+) -> Result<NotificationPage> {
     let limit = limit.clamp(1, MAX_PAGE_LIMIT);
-    let path = history_path(config_path);
     if !path.try_exists().map_err(io_error)? {
         return match before {
             None => Ok(NotificationPage {
@@ -246,7 +296,7 @@ fn list_with_timeout(
         };
     }
 
-    let mut conn = open(&path, busy_timeout)?;
+    let mut conn = open(path, busy_timeout)?;
     let tx = conn.transaction().map_err(db_error)?;
     let before_seq = match before {
         None => i64::MAX,
@@ -333,10 +383,30 @@ fn append_at(config_path: &Path, id: &str, payload: &Value, received_at: u64) ->
     append_with_timeout(config_path, id, payload, kind, received_at, BUSY_TIMEOUT)
 }
 
-/// Stores the entry and returns `Ok` only once the transaction has committed (or the id was
-/// already stored). Locked, full, corrupt and unwritable databases are errors, never a no-op.
+#[cfg(test)]
 fn append_with_timeout(
     config_path: &Path,
+    id: &str,
+    payload: &Value,
+    kind: NotificationKind,
+    received_at: u64,
+    busy_timeout: Duration,
+) -> Result<()> {
+    append_to(
+        &history_path(config_path),
+        id,
+        payload,
+        kind,
+        received_at,
+        busy_timeout,
+    )
+}
+
+/// Stores the entry in the history database `db` and returns `Ok` only once the transaction has
+/// committed (or the id was already stored). Locked, full, corrupt and unwritable databases are
+/// errors, never a no-op.
+fn append_to(
+    db: &Path,
     id: &str,
     payload: &Value,
     kind: NotificationKind,
@@ -349,7 +419,7 @@ fn append_with_timeout(
         ));
     }
     let item = build_item(id, payload, kind, received_at);
-    let mut conn = open(&history_path(config_path), busy_timeout)?;
+    let mut conn = open(db, busy_timeout)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error)?;
@@ -544,11 +614,21 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 fn history_path(config_path: &Path) -> PathBuf {
+    history_path_for(config_path, config::DEFAULT_ACCOUNT_ID)
+}
+
+/// `default` keeps the single-account file name so an existing history is picked up as is.
+pub fn history_path_for(config_path: &Path, account_id: &str) -> PathBuf {
     let mut name = config_path
         .file_name()
         .map(|n| n.to_os_string())
         .unwrap_or_else(|| "angelic-angel.toml".into());
+    if account_id != config::DEFAULT_ACCOUNT_ID {
+        name.push(".");
+        name.push(account_id);
+    }
     name.push(".notifications.sqlite3");
     config_path.with_file_name(name)
 }
@@ -712,6 +792,141 @@ mod tests {
 
     fn db_file(config: &Path) -> PathBuf {
         config.with_file_name("c.toml.notifications.sqlite3")
+    }
+
+    #[test]
+    fn history_path_for_keeps_the_default_name_and_adds_the_id_for_others() {
+        let config = Path::new("/data/angelic-angel.toml");
+        assert_eq!(
+            history_path_for(config, config::DEFAULT_ACCOUNT_ID),
+            Path::new("/data/angelic-angel.toml.notifications.sqlite3")
+        );
+        assert_eq!(history_path(config), history_path_for(config, "default"));
+        assert_eq!(
+            history_path_for(config, "work"),
+            Path::new("/data/angelic-angel.toml.work.notifications.sqlite3")
+        );
+        assert_eq!(
+            history_path_for(Path::new("c.toml"), "a-1_b"),
+            Path::new("c.toml.a-1_b.notifications.sqlite3")
+        );
+        assert_ne!(history_path_for(config, "a"), history_path_for(config, "b"));
+    }
+
+    fn list_for(
+        path: &Path,
+        account_id: &str,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<NotificationPage> {
+        list_filtered_for(
+            path,
+            account_id,
+            before,
+            limit,
+            &NotificationFilter::default(),
+        )
+    }
+
+    #[test]
+    fn listing_reads_only_the_history_file_of_the_requested_account() {
+        let path = config_path();
+        let tweet = json!({"title": "t", "data": {"type": "tweet"}});
+        for (account, entries) in [
+            (config::DEFAULT_ACCOUNT_ID, ["d-1", "d-2"].as_slice()),
+            ("work", ["w-1", "w-2", "w-3"].as_slice()),
+            ("shop", ["s-1"].as_slice()),
+        ] {
+            for id in entries {
+                append_as_for(&path, account, id, &tweet, NotificationKind::Tweet).unwrap();
+            }
+        }
+        for account in ["work", "shop"] {
+            assert!(history_path_for(&path, account).is_file(), "{account}");
+        }
+
+        let names = |account: &str| -> Vec<String> {
+            list_for(&path, account, None, 10)
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|i| i.id)
+                .collect()
+        };
+        assert_eq!(names(config::DEFAULT_ACCOUNT_ID), ["d-2", "d-1"]);
+        assert_eq!(names("work"), ["w-3", "w-2", "w-1"]);
+        assert_eq!(names("shop"), ["s-1"]);
+        // The default account's listing is the file the old single-account code read.
+        assert_eq!(
+            ids(&list(&path, None, 10).unwrap()),
+            ["d-2", "d-1"],
+            "default keeps the legacy file"
+        );
+
+        // An account with no history yet is empty, and does not create a file by being read.
+        let empty = list_for(&path, "idle", None, 10).unwrap();
+        assert!(empty.items.is_empty() && empty.next_cursor.is_none());
+        assert!(!history_path_for(&path, "idle").exists());
+    }
+
+    #[test]
+    fn a_cursor_from_one_account_is_unknown_to_every_other_account() {
+        let path = config_path();
+        let tweet = json!({"title": "t", "data": {"type": "tweet"}});
+        for id in ["a-1", "a-2", "a-3"] {
+            append_as_for(&path, "one", id, &tweet, NotificationKind::Tweet).unwrap();
+        }
+        // The same entry id can exist in both histories without the two ever mixing.
+        append_as_for(&path, "two", "a-1", &tweet, NotificationKind::Tweet).unwrap();
+        append_as_for(&path, "two", "b-1", &tweet, NotificationKind::Tweet).unwrap();
+
+        let page = list_for(&path, "one", None, 2).unwrap();
+        assert_eq!(ids(&page), ["a-3", "a-2"]);
+        let cursor = page.next_cursor.unwrap();
+        assert_eq!(cursor, "a-2");
+
+        // Paging continues inside the same account ...
+        let rest = list_for(&path, "one", Some(&cursor), 2).unwrap();
+        assert_eq!(ids(&rest), ["a-1"]);
+        // ... a cursor that only exists in another account's history is rejected ...
+        for other in ["two", config::DEFAULT_ACCOUNT_ID, "idle"] {
+            let err = list_for(&path, other, Some("a-2"), 2).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown notification cursor"),
+                "{other}: {err}"
+            );
+        }
+        // ... and an id stored in both histories pages by each account's own order.
+        let two = list_for(&path, "two", Some("b-1"), 5).unwrap();
+        assert_eq!(ids(&two), ["a-1"]);
+        let two = list_for(&path, "two", Some("a-1"), 5).unwrap();
+        assert!(two.items.is_empty() && two.next_cursor.is_none());
+    }
+
+    #[test]
+    fn the_filter_applies_to_each_accounts_listing_separately() {
+        let path = config_path();
+        let tweet = json!({"data": {"type": "tweet"}});
+        let chat = json!({"data": {"type": "xchat_message_received"}});
+        for account in ["one", "two"] {
+            append_as_for(&path, account, "t", &tweet, NotificationKind::Tweet).unwrap();
+            append_as_for(
+                &path,
+                account,
+                "c",
+                &chat,
+                NotificationKind::XchatMessageReceived,
+            )
+            .unwrap();
+        }
+        let chat_only = NotificationFilter {
+            tweet: false,
+            ..NotificationFilter::default()
+        };
+        let hidden = list_filtered_for(&path, "one", None, 10, &chat_only).unwrap();
+        assert_eq!(ids(&hidden), ["c"]);
+        let all = list_for(&path, "two", None, 10).unwrap();
+        assert_eq!(ids(&all), ["c", "t"]);
     }
 
     fn sample(n: usize) -> Value {

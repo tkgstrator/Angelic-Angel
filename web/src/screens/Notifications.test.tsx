@@ -13,9 +13,9 @@ import {
 } from '../test/helpers'
 import { Notifications } from './Notifications'
 
-const FIRST = 'GET /api/notifications?limit=50'
+const FIRST = 'GET /api/accounts/default/notifications?limit=50'
 const before = (cursor: string) =>
-  `GET /api/notifications?before=${encodeURIComponent(cursor)}&limit=50`
+  `GET /api/accounts/default/notifications?before=${encodeURIComponent(cursor)}&limit=50`
 
 async function tick(ms: number) {
   await act(async () => {
@@ -28,14 +28,14 @@ const rows = () => within(screen.getByRole('list', { name: '通知の一覧' }))
 describe('Notifications', () => {
   it('explains an empty history', async () => {
     mockApi({ [FIRST]: () => json(page([])) })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     expect(await screen.findByText('表示対象の通知はありません。')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'もっと見る' })).not.toBeInTheDocument()
   })
 
   it('keeps the server order (newest first) and formats the time', async () => {
     mockApi({ [FIRST]: () => json(page(['c', 'b', 'a'])) })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await screen.findByText('title c')
     expect(rows().map((r) => r.querySelector('p')?.textContent)).toEqual([
       'title c',
@@ -58,7 +58,7 @@ describe('Notifications', () => {
           ]),
         ),
     })
-    const { container } = render(<Notifications />)
+    const { container } = render(<Notifications accountId="default" />)
     expect(await screen.findByText('<img src=x onerror=alert(1)>')).toBeInTheDocument()
     expect(screen.getByText(/1行目/).textContent).toBe('1行目\n<b>2行目</b>')
     expect(container.querySelector('b, script')).toBeNull()
@@ -74,7 +74,7 @@ describe('Notifications', () => {
           ]),
         ),
     })
-    const { container } = render(<Notifications />)
+    const { container } = render(<Notifications accountId="default" />)
     await screen.findByText('title a')
     const details = container.querySelector('details')
     if (!details) throw new Error('details missing')
@@ -94,7 +94,7 @@ describe('Notifications', () => {
           pageOf([notification('a', { payload: null }), notification('b', { payload: 'plain' })]),
         ),
     })
-    const { container } = render(<Notifications />)
+    const { container } = render(<Notifications accountId="default" />)
     await screen.findByText('title a')
     expect([...container.querySelectorAll('pre')].map((p) => p.textContent)).toEqual([
       'null',
@@ -120,7 +120,7 @@ describe('Notifications', () => {
     [null, false],
   ])('post link %s -> link=%s', async (url, linked) => {
     mockApi({ [FIRST]: () => json(pageOf([notification('a', { url })])) })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await screen.findByText('title a')
     const link = screen.queryByRole('link', { name: /投稿を開く/ })
     if (!linked) return expect(link).toBeNull()
@@ -141,7 +141,7 @@ describe('Notifications', () => {
     [null, false],
   ])('icon %s -> image=%s', async (icon, shown) => {
     mockApi({ [FIRST]: () => json(pageOf([notification('a', { icon })])) })
-    const { container } = render(<Notifications />)
+    const { container } = render(<Notifications accountId="default" />)
     await screen.findByText('title a')
     const img = container.querySelector('img')
     if (!shown) return expect(img).toBeNull()
@@ -154,7 +154,7 @@ describe('Notifications', () => {
     mockApi({
       [FIRST]: () => json(pageOf([notification('a', { icon: 'https://pbs.twimg.com/a.jpg' })])),
     })
-    const { container } = render(<Notifications />)
+    const { container } = render(<Notifications accountId="default" />)
     await screen.findByText('title a')
     act(() => container.querySelector('img')?.dispatchEvent(new Event('error')))
     expect(container.querySelector('img')).toBeNull()
@@ -163,7 +163,7 @@ describe('Notifications', () => {
   it('loads older pages on demand, appends them and hides the button at the end', async () => {
     const older = vi.fn(() => json(page(['b2', 'b1'])))
     mockApi({ [FIRST]: () => json(page(['a2', 'a1'], 'a1')), [before('a1')]: older })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await screen.findByText('title a2')
     expect(older).not.toHaveBeenCalled()
     await userEvent.click(screen.getByRole('button', { name: 'もっと見る' }))
@@ -184,7 +184,7 @@ describe('Notifications', () => {
       [FIRST]: () => json(page(['a'], 'a')),
       [before('a')]: () => (++calls === 1 ? apiError(500, 'x', '続き失敗') : json(page(['z']))),
     })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await userEvent.click(await screen.findByRole('button', { name: 'もっと見る' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('続き失敗')
     expect(screen.getByText('title a')).toBeInTheDocument()
@@ -197,7 +197,7 @@ describe('Notifications', () => {
     let release: (r: Response) => void = () => {}
     const older = vi.fn(() => new Promise<Response>((r) => (release = r)))
     mockApi({ [FIRST]: () => json(page(['a'], 'a')), [before('a')]: older })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await userEvent.click(await screen.findByRole('button', { name: 'もっと見る' }))
     expect(await screen.findByRole('button', { name: '読み込み中…' })).toBeDisabled()
     expect(older).toHaveBeenCalledTimes(1)
@@ -208,7 +208,7 @@ describe('Notifications', () => {
   it('shows an error with retry when the first load fails', async () => {
     let calls = 0
     mockApi({ [FIRST]: () => (++calls === 1 ? apiError(500, 'x', '取得失敗') : json(page(['a']))) })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     expect(await screen.findByRole('alert')).toHaveTextContent('取得失敗')
     expect(screen.queryByText('表示対象の通知はありません。')).not.toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: '再試行' }))
@@ -235,7 +235,7 @@ describe('Notifications polling', () => {
         })
       },
     })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await tick(0)
     expect(fetchMock).toHaveBeenCalledTimes(1)
     await tick(10_000)
@@ -254,7 +254,7 @@ describe('Notifications polling', () => {
     vi.useFakeTimers()
     let latest = page(['a2', 'a1'], 'a1')
     mockApi({ [FIRST]: () => json(latest), [before('a1')]: () => json(page(['b1'])) })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await tick(0)
     await act(async () => screen.getByRole('button', { name: 'もっと見る' }).click())
     await tick(0)
@@ -275,7 +275,7 @@ describe('Notifications polling', () => {
     vi.useFakeTimers()
     let latest = page(['a2', 'a1'], 'a1')
     mockApi({ [FIRST]: () => json(latest) })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await tick(0)
     latest = page(['z2', 'z1'], 'z1')
     await tick(2000)
@@ -292,7 +292,7 @@ describe('Notifications polling', () => {
         return calls === 2 ? apiError(502, 'x', '一時的な障害') : json(page(['a']))
       },
     })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await tick(0)
     await tick(2000)
     expect(screen.getByRole('alert')).toHaveTextContent('一時的な障害')
@@ -305,7 +305,7 @@ describe('Notifications polling', () => {
   it('pauses while hidden and refreshes when visible again', async () => {
     vi.useFakeTimers()
     const fetchMock = mockApi({ [FIRST]: () => json(page(['a'])) })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await tick(0)
     const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true)
     document.dispatchEvent(new Event('visibilitychange'))
@@ -335,7 +335,7 @@ describe('Notifications filter', () => {
     vi.useFakeTimers()
     let latest = page(['c', 'b', 'a'])
     mockApi({ [FIRST]: () => json(latest) })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await tick(0)
     expect(rowTitles()).toEqual(['title c', 'title b', 'title a'])
 
@@ -358,7 +358,7 @@ describe('Notifications filter', () => {
     vi.useFakeTimers()
     let latest = page(['a3', 'a2', 'a1'], 'a1')
     mockApi({ [FIRST]: () => json(latest), [before('a1')]: () => json(page(['b1'])) })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await tick(0)
     await act(async () => screen.getByRole('button', { name: 'もっと見る' }).click())
     await tick(0)
@@ -374,7 +374,7 @@ describe('Notifications filter', () => {
     vi.useFakeTimers()
     let latest = page(['a3', 'a2', 'a1'], 'a1')
     mockApi({ [FIRST]: () => json(latest), [before('a1')]: () => json(page(['b1'])) })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await tick(0)
     await act(async () => screen.getByRole('button', { name: 'もっと見る' }).click())
     await tick(0)
@@ -394,7 +394,7 @@ describe('Notifications filter', () => {
     vi.useFakeTimers()
     const server = { latest: page(['a3', 'a2', 'a1'], 'a1') }
     mockApi({ [FIRST]: () => json(server.latest), [before('a1')]: () => json(page(['b1'])) })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await tick(0)
     await act(async () => screen.getByRole('button', { name: 'もっと見る' }).click())
     await tick(0)
@@ -411,7 +411,7 @@ describe('Notifications filter', () => {
     const same = filterOf({ other: false })
     let latest = page(['a2', 'a1'], 'a1', same)
     mockApi({ [FIRST]: () => json(latest), [before('a1')]: () => json(page(['b1'], null, same)) })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await tick(0)
     await act(async () => screen.getByRole('button', { name: 'もっと見る' }).click())
     await tick(0)
@@ -428,7 +428,7 @@ describe('Notifications filter', () => {
       [FIRST]: () => json(latest),
       [before('a1')]: () => new Promise<Response>((r) => (release = r)),
     })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await tick(0)
     await act(async () => screen.getByRole('button', { name: 'もっと見る' }).click())
     await tick(0)
@@ -453,7 +453,7 @@ describe('Notifications filter', () => {
       [FIRST]: () => json(latest),
       [before('a1')]: () => new Promise<Response>((r) => (release = r)),
     })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await tick(0)
     await act(async () => screen.getByRole('button', { name: 'もっと見る' }).click())
     await tick(0)
@@ -474,7 +474,7 @@ describe('Notifications filter', () => {
       [FIRST]: () => json(latest),
       [before('a')]: () => apiError(500, 'x', '続き失敗'),
     })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await tick(0)
     await act(async () => screen.getByRole('button', { name: 'もっと見る' }).click())
     await tick(0)
@@ -494,7 +494,7 @@ describe('Notifications filter', () => {
       [FIRST]: () => json(latest),
       [before('a1')]: () => new Promise<Response>((r) => (release = r)),
     })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await tick(0)
     await act(async () => screen.getByRole('button', { name: 'もっと見る' }).click())
     await tick(0)
@@ -517,7 +517,7 @@ describe('Notifications filter', () => {
       [FIRST]: () => json(latest),
       [before('a1')]: () => new Promise<Response>((r) => (release = r)),
     })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     await tick(0)
     await act(async () => screen.getByRole('button', { name: 'もっと見る' }).click())
     await tick(0)
@@ -539,7 +539,7 @@ describe('Notifications filter', () => {
       [FIRST]: () => json(page(['a'], 'a')),
       [before('a')]: () => new Promise<Response>((r) => (release = r)),
     })
-    const view = render(<Notifications />)
+    const view = render(<Notifications accountId="default" />)
     await tick(0)
     await act(async () => screen.getByRole('button', { name: 'もっと見る' }).click())
     await tick(0)
@@ -554,7 +554,7 @@ describe('Notifications filter', () => {
 describe('Notifications with a server that omits the filter', () => {
   it('shows the generic error instead of an empty or broken list', async () => {
     mockApi({ [FIRST]: () => json({ items: [notification('a')], next_cursor: null }) })
-    render(<Notifications />)
+    render(<Notifications accountId="default" />)
     expect(await screen.findByRole('alert')).toHaveTextContent('サーバーでエラーが発生しました。')
     expect(screen.queryByText('title a')).not.toBeInTheDocument()
     expect(screen.queryByText('表示対象の通知はありません。')).not.toBeInTheDocument()

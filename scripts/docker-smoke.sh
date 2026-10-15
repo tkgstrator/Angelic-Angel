@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Credential-free smoke test for the runtime image.
 # Usage: scripts/docker-smoke.sh IMAGE
-# Uses dummy credentials, a fabricated registration and --network none only;
+# Uses dummy credentials, fabricated registrations and --network none only;
 # it never contacts Twitter or AutoPush. The runtime image is distroless (no
 # shell), so file checks and seeding use a separate busybox helper image.
 # The image starts as root and the application drops to the owner of /config
@@ -30,6 +30,14 @@ DUMMY_AUTH=dummy-auth-token
 DUMMY_CT0=dummy-ct0-token
 ENV_AUTH=dummy-env-auth-token
 ENV_CT0=dummy-env-ct0-token
+# `status` prints only the first 20 characters of a stored credential; the TAILSECRET
+# markers sit past that, so seeing one in any output means a value was printed in full.
+WORK_AUTH=work-auth-token-visible-TAILSECRET1
+WORK_CT0=work-ct0-token-visible-TAILSECRET2
+WORK_AUTH_SHOWN="${WORK_AUTH:0:20}..."
+WORK_CT0_SHOWN="${WORK_CT0:0:20}..."
+WEBHOOK_SECRET=dummy-webhook-secret-WHSECRET
+MULTI_CONFIG=/config/multi.toml
 
 # Every resource name is recorded before it is created, so the trap only ever
 # removes resources owned by this run.
@@ -98,6 +106,23 @@ expect_contains() { # label text needle
     *"$3"*) ;;
     *) fail "$1: expected output to contain '$3', got: $2" ;;
   esac
+}
+
+expect_lacks() { # label text needle
+  case $2 in
+    *"$3"*) fail "$1: output must not contain '$3', got: $2" ;;
+  esac
+}
+
+# Runs a command that must fail with the given exit code; its output is left in $out.
+expect_failure() { # label code command...
+  local label=$1 want=$2 code
+  shift 2
+  set +e
+  out=$("$@" 2>&1)
+  code=$?
+  set -e
+  [ "$code" -eq "$want" ] || fail "$label: exited $code, expected $want: $out"
 }
 
 # Named one-shot container; the name is recorded so cleanup can reap it.
@@ -189,6 +214,87 @@ out=$(helper -v "$INIT_VOLUME:/config" "$HELPER_IMAGE" sh -c "stat -c '%n %u' $O
   || fail "ANGELIC_ANGEL_CONFIG did not create $OTHER_CONFIG: $out"
 expect_contains config-env-file "$out" "$OTHER_CONFIG 65532"
 
+echo "== multiple accounts: a legacy config is converted on its first save"
+# The pre-0.4 layout (top-level [twitter]) must keep working as the `default` account. Reading
+# never rewrites the file; the first save backs the original up as <config>.legacy.bak (0600,
+# never overwritten) and switches the file to [[accounts]].
+multi() {
+  app -e "ANGELIC_ANGEL_CONFIG=$MULTI_CONFIG" -e NO_COLOR=1 -v "$INIT_VOLUME:/config" "$IMAGE" "$@"
+}
+helper -i -v "$INIT_VOLUME:/config" "$HELPER_IMAGE" sh -c "cat > $MULTI_CONFIG" <<TOML \
+  || fail "cannot seed the legacy multi-account config"
+[twitter]
+auth_token = "$DUMMY_AUTH"
+ct0 = "$DUMMY_CT0"
+TOML
+out=$(multi status 2>&1) || fail "status failed on a legacy config: $out"
+expect_contains legacy-status "$out" "$DUMMY_AUTH"
+expect_lacks legacy-status "$out" "Account:"
+helper -v "$INIT_VOLUME:/config" "$HELPER_IMAGE" \
+  sh -c "test ! -e $MULTI_CONFIG.legacy.bak && grep -q '^\[twitter\]' $MULTI_CONFIG" \
+  || fail "reading a legacy config must neither back it up nor rewrite it"
+
+out=$(multi init --account work --auth-token "$WORK_AUTH" --ct0 "$WORK_CT0" 2>&1) \
+  || fail "init --account work failed: $out"
+expect_lacks init-work "$out" TAILSECRET
+out=$(helper -v "$INIT_VOLUME:/config" "$HELPER_IMAGE" \
+  sh -c "stat -c '%n %u:%a' $MULTI_CONFIG $MULTI_CONFIG.legacy.bak && cat $MULTI_CONFIG.legacy.bak") \
+  || fail "cannot inspect the converted config: $out"
+expect_contains legacy-backup "$out" "$MULTI_CONFIG 65532:600"
+expect_contains legacy-backup "$out" "$MULTI_CONFIG.legacy.bak 65532:600"
+expect_contains legacy-backup "$out" "[twitter]"
+expect_contains legacy-backup "$out" "$DUMMY_AUTH"
+expect_lacks legacy-backup "$out" "[[accounts]]"
+out=$(helper -v "$INIT_VOLUME:/config" "$HELPER_IMAGE" sh -c "cat $MULTI_CONFIG") \
+  || fail "cannot read the converted config"
+expect_contains converted "$out" "[[accounts]]"
+expect_contains converted "$out" 'id = "default"'
+expect_contains converted "$out" 'id = "work"'
+expect_contains converted "$out" "$DUMMY_AUTH"
+
+out=$(multi status 2>&1) || fail "status failed with two accounts: $out"
+expect_contains multi-status "$out" "Account: default"
+expect_contains multi-status "$out" "Account: work"
+expect_contains multi-status "$out" "$DUMMY_AUTH"
+expect_contains multi-status "$out" "$WORK_AUTH_SHOWN"
+expect_contains multi-status "$out" "$WORK_CT0_SHOWN"
+expect_lacks multi-status "$out" TAILSECRET
+out=$(multi status --account work 2>&1) || fail "status --account work failed: $out"
+expect_contains work-status "$out" "$WORK_AUTH_SHOWN"
+expect_lacks work-status "$out" "$DUMMY_AUTH"
+expect_lacks work-status "$out" TAILSECRET
+expect_failure unknown-account 1 multi status --account nope
+expect_contains unknown-account "$out" '"nope" not found'
+expect_failure invalid-account 2 multi status --account=Bad
+expect_contains invalid-account "$out" "invalid account id"
+expect_failure unregister-account 1 multi unregister --account work
+expect_contains unregister-account "$out" 'No registration found for account "work"'
+
+# A second save leaves the first backup alone.
+multi init --account work --auth-token other-auth --ct0 other-ct0 >/dev/null 2>&1 \
+  || fail "second init --account work failed"
+out=$(helper -v "$INIT_VOLUME:/config" "$HELPER_IMAGE" sh -c "cat $MULTI_CONFIG.legacy.bak") \
+  || fail "cannot read the legacy backup"
+expect_contains legacy-backup-kept "$out" "$DUMMY_AUTH"
+expect_lacks legacy-backup-kept "$out" "other-auth"
+
+echo "== multiple accounts: environment credentials apply to default only"
+out=$(app -e "ANGELIC_ANGEL_CONFIG=$MULTI_CONFIG" -e NO_COLOR=1 -e "TWITTER_AUTH_TOKEN=$ENV_AUTH" \
+  -e "TWITTER_CSRF_TOKEN=$ENV_CT0" -v "$INIT_VOLUME:/config" "$IMAGE" status 2>&1) \
+  || fail "status with environment credentials failed: $out"
+[ "$(grep -c 'credentials from environment' <<<"$out")" -eq 1 ] \
+  || fail "environment credentials must show up for default only: $out"
+expect_contains env-multi "$out" "other-auth..."
+expect_lacks env-multi "$out" "$ENV_AUTH"
+expect_lacks env-multi "$out" "$ENV_CT0"
+expect_lacks env-multi "$out" "$DUMMY_AUTH"
+out=$(app -e "ANGELIC_ANGEL_CONFIG=$MULTI_CONFIG" -e NO_COLOR=1 -e "TWITTER_AUTH_TOKEN=$ENV_AUTH" \
+  -v "$INIT_VOLUME:/config" "$IMAGE" status 2>&1) \
+  || fail "status with half the environment credentials failed: $out"
+expect_contains env-multi-half "$out" "TWITTER_CSRF_TOKEN is not"
+expect_contains env-multi-half "$out" "other-auth..."
+expect_lacks env-multi-half "$out" "$ENV_AUTH"
+
 echo "== permissions"
 out=$(helper -v "$INIT_VOLUME:/config" "$HELPER_IMAGE" \
   sh -c "stat -c '%n %u:%a' /config $CONFIG \
@@ -225,7 +331,9 @@ expect_contains bind-empty-status "$out" "$DUMMY_AUTH"
 
 # a'. Known files of a root-owned directory follow it; unrelated files stay as they are.
 root_helper -i -v "$BIND_DIR/legacy:/config" "$HELPER_IMAGE" \
-  sh -c "cat > $CONFIG && touch $CONFIG.lock /config/unrelated.txt" <<TOML \
+  sh -c "cat > $CONFIG && touch $CONFIG.lock /config/unrelated.txt \
+    $CONFIG.legacy.bak $CONFIG.work.notifications.sqlite3 $CONFIG.work.notifications.sqlite3-wal \
+    $CONFIG.Work.notifications.sqlite3" <<TOML \
   || fail "cannot seed the legacy bind mount"
 [twitter]
 auth_token = "$DUMMY_AUTH"
@@ -235,12 +343,20 @@ out=$(app -v "$BIND_DIR/legacy:/config" "$IMAGE" status 2>&1) || fail "status fa
 expect_contains bind-legacy "$out" "running as 65532:65532 owning /config"
 expect_contains bind-legacy "$out" "$DUMMY_AUTH"
 out=$(root_helper -v "$BIND_DIR/legacy:/config" "$HELPER_IMAGE" \
-  sh -c "stat -c '%n %u:%g' /config $CONFIG $CONFIG.lock /config/unrelated.txt") \
+  sh -c "stat -c '%n %u:%g' /config $CONFIG $CONFIG.lock /config/unrelated.txt \
+    $CONFIG.legacy.bak $CONFIG.work.notifications.sqlite3 $CONFIG.work.notifications.sqlite3-wal \
+    $CONFIG.Work.notifications.sqlite3") \
   || fail "cannot inspect the legacy bind mount: $out"
 expect_contains bind-legacy-owner "$out" "/config 65532:65532"
 expect_contains bind-legacy-owner "$out" "$CONFIG 65532:65532"
 expect_contains bind-legacy-owner "$out" "$CONFIG.lock 65532:65532"
 expect_contains bind-legacy-owner "$out" "/config/unrelated.txt 0:0"
+# Per-account history databases and the legacy backup are managed files; an id that cannot be
+# a valid account id (here an uppercase one) is not.
+expect_contains bind-legacy-owner "$out" "$CONFIG.legacy.bak 65532:65532"
+expect_contains bind-legacy-owner "$out" "$CONFIG.work.notifications.sqlite3 65532:65532"
+expect_contains bind-legacy-owner "$out" "$CONFIG.work.notifications.sqlite3-wal 65532:65532"
+expect_contains bind-legacy-owner "$out" "$CONFIG.Work.notifications.sqlite3 0:0"
 
 # a''. An existing config owned by a non-root user wins over the root-owned directory:
 # the directory is handed to that user, so a 0600 file stays readable and a lock can be created.
@@ -336,7 +452,7 @@ helper -v "$AUTOREG_VOLUME:/config" "$HELPER_IMAGE" \
   sh -c "! grep -rqF -e '$ENV_AUTH' -e '$ENV_CT0' /config" \
   || fail "environment credentials were written under /config"
 
-echo "== listen offline with fabricated registration"
+echo "== listen offline with fabricated registration (legacy layout)"
 helper -i -v "$LISTEN_VOLUME:/config" "$HELPER_IMAGE" sh -c "cat > $CONFIG" <<TOML \
   || fail "cannot seed fabricated registration"
 [twitter]
@@ -379,5 +495,82 @@ docker stop -t 5 "$LISTEN_CONTAINER" >/dev/null || fail "docker stop failed"
 [ "$(docker inspect -f '{{.State.ExitCode}}' "$LISTEN_CONTAINER")" = "0" ] \
   || fail "listener exit code after stop is not 0"
 expect_contains sigint "$(docker logs "$LISTEN_CONTAINER" 2>&1)" "Interrupted"
+
+echo "== listen offline with two fabricated registrations"
+# Two accounts run side by side in one process, each failing to connect on its own.
+docker rm "$LISTEN_CONTAINER" >/dev/null || fail "cannot remove $LISTEN_CONTAINER"
+helper -i -v "$LISTEN_VOLUME:/config" "$HELPER_IMAGE" sh -c "cat > $CONFIG" <<TOML \
+  || fail "cannot seed the fabricated registrations"
+[[accounts]]
+id = "default"
+webhook_endpoint = "https://hook.invalid/default"
+webhook_secret = "$WEBHOOK_SECRET"
+
+[accounts.twitter]
+auth_token = "$DUMMY_AUTH"
+ct0 = "$DUMMY_CT0"
+
+[accounts.registration]
+endpoint = "https://invalid.example/push"
+
+[accounts.registration.autopush]
+uaid = "00000000-0000-0000-0000-000000000000"
+channel_id = "00000000-0000-0000-0000-000000000001"
+
+[accounts.registration.keys]
+public_key = [1, 2, 3]
+private_key = [1, 2, 3]
+auth_secret = [1, 2, 3]
+
+[[accounts]]
+id = "work"
+webhook_endpoint = "https://hook.invalid/work"
+webhook_secret = "$WEBHOOK_SECRET"
+
+[accounts.twitter]
+auth_token = "$WORK_AUTH"
+ct0 = "$WORK_CT0"
+
+[accounts.registration]
+endpoint = "https://invalid.example/push-work"
+
+[accounts.registration.autopush]
+uaid = "00000000-0000-0000-0000-000000000002"
+channel_id = "00000000-0000-0000-0000-000000000003"
+
+[accounts.registration.keys]
+public_key = [1, 2, 3]
+private_key = [1, 2, 3]
+auth_secret = [1, 2, 3]
+TOML
+out=$(app -e NO_COLOR=1 -v "$LISTEN_VOLUME:/config" "$IMAGE" status 2>&1)
+expect_contains two-accounts-status "$out" "Account: default"
+expect_contains two-accounts-status "$out" "Account: work"
+[ "$(grep -c 'Registration  active' <<<"$out")" -eq 2 ] \
+  || fail "both fabricated registrations should be active: $out"
+expect_lacks two-accounts-status "$out" TAILSECRET
+expect_lacks two-accounts-status "$out" WHSECRET
+
+docker run -d --name "$LISTEN_CONTAINER" --network none -v "$LISTEN_VOLUME:/config" "$IMAGE" >/dev/null \
+  || fail "cannot start the two-account listener"
+failures=0
+i=0
+while [ "$i" -lt 30 ]; do
+  failures=$(docker logs "$LISTEN_CONTAINER" 2>&1 | grep -c "connection failed, retrying" || true)
+  [ "$failures" -ge 2 ] && break
+  [ "$(docker inspect -f '{{.State.Running}}' "$LISTEN_CONTAINER")" = "true" ] \
+    || fail "two-account listener exited early: $(docker logs "$LISTEN_CONTAINER" 2>&1)"
+  sleep 1
+  i=$((i + 1))
+done
+[ "$failures" -ge 2 ] \
+  || fail "expected a connection failure/retry log per account: $(docker logs "$LISTEN_CONTAINER" 2>&1)"
+docker stop -t 5 "$LISTEN_CONTAINER" >/dev/null || fail "docker stop failed"
+[ "$(docker inspect -f '{{.State.ExitCode}}' "$LISTEN_CONTAINER")" = "0" ] \
+  || fail "two-account listener exit code after stop is not 0"
+out=$(docker logs "$LISTEN_CONTAINER" 2>&1)
+expect_contains two-accounts-sigint "$out" "Interrupted"
+expect_lacks two-accounts-log "$out" TAILSECRET
+expect_lacks two-accounts-log "$out" WHSECRET
 
 echo "OK"

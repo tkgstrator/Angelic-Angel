@@ -28,17 +28,17 @@ describe('Status', () => {
     ['unregistering', '解除処理中'],
     ['error', 'エラー'],
   ])('renders state %s', async (state, label) => {
-    mockApi({ 'GET /api/status': () => json(status({ state })) })
-    render(<Status />)
+    mockApi({ 'GET /api/accounts/default/status': () => json(status({ state })) })
+    render(<Status accountId="default" />)
     expect(await screen.findAllByText(label)).not.toHaveLength(0)
   })
 
   it('shows zero counters, empty timestamps and no error', async () => {
     mockApi({
-      'GET /api/status': () =>
+      'GET /api/accounts/default/status': () =>
         json(status({ state: 'unregistered', connected_since: null, registered: false })),
     })
-    render(<Status />)
+    render(<Status accountId="default" />)
     expect(await screen.findByText(/登録画面で登録すると/)).toBeInTheDocument()
     expect(screen.getByRole('row', { name: '受信 0' })).toBeInTheDocument()
     expect(screen.getAllByText('—')).toHaveLength(2)
@@ -47,7 +47,7 @@ describe('Status', () => {
 
   it('shows counters, local time, retry count and last error', async () => {
     mockApi({
-      'GET /api/status': () =>
+      'GET /api/accounts/default/status': () =>
         json(
           status({
             state: 'retrying',
@@ -60,7 +60,7 @@ describe('Status', () => {
           }),
         ),
     })
-    render(<Status />)
+    render(<Status accountId="default" />)
     expect(await screen.findByRole('row', { name: '受信 1,234' })).toBeInTheDocument()
     expect(screen.getByRole('row', { name: '転送失敗 34' })).toBeInTheDocument()
     expect(screen.getByRole('row', { name: '再試行回数 5' })).toBeInTheDocument()
@@ -71,8 +71,8 @@ describe('Status', () => {
   })
 
   it('shows an error when the first load fails', async () => {
-    mockApi({ 'GET /api/status': () => apiError(500, 'x', '取得に失敗') })
-    render(<Status />)
+    mockApi({ 'GET /api/accounts/default/status': () => apiError(500, 'x', '取得に失敗') })
+    render(<Status accountId="default" />)
     expect(await screen.findByRole('alert')).toHaveTextContent('取得に失敗')
   })
 
@@ -82,7 +82,7 @@ describe('Status', () => {
     let inflight = 0
     let maxInflight = 0
     const fetchMock = mockApi({
-      'GET /api/status': () => {
+      'GET /api/accounts/default/status': () => {
         inflight++
         maxInflight = Math.max(maxInflight, inflight)
         return new Promise<Response>((r) => {
@@ -93,7 +93,7 @@ describe('Status', () => {
         })
       },
     })
-    render(<Status />)
+    render(<Status accountId="default" />)
     await flush()
     expect(fetchMock).toHaveBeenCalledTimes(1)
 
@@ -114,8 +114,8 @@ describe('Status', () => {
 
   it('pauses while hidden and refreshes when visible again', async () => {
     vi.useFakeTimers()
-    const fetchMock = mockApi({ 'GET /api/status': () => json(status()) })
-    render(<Status />)
+    const fetchMock = mockApi({ 'GET /api/accounts/default/status': () => json(status()) })
+    render(<Status accountId="default" />)
     await flush()
     expect(fetchMock).toHaveBeenCalledTimes(1)
 
@@ -135,10 +135,10 @@ describe('Status', () => {
     vi.useFakeTimers()
     let calls = 0
     mockApi({
-      'GET /api/status': () =>
+      'GET /api/accounts/default/status': () =>
         ++calls === 1 ? json(status({ received_count: 7 })) : apiError(502, 'x', '一時的な障害'),
     })
-    render(<Status />)
+    render(<Status accountId="default" />)
     await flush()
     await tick(2000)
     expect(screen.getByRole('alert')).toHaveTextContent('一時的な障害')

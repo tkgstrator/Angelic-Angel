@@ -1,5 +1,6 @@
 import { vi } from 'vitest'
 import type {
+  Account,
   CredentialCheck,
   FollowingNotifications,
   NotificationFilter,
@@ -54,10 +55,18 @@ export const settings = (over: Partial<Settings> = {}): Settings => ({
   configured: true,
   auth_token_set: true,
   ct0_set: true,
+  webhook_secret_set: true,
   webhook_endpoint: 'https://example.com/hook',
   webhook_source: 'config',
   credentials_locked: false,
   notification_filter: allowAll,
+  ...over,
+})
+
+export const account = (id: string, over: Partial<Account> = {}): Account => ({
+  id,
+  registered: true,
+  receiver_state: 'connected',
   ...over,
 })
 
@@ -131,10 +140,10 @@ export const validation = (over: Partial<CredentialCheck> = {}): CredentialCheck
 
 /** Every request the Settings screen makes on its own, answered with quiet defaults. */
 export const settingsRoutes = (): Record<string, Handler> => ({
-  'GET /api/settings': () => json(settings()),
-  'GET /api/registration': () => json(registration()),
-  'GET /api/following-notifications': () => json(following()),
-  'POST /api/settings/validate': () => json(validation()),
+  'GET /api/accounts/default/settings': () => json(settings()),
+  'GET /api/accounts/default/registration': () => json(registration()),
+  'GET /api/accounts/default/following-notifications': () => json(following()),
+  'POST /api/accounts/default/settings/validate': () => json(validation()),
 })
 
 export function requests(fetchMock: ReturnType<typeof mockApi>, key: string): number {

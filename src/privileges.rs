@@ -62,15 +62,36 @@ fn config_dir(config_path: &Path) -> PathBuf {
 }
 
 /// 設定ファイルと同じ場所に作られる、このアプリが管理するファイルか。
-/// 設定本体・`.lock`・履歴 DB（とその journal/wal/shm）・`.tmp-*` だけが対象。
+/// 設定本体・`.lock`・履歴 DB（とその journal/wal/shm）・`.legacy.bak`・`.tmp-*` だけが対象。
+/// 履歴 DB は `default` が `.notifications.sqlite3`、ほかのアカウントが `.<id>.notifications.sqlite3`。
 fn is_managed(config_name: &[u8], entry: &[u8]) -> bool {
     let Some(rest) = entry.strip_prefix(config_name) else {
         return false;
     };
     rest.is_empty()
         || rest == b".lock"
-        || rest.starts_with(b".notifications.sqlite3")
+        || rest == b".legacy.bak"
+        || is_history_db(rest)
         || rest.starts_with(b".tmp-")
+}
+
+/// 設定ファイル名の後ろの部分が、履歴 DB（`-journal` / `-wal` / `-shm` を含む）か。
+/// アカウント ID は設定で許される形式のものだけを受け付け、任意の文字列は通さない。
+fn is_history_db(rest: &[u8]) -> bool {
+    const DB: &[u8] = b".notifications.sqlite3";
+    if rest.starts_with(DB) {
+        return true;
+    }
+    let Some(after_dot) = rest.strip_prefix(b".") else {
+        return false;
+    };
+    // アカウント ID は `.` を含められないので、最初の `.` までが ID。
+    let Some(end) = after_dot.iter().position(|b| *b == b'.') else {
+        return false;
+    };
+    let (id, db) = after_dot.split_at(end);
+    db.starts_with(DB)
+        && std::str::from_utf8(id).is_ok_and(|id| crate::config::validate_account_id(id).is_ok())
 }
 
 /// 既存の設定ファイルの所有者。無い場合、通常ファイルでない場合（symlink は辿らない）は `None`。
@@ -379,6 +400,12 @@ mod tests {
             "angelic-angel.toml.notifications.sqlite3-journal",
             "angelic-angel.toml.notifications.sqlite3-wal",
             "angelic-angel.toml.notifications.sqlite3-shm",
+            "angelic-angel.toml.work.notifications.sqlite3",
+            "angelic-angel.toml.work.notifications.sqlite3-journal",
+            "angelic-angel.toml.work.notifications.sqlite3-wal",
+            "angelic-angel.toml.work.notifications.sqlite3-shm",
+            "angelic-angel.toml.a-1_b.notifications.sqlite3",
+            "angelic-angel.toml.legacy.bak",
             "angelic-angel.toml.tmp-42",
             "angelic-angel.toml.tmp-probe-42",
         ] {
@@ -389,6 +416,17 @@ mod tests {
             "other.toml.lock",
             "angelic-angel.toml.token",
             "angelic-angel.toml.notifications.json",
+            "angelic-angel.toml.legacy.bak.old",
+            "angelic-angel.toml.legacy",
+            "angelic-angel.toml.Work.notifications.sqlite3",
+            "angelic-angel.toml..notifications.sqlite3",
+            "angelic-angel.toml.-work.notifications.sqlite3",
+            "angelic-angel.toml.a.b.notifications.sqlite3",
+            "angelic-angel.toml.a b.notifications.sqlite3",
+            "angelic-angel.toml.work.notifications.json",
+            "angelic-angel.toml.work.notificationsXsqlite3",
+            "angelic-angel.toml.work",
+            "other.toml.work.notifications.sqlite3",
             "angelic-angel.tomlx",
             "old-angelic-angel.toml",
             "angelic-angel",
@@ -438,6 +476,9 @@ mod tests {
             format!("{name}.lock"),
             format!("{name}.notifications.sqlite3"),
             format!("{name}.notifications.sqlite3-journal"),
+            format!("{name}.work.notifications.sqlite3"),
+            format!("{name}.work.notifications.sqlite3-wal"),
+            format!("{name}.legacy.bak"),
             format!("{name}.tmp-1"),
             "other.toml".to_string(),
         ] {
@@ -461,7 +502,7 @@ mod tests {
         let to = id(own.uid(), own.gid());
         assert_eq!(
             chown_managed_files(&base, name.as_bytes(), own.uid(), to).unwrap(),
-            5
+            8
         );
         // 別の UID 所有のファイルだけを対象にする。
         assert_eq!(

@@ -12,6 +12,7 @@ use sha2::Sha256;
 use std::net::IpAddr;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::Instrument;
 
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(30);
 const SIGNATURE_HEADER: HeaderName = HeaderName::from_static("webhook-signature");
@@ -21,6 +22,8 @@ enum ForwardOutcome {
     Forwarded,
     Failed,
     Skipped,
+    /// 設定ファイルにこのアカウントが無い。履歴にも転送にも回さない。
+    AccountRemoved,
 }
 
 /// Outcome of a single listen session.
@@ -38,6 +41,35 @@ enum SessionOutcome {
     ConnectionFailed(AngelicAngelError),
     /// Unrecoverable error (e.g. UAID invalidated and re-registration also failed).
     Fatal(AngelicAngelError),
+    /// The account is gone from the config file; the receiver ends without reconnecting.
+    AccountRemoved,
+}
+
+/// Why the notification loop of a connected session returned.
+enum LoopEnd {
+    Closed,
+    AccountRemoved,
+}
+
+/// Result of [`try_connect`].
+enum Connection {
+    Ready(Box<autopush::AutoPushClient>),
+    AccountRemoved,
+}
+
+/// What `listen_managed` does once a session has ended.
+enum Next {
+    Wait(Duration),
+    Finish(Result<()>),
+}
+
+/// Whether the config file exists and no longer has the account. A missing or unreadable file is
+/// not a removal, so a transient read error never stops a receiver.
+fn account_removed(config_path: &Path, account_id: &str) -> bool {
+    matches!(
+        Config::load_optional(config_path),
+        Ok(Some(config)) if config.account(account_id).is_none()
+    )
 }
 
 /// Computes an exponential backoff delay compatible with Firefox's implementation.
@@ -64,12 +96,20 @@ fn calc_backoff(retry_count: u32) -> u64 {
 /// - No upper limit on retry attempts (infinite retries).
 /// - Exponential backoff: 5s * 2^n, capped at 5 minutes.
 /// - Server-initiated backoff via close code 4774 delays reconnection for 30 minutes.
-pub async fn listen(registration: Registration, config_path: &Path) -> Result<()> {
-    listen_managed(registration, config_path, &Telemetry::default()).await
+///
+/// Every log line of the receiver carries the account id through the `account` span. The loop ends
+/// with `Ok` when the account disappears from the config file.
+pub async fn listen(
+    account_id: &str,
+    registration: Registration,
+    config_path: &Path,
+) -> Result<()> {
+    listen_managed(account_id, registration, config_path, &Telemetry::default()).await
 }
 
 /// Same as [`listen`], additionally reporting state and counters to `telemetry`.
 pub async fn listen_managed(
+    account_id: &str,
     mut registration: Registration,
     config_path: &Path,
     telemetry: &Telemetry,
@@ -77,55 +117,88 @@ pub async fn listen_managed(
     let mut retry_count: u32 = 0;
     telemetry.set_connecting();
 
-    loop {
-        match listen_once(&mut registration, config_path, telemetry).await {
-            SessionOutcome::NormalClose => {
-                retry_count = 0;
-                telemetry.set_retrying("connection closed");
-                tracing::info!("WebSocket connection closed, reconnecting");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            },
-            SessionOutcome::DisconnectedAfterConnect(e) => {
-                if e.to_string().contains("BACKOFF:") {
-                    telemetry.set_retrying("server requested backoff");
-                    tracing::warn!("server requested backoff, delaying reconnect for 30 minutes");
-                    tokio::time::sleep(Duration::from_secs(30 * 60)).await;
-                } else {
-                    retry_count = 0;
-                    telemetry.set_retrying("connection lost");
-                    tracing::info!(error = %e, "disconnected after connect, reconnecting");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            },
-            SessionOutcome::ConnectionFailed(e) => {
-                retry_count += 1;
-                telemetry.set_retrying("connection failed");
-                let delay = calc_backoff(retry_count);
-                tracing::warn!(
-                    retry_count,
-                    delay_secs = delay,
-                    error = %e,
-                    "WebSocket connection failed, retrying"
-                );
-                tokio::time::sleep(Duration::from_secs(delay)).await;
-            },
-            SessionOutcome::Fatal(e) => {
-                telemetry.set_error("re-registration required");
-                tracing::error!(error = %e, "fatal error, re-registration required");
-                return Err(e);
-            },
+    async {
+        loop {
+            let outcome = listen_once(account_id, &mut registration, config_path, telemetry).await;
+            match next_step(account_id, outcome, &mut retry_count, telemetry) {
+                Next::Wait(delay) => tokio::time::sleep(delay).await,
+                Next::Finish(result) => return result,
+            }
         }
+    }
+    .instrument(tracing::info_span!("account", id = account_id))
+    .await
+}
+
+/// Records the session outcome in `telemetry` and decides whether to reconnect after a delay or to
+/// stop.
+fn next_step(
+    account_id: &str,
+    outcome: SessionOutcome,
+    retry_count: &mut u32,
+    telemetry: &Telemetry,
+) -> Next {
+    match outcome {
+        SessionOutcome::NormalClose => {
+            *retry_count = 0;
+            telemetry.set_retrying("connection closed");
+            tracing::info!("WebSocket connection closed, reconnecting");
+            Next::Wait(Duration::from_secs(1))
+        },
+        SessionOutcome::DisconnectedAfterConnect(e) => {
+            if e.to_string().contains("BACKOFF:") {
+                telemetry.set_retrying("server requested backoff");
+                tracing::warn!("server requested backoff, delaying reconnect for 30 minutes");
+                Next::Wait(Duration::from_secs(30 * 60))
+            } else {
+                *retry_count = 0;
+                telemetry.set_retrying("connection lost");
+                tracing::info!(error = %e, "disconnected after connect, reconnecting");
+                Next::Wait(Duration::from_secs(1))
+            }
+        },
+        SessionOutcome::ConnectionFailed(e) => {
+            *retry_count += 1;
+            telemetry.set_retrying("connection failed");
+            let delay = calc_backoff(*retry_count);
+            tracing::warn!(
+                retry_count = *retry_count,
+                delay_secs = delay,
+                error = %e,
+                "WebSocket connection failed, retrying"
+            );
+            Next::Wait(Duration::from_secs(delay))
+        },
+        SessionOutcome::Fatal(e) => {
+            telemetry.set_error("re-registration required");
+            tracing::error!(error = %e, "fatal error, re-registration required");
+            Next::Finish(Err(e))
+        },
+        SessionOutcome::AccountRemoved => {
+            telemetry.set_stopped();
+            tracing::info!(
+                account = account_id,
+                "account was removed from the config, stopping its receiver"
+            );
+            Next::Finish(Ok(()))
+        },
     }
 }
 
 /// Runs a single listen session: connect, receive notifications, return outcome.
 async fn listen_once(
+    account_id: &str,
     registration: &mut Registration,
     config_path: &Path,
     telemetry: &Telemetry,
 ) -> SessionOutcome {
-    let mut client = match try_connect(registration, config_path).await {
-        Ok(client) => client,
+    if account_removed(config_path, account_id) {
+        return SessionOutcome::AccountRemoved;
+    }
+
+    let mut client = match try_connect(account_id, registration, config_path).await {
+        Ok(Connection::Ready(client)) => client,
+        Ok(Connection::AccountRemoved) => return SessionOutcome::AccountRemoved,
         Err(e) => {
             if e.to_string().contains("UAID invalid")
                 || e.to_string().contains("still failed after re-registration")
@@ -139,24 +212,34 @@ async fn listen_once(
     tracing::info!("WebSocket connection established, listening for notifications");
     telemetry.set_connected();
 
-    match run_notification_loop(&mut client, registration, config_path, telemetry).await {
-        Ok(()) => SessionOutcome::NormalClose,
+    match run_notification_loop(
+        account_id,
+        &mut client,
+        registration,
+        config_path,
+        telemetry,
+    )
+    .await
+    {
+        Ok(LoopEnd::Closed) => SessionOutcome::NormalClose,
+        Ok(LoopEnd::AccountRemoved) => SessionOutcome::AccountRemoved,
         Err(e) => SessionOutcome::DisconnectedAfterConnect(e),
     }
 }
 
 /// Establishes a connection to AutoPush, handling UAID invalidation transparently.
 async fn try_connect(
+    account_id: &str,
     registration: &mut Registration,
     config_path: &Path,
-) -> Result<autopush::AutoPushClient> {
+) -> Result<Connection> {
     let connect_result =
         autopush::connect_and_listen(&registration.autopush, &registration.keys).await?;
 
     match connect_result {
         ConnectResult::Connected(client) => {
             tracing::info!("connected with existing session");
-            Ok(*client)
+            Ok(Connection::Ready(client))
         },
         ConnectResult::NeedsReregistration(reregistration_info) => {
             let new_reg = &reregistration_info.registration;
@@ -168,11 +251,20 @@ async fn try_connect(
                 "UAID invalidated (pushsubscriptionchange), re-registering"
             );
 
+            // 削除済みのアカウントの認証情報で X に再登録しない。
+            if account_removed(config_path, account_id) {
+                return Ok(Connection::AccountRemoved);
+            }
+
             tracing::info!("re-registering with Twitter API");
             // 環境変数で自動登録した設定は [twitter] が空なので、ファイルだけでなく環境変数も見る。
             let (env_auth, env_csrf) = config::twitter_env_pair();
-            let twitter_credentials =
-                reregistration_twitter(config_path, env_auth.as_deref(), env_csrf.as_deref())?;
+            let twitter_credentials = reregistration_twitter(
+                account_id,
+                config_path,
+                env_auth.as_deref(),
+                env_csrf.as_deref(),
+            )?;
 
             let subscription = crate::push::PushSubscription {
                 endpoint: new_reg.endpoint.clone(),
@@ -190,21 +282,16 @@ async fn try_connect(
             registration.autopush.uaid = new_reg.uaid.clone();
             registration.autopush.channel_id = new_reg.channel_id.clone();
             registration.keys = new_keys;
-            // Re-read the latest config so concurrent settings edits are never overwritten.
-            let updated = registration.clone();
-            config::Config::modify(config_path, |current| {
-                Ok::<_, AngelicAngelError>(match current {
-                    Some(mut latest) if latest.registration.is_some() => {
-                        latest.registration = Some(updated);
-                        (Some(latest), ())
-                    },
-                    _ => (None, ()),
-                })
-            })?;
-            tracing::info!("saved updated registration");
+            match save_reregistration(config_path, account_id, registration.clone())? {
+                ReregistrationSaved::Saved => tracing::info!("saved updated registration"),
+                ReregistrationSaved::Unregistered => {
+                    tracing::warn!("registration was removed concurrently, not saving the new one");
+                },
+                ReregistrationSaved::AccountRemoved => return Ok(Connection::AccountRemoved),
+            }
 
             match autopush::connect_and_listen(&registration.autopush, &registration.keys).await? {
-                ConnectResult::Connected(client) => Ok(*client),
+                ConnectResult::Connected(client) => Ok(Connection::Ready(client)),
                 ConnectResult::NeedsReregistration(_) => Err(AngelicAngelError::AutoPush(
                     "still failed after re-registration".to_string(),
                 )),
@@ -213,25 +300,61 @@ async fn try_connect(
     }
 }
 
-/// UAID 無効化後の再登録で X に渡す認証情報（環境変数が優先、無ければ設定ファイル）。
+/// What became of the registration obtained by a re-registration.
+#[derive(Debug, PartialEq, Eq)]
+enum ReregistrationSaved {
+    Saved,
+    /// The account has no registration any more (it was unregistered concurrently).
+    Unregistered,
+    AccountRemoved,
+}
+
+/// Writes the new registration into the account `account_id` only. The latest config is re-read so
+/// concurrent settings edits are never overwritten, and a registration that was removed
+/// concurrently is not resurrected.
+fn save_reregistration(
+    config_path: &Path,
+    account_id: &str,
+    updated: Registration,
+) -> Result<ReregistrationSaved> {
+    Config::modify_account(config_path, account_id, |current| {
+        Ok::<_, AngelicAngelError>(match current {
+            Some(mut latest) if latest.registration.is_some() => {
+                latest.registration = Some(updated);
+                (Some(latest), ReregistrationSaved::Saved)
+            },
+            Some(_) => (None, ReregistrationSaved::Unregistered),
+            None => (None, ReregistrationSaved::AccountRemoved),
+        })
+    })
+}
+
+/// UAID 無効化後の再登録で X に渡す認証情報（`default` は環境変数が優先、無ければ設定ファイル）。
 fn reregistration_twitter(
+    account_id: &str,
     config_path: &Path,
     env_auth: Option<&str>,
     env_csrf: Option<&str>,
 ) -> Result<config::TwitterConfig> {
     let stored = config::Config::load(config_path)?;
-    config::require_twitter_with(env_auth, env_csrf, &stored.twitter)
+    let stored = stored
+        .account(account_id)
+        .map(|a| a.twitter.clone())
+        .unwrap_or_default();
+    config::require_twitter_with(account_id, env_auth, env_csrf, &stored)
 }
 
-/// Receives and processes notifications in a loop until the connection drops.
+/// Receives and processes notifications in a loop until the connection drops or the account is
+/// removed.
 async fn run_notification_loop(
+    account_id: &str,
     client: &mut autopush::AutoPushClient,
     registration: &Registration,
     config_path: &Path,
     telemetry: &Telemetry,
-) -> Result<()> {
+) -> Result<LoopEnd> {
     // 非 Unicode の値は未設定として扱う。
-    let webhook_secret = std::env::var("WEBHOOK_SECRET_KEY").ok();
+    let webhook_secret = std::env::var(config::WEBHOOK_SECRET_ENV).ok();
     let lookup = TweetLookup::production()?;
     while let Some(notification) = client.next_notification().await? {
         tracing::info!(
@@ -241,9 +364,11 @@ async fn run_notification_loop(
         );
 
         telemetry.record_received();
+        let mut account_gone = false;
         let ack_code = if let Some(ref data) = notification.data {
             let history_id = format!("{}:{}", notification.channel_id, notification.version);
             match handle_notification_data(
+                account_id,
                 data,
                 &notification.headers,
                 &registration.keys,
@@ -263,6 +388,10 @@ async fn run_notification_loop(
                     autopush::AckCode::Delivered
                 },
                 Ok(ForwardOutcome::Skipped) => autopush::AckCode::Delivered,
+                Ok(ForwardOutcome::AccountRemoved) => {
+                    account_gone = true;
+                    autopush::AckCode::Delivered
+                },
                 Err(ref e) if is_decryption_error(e) => {
                     telemetry.record_failed("notification decryption failed");
                     tracing::warn!(error = %e, "decryption error, sending ACK with decryption_error");
@@ -291,22 +420,27 @@ async fn run_notification_loop(
             ack_code = ?ack_code,
             "ACK sent"
         );
+        if account_gone {
+            return Ok(LoopEnd::AccountRemoved);
+        }
     }
 
-    Ok(())
+    Ok(LoopEnd::Closed)
 }
 
 fn is_decryption_error(e: &AngelicAngelError) -> bool {
     matches!(e, AngelicAngelError::Decryption(_))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_notification_data(
+    account_id: &str,
     data: &str,
     headers: &Option<std::collections::HashMap<String, String>>,
     keys: &crate::config::WebPushKeys,
     config_path: &Path,
     history_id: &str,
-    webhook_secret: Option<&str>,
+    env_webhook_secret: Option<&str>,
     lookup: &TweetLookup,
 ) -> Result<ForwardOutcome> {
     let encrypted = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, data)
@@ -346,39 +480,53 @@ async fn handle_notification_data(
     tracing::debug!(payload_bytes, "notification decrypted");
 
     let kind = notifications::resolve_kind(&payload, lookup).await;
-    record_history(config_path, history_id, &payload, kind).await;
 
-    // 履歴保存後に一度だけ設定を読み、フィルターと Webhook の解決に同じ内容を使う。
-    let config = Config::load_optional(config_path)?;
-    let filter = config
-        .as_ref()
-        .map(|c| c.notification_filter)
-        .unwrap_or_default();
+    // 設定を一度だけ読み、削除の判定・フィルター・Webhook の解決に同じ内容を使う。履歴は設定が
+    // 読めなくても残すので、読み込みの失敗は履歴を保存した後に返す。
+    let loaded = Config::load_optional(config_path);
+    // 削除済みのアカウントの履歴ファイルを作り直さない。
+    if matches!(&loaded, Ok(Some(config)) if config.account(account_id).is_none()) {
+        return Ok(ForwardOutcome::AccountRemoved);
+    }
+    record_history(config_path, account_id, history_id, &payload, kind).await;
+
+    let config = loaded?;
+    let account = config.as_ref().and_then(|c| c.account(account_id));
+    let filter = account.map(|a| a.notification_filter).unwrap_or_default();
     if !filter.allows(kind) {
         tracing::info!("notification kind is disabled by the filter, skipping forward");
         return Ok(ForwardOutcome::Skipped);
     }
-    let stored = config.as_ref().and_then(|c| c.webhook_endpoint.as_deref());
-    let Some(webhook_url) = config::resolve_webhook(stored).0 else {
+    let stored = account.and_then(|a| a.webhook_endpoint.as_deref());
+    let Some(webhook_url) = config::resolve_webhook(account_id, stored).0 else {
         tracing::info!("webhook endpoint is not set, skipping forward");
         return Ok(ForwardOutcome::Skipped);
     };
+    let secret = config::resolve_webhook_secret_with(
+        account_id,
+        env_webhook_secret,
+        account.and_then(|a| a.webhook_secret.as_deref()),
+    )
+    .0;
 
-    send_to_webhook(&payload, &webhook_url, webhook_secret).await
+    send_to_webhook(account_id, &payload, &webhook_url, secret.as_deref()).await
 }
 
-/// Stores the notification in the local history. A failure never blocks forwarding or the ACK.
+/// Stores the notification in the account's local history. A failure never blocks forwarding or
+/// the ACK.
 async fn record_history(
     config_path: &Path,
+    account_id: &str,
     history_id: &str,
     payload: &serde_json::Value,
     kind: notifications::NotificationKind,
 ) {
     let config_path = config_path.to_path_buf();
+    let account_id = account_id.to_owned();
     let history_id = history_id.to_owned();
     let payload = payload.clone();
     let saved = tokio::task::spawn_blocking(move || {
-        notifications::append_as(&config_path, &history_id, &payload, kind)
+        notifications::append_as_for(&config_path, &account_id, &history_id, &payload, kind)
     })
     .await;
     if !matches!(saved, Ok(Ok(()))) {
@@ -386,16 +534,32 @@ async fn record_history(
     }
 }
 
+/// 署名鍵が無いときのエラー。アカウントを特定できるよう ID を含めるが、鍵の値は含めない。
+fn missing_secret_error(account_id: &str) -> AngelicAngelError {
+    let source = if account_id == config::DEFAULT_ACCOUNT_ID {
+        format!(
+            "{} or the account's webhook secret",
+            config::WEBHOOK_SECRET_ENV
+        )
+    } else {
+        "the account's webhook secret".to_string()
+    };
+    AngelicAngelError::Config(format!(
+        "{source} is required to send to the webhook of account {account_id:?}"
+    ))
+}
+
 /// 通知を署名付き(`Webhook-Signature`)で Webhook へ POST し、2xx で応答したかを返す。
 async fn send_to_webhook(
+    account_id: &str,
     payload: &serde_json::Value,
     webhook_url: &str,
     secret: Option<&str>,
 ) -> Result<ForwardOutcome> {
     let url = checked_webhook_url(webhook_url)?;
-    let secret = secret.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
-        AngelicAngelError::Config("WEBHOOK_SECRET_KEY is required to send to a webhook".into())
-    })?;
+    let secret = secret
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| missing_secret_error(account_id))?;
 
     let body = serde_json::to_vec(payload)?;
     let timestamp = SystemTime::now()
@@ -607,7 +771,10 @@ fn parse_header_param(header_value: Option<&String>, param_name: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, NotificationFilter, TwitterConfig, WebPushKeys, test_temp_dir};
+    use crate::config::{
+        Account, Config, DEFAULT_ACCOUNT_ID, NotificationFilter, TwitterConfig, WebPushKeys,
+        test_temp_dir,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -702,14 +869,15 @@ mod tests {
     }
 
     fn write_config_filtered(path: &Path, webhook: Option<&str>, filter: NotificationFilter) {
+        let mut account = Account::new(DEFAULT_ACCOUNT_ID);
+        account.twitter = TwitterConfig {
+            auth_token: "synthetic".into(),
+            ct0: "synthetic".into(),
+        };
+        account.webhook_endpoint = webhook.map(str::to_string);
+        account.notification_filter = filter;
         Config {
-            twitter: TwitterConfig {
-                auth_token: "synthetic".into(),
-                ct0: "synthetic".into(),
-            },
-            registration: None,
-            webhook_endpoint: webhook.map(str::to_string),
-            notification_filter: filter,
+            accounts: vec![account],
         }
         .save(path)
         .unwrap();
@@ -720,16 +888,22 @@ mod tests {
         let dir = test_temp_dir();
         let path = dir.join("angelic-angel.toml");
         // 環境変数で自動登録した設定は [twitter] を持たない。
-        Config::default().save(&path).unwrap();
+        Config {
+            accounts: vec![Account::new(DEFAULT_ACCOUNT_ID)],
+        }
+        .save(&path)
+        .unwrap();
         assert!(!std::fs::read_to_string(&path).unwrap().contains("twitter"));
 
-        let t = reregistration_twitter(&path, Some("env-auth"), Some("env-ct0")).unwrap();
+        let t =
+            reregistration_twitter(DEFAULT_ACCOUNT_ID, &path, Some("env-auth"), Some("env-ct0"))
+                .unwrap();
         assert_eq!(
             (t.auth_token.as_str(), t.ct0.as_str()),
             ("env-auth", "env-ct0")
         );
         // 環境変数が無ければ空の認証情報で X を呼ばず、設定の不足として失敗する。
-        let err = reregistration_twitter(&path, None, None).unwrap_err();
+        let err = reregistration_twitter(DEFAULT_ACCOUNT_ID, &path, None, None).unwrap_err();
         assert!(matches!(err, AngelicAngelError::Config(_)), "{err}");
     }
 
@@ -739,16 +913,269 @@ mod tests {
         let path = dir.join("angelic-angel.toml");
         write_config(&path, "https://example.com/h");
 
-        let t = reregistration_twitter(&path, Some("env-auth"), Some("env-ct0")).unwrap();
+        let t =
+            reregistration_twitter(DEFAULT_ACCOUNT_ID, &path, Some("env-auth"), Some("env-ct0"))
+                .unwrap();
         assert_eq!(t.auth_token, "env-auth");
-        let t = reregistration_twitter(&path, None, None).unwrap();
+        let t = reregistration_twitter(DEFAULT_ACCOUNT_ID, &path, None, None).unwrap();
         assert_eq!(t.auth_token, "synthetic");
 
         // 片方だけなら、ファイルの値へ黙って戻さずエラーにする。
         for (auth, csrf) in [(Some("env-auth"), None), (None, Some("env-ct0"))] {
-            let err = reregistration_twitter(&path, auth, csrf).unwrap_err();
+            let err = reregistration_twitter(DEFAULT_ACCOUNT_ID, &path, auth, csrf).unwrap_err();
             assert!(matches!(err, AngelicAngelError::Config(_)), "{err}");
         }
+    }
+
+    fn registration_named(uaid: &str) -> Registration {
+        Registration {
+            endpoint: format!("https://push.example/{uaid}"),
+            autopush: config::AutoPushSession {
+                uaid: uaid.into(),
+                channel_id: format!("chan-{uaid}"),
+            },
+            keys: WebPushKeys {
+                public_key: vec![1],
+                private_key: vec![2],
+                auth_secret: vec![3],
+            },
+        }
+    }
+
+    fn account_named(id: &str, webhook: Option<&str>, filter: NotificationFilter) -> Account {
+        let mut account = Account::new(id);
+        account.twitter = TwitterConfig {
+            auth_token: format!("{id}-auth"),
+            ct0: format!("{id}-ct0"),
+        };
+        account.registration = Some(registration_named(id));
+        account.webhook_endpoint = webhook.map(str::to_string);
+        account.webhook_secret = Some(format!("{id}-secret"));
+        account.notification_filter = filter;
+        account
+    }
+
+    fn write_accounts(path: &Path, accounts: Vec<Account>) {
+        Config { accounts }.save(path).unwrap();
+    }
+
+    #[test]
+    fn reregistration_uses_only_the_accounts_own_credentials() {
+        let path = test_temp_dir().join("angelic-angel.toml");
+        let mut empty = Account::new("empty");
+        empty.registration = Some(registration_named("empty"));
+        write_accounts(
+            &path,
+            vec![
+                account_named("default", None, NotificationFilter::default()),
+                account_named("work", None, NotificationFilter::default()),
+                empty,
+            ],
+        );
+
+        // 環境変数は `default` だけに効き、`work` は自分のファイル上の値を使う。
+        let t = reregistration_twitter("work", &path, Some("env-auth"), Some("env-ct0")).unwrap();
+        assert_eq!(
+            (t.auth_token.as_str(), t.ct0.as_str()),
+            ("work-auth", "work-ct0")
+        );
+        let t =
+            reregistration_twitter("default", &path, Some("env-auth"), Some("env-ct0")).unwrap();
+        assert_eq!(t.auth_token, "env-auth");
+        // 認証情報の無いアカウントは、環境変数があっても X を呼ばず失敗する。
+        let err =
+            reregistration_twitter("empty", &path, Some("env-auth"), Some("env-ct0")).unwrap_err();
+        assert!(matches!(err, AngelicAngelError::Config(_)), "{err}");
+        assert!(err.to_string().contains("\"empty\""), "{err}");
+    }
+
+    fn uaid_of(config: &Config, id: &str) -> Option<String> {
+        config
+            .account(id)
+            .and_then(|a| a.registration.as_ref())
+            .map(|r| r.autopush.uaid.clone())
+    }
+
+    #[test]
+    fn reregistration_is_written_back_to_its_own_account_only() {
+        let path = test_temp_dir().join("angelic-angel.toml");
+        let mut work = account_named(
+            "work",
+            Some("https://work.example/h"),
+            NotificationFilter::default(),
+        );
+        work.notification_filter.retweet = false;
+        write_accounts(
+            &path,
+            vec![
+                account_named(
+                    "default",
+                    Some("https://d.example/h"),
+                    only(true, true, true),
+                ),
+                work,
+            ],
+        );
+
+        let saved = save_reregistration(&path, "work", registration_named("work-renewed")).unwrap();
+
+        assert_eq!(saved, ReregistrationSaved::Saved);
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(uaid_of(&loaded, "work").as_deref(), Some("work-renewed"));
+        assert_eq!(uaid_of(&loaded, "default").as_deref(), Some("default"));
+        // 設定の編集は登録の更新で上書きされない。
+        let work = loaded.account("work").unwrap();
+        assert_eq!(
+            work.webhook_endpoint.as_deref(),
+            Some("https://work.example/h")
+        );
+        assert_eq!(work.webhook_secret.as_deref(), Some("work-secret"));
+        assert!(!work.notification_filter.retweet);
+        assert_eq!(work.twitter.auth_token, "work-auth");
+        assert_eq!(
+            loaded
+                .accounts
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "work"]
+        );
+    }
+
+    #[test]
+    fn reregistration_does_not_resurrect_a_registration_removed_concurrently() {
+        let path = test_temp_dir().join("angelic-angel.toml");
+        let mut unregistered = account_named("work", None, NotificationFilter::default());
+        unregistered.registration = None;
+        write_accounts(
+            &path,
+            vec![
+                account_named("default", None, NotificationFilter::default()),
+                unregistered,
+            ],
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let saved = save_reregistration(&path, "work", registration_named("work-renewed")).unwrap();
+
+        assert_eq!(saved, ReregistrationSaved::Unregistered);
+        // ファイルには一切手を入れない。
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(uaid_of(&loaded, "work"), None);
+        assert_eq!(uaid_of(&loaded, "default").as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn reregistration_of_a_removed_account_writes_nothing() {
+        let path = test_temp_dir().join("angelic-angel.toml");
+        write_accounts(
+            &path,
+            vec![account_named(
+                "default",
+                None,
+                NotificationFilter::default(),
+            )],
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let saved = save_reregistration(&path, "work", registration_named("work-renewed")).unwrap();
+
+        assert_eq!(saved, ReregistrationSaved::AccountRemoved);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn account_removal_is_detected_only_from_a_readable_config() {
+        let path = test_temp_dir().join("angelic-angel.toml");
+        // 設定ファイルが無い・読めないときは、一時的な状態かもしれないので止めない。
+        assert!(!account_removed(&path, "work"));
+        std::fs::write(&path, "[[accounts]\nbroken").unwrap();
+        assert!(!account_removed(&path, "work"));
+
+        write_accounts(
+            &path,
+            vec![account_named(
+                "default",
+                None,
+                NotificationFilter::default(),
+            )],
+        );
+        assert!(!account_removed(&path, "default"));
+        assert!(account_removed(&path, "work"));
+        // 全アカウントが消えて空になった設定でも、削除として扱う。
+        write_accounts(&path, Vec::new());
+        assert!(account_removed(&path, "default"));
+    }
+
+    #[test]
+    fn a_removed_account_ends_its_receiver_without_retrying() {
+        let telemetry = Telemetry::default();
+        telemetry.set_connected();
+        let mut retries = 3;
+
+        let next = next_step(
+            "work",
+            SessionOutcome::AccountRemoved,
+            &mut retries,
+            &telemetry,
+        );
+
+        assert!(matches!(next, Next::Finish(Ok(()))));
+        assert_eq!(
+            telemetry.snapshot().0,
+            crate::status::ReceiverState::Stopped
+        );
+        // 再接続の状態は変えない。
+        assert_eq!(retries, 3);
+
+        // 通常の切断は待ってから再接続し、致命的な失敗だけがエラーで終わる。
+        let next = next_step(
+            "work",
+            SessionOutcome::NormalClose,
+            &mut retries,
+            &telemetry,
+        );
+        assert!(matches!(next, Next::Wait(d) if d == Duration::from_secs(1)));
+        assert_eq!(retries, 0);
+        let fatal = SessionOutcome::Fatal(AngelicAngelError::AutoPush("UAID invalid".into()));
+        assert!(matches!(
+            next_step("work", fatal, &mut retries, &telemetry),
+            Next::Finish(Err(_))
+        ));
+        let failed = SessionOutcome::ConnectionFailed(AngelicAngelError::AutoPush("x".into()));
+        assert!(matches!(
+            next_step("work", failed, &mut retries, &telemetry),
+            Next::Wait(d) if d == Duration::from_secs(calc_backoff(1))
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_receiver_of_a_removed_account_stops_before_connecting() {
+        let path = test_temp_dir().join("angelic-angel.toml");
+        write_accounts(
+            &path,
+            vec![account_named(
+                "default",
+                None,
+                NotificationFilter::default(),
+            )],
+        );
+        let telemetry = Telemetry::default();
+
+        // 設定に無いアカウントの受信は、接続を試みずに正常終了する（接続すればここで待たされる）。
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            listen_managed("work", registration_named("work"), &path, &telemetry),
+        )
+        .await
+        .expect("the receiver of a removed account must not keep running");
+
+        assert!(ended.is_ok(), "{ended:?}");
+        assert_eq!(
+            telemetry.snapshot().0,
+            crate::status::ReceiverState::Stopped
+        );
     }
 
     fn encrypted_message(payload: &str) -> (String, WebPushKeys) {
@@ -775,6 +1202,7 @@ mod tests {
         let (data, keys) = encrypted_message(message);
 
         let outcome = handle_notification_data(
+            DEFAULT_ACCOUNT_ID,
             &data,
             &None,
             &keys,
@@ -808,6 +1236,7 @@ mod tests {
         let (data, keys) = encrypted_message(r#"{"title":"Still forwarded"}"#);
 
         let outcome = handle_notification_data(
+            DEFAULT_ACCOUNT_ID,
             &data,
             &None,
             &keys,
@@ -832,6 +1261,7 @@ mod tests {
         let (data, keys) = encrypted_message("not json at all");
 
         handle_notification_data(
+            DEFAULT_ACCOUNT_ID,
             &data,
             &None,
             &keys,
@@ -858,6 +1288,7 @@ mod tests {
         let (data, keys) = encrypted_message(&format!(r#"{{"title":"{title}"}}"#));
 
         let outcome = handle_notification_data(
+            DEFAULT_ACCOUNT_ID,
             &data,
             &None,
             &keys,
@@ -892,6 +1323,7 @@ mod tests {
         let (data, keys) = encrypted_message(r#"{"title":"No config"}"#);
 
         let outcome = handle_notification_data(
+            DEFAULT_ACCOUNT_ID,
             &data,
             &None,
             &keys,
@@ -962,6 +1394,7 @@ mod tests {
             let (data, keys) = encrypted_message(message);
 
             let outcome = handle_notification_data(
+                DEFAULT_ACCOUNT_ID,
                 &data,
                 &None,
                 &keys,
@@ -997,6 +1430,7 @@ mod tests {
         write_config_filtered(&path, Some(&url), filter);
         let (data, keys) = encrypted_message(retweet);
         let outcome = handle_notification_data(
+            DEFAULT_ACCOUNT_ID,
             &data,
             &None,
             &keys,
@@ -1019,6 +1453,7 @@ mod tests {
         write_config_filtered(&path, Some(&url), filter);
         let (data, keys) = encrypted_message(tweet);
         let outcome = handle_notification_data(
+            DEFAULT_ACCOUNT_ID,
             &data,
             &None,
             &keys,
@@ -1078,6 +1513,7 @@ mod tests {
             let (data, keys) = encrypted_message(LOOKED_UP_TWEET);
             let id = format!("chan:8{n}");
             let outcome = handle_notification_data(
+                DEFAULT_ACCOUNT_ID,
                 &data,
                 &None,
                 &keys,
@@ -1100,6 +1536,7 @@ mod tests {
             write_config_filtered(&path, Some(&url), other_disabled);
             let id = format!("chan:9{n}");
             let outcome = handle_notification_data(
+                DEFAULT_ACCOUNT_ID,
                 &data,
                 &None,
                 &keys,
@@ -1158,6 +1595,7 @@ mod tests {
             write_config_filtered(&path, Some(&url), skipped);
             let id = format!("chan:12{n}");
             let outcome = handle_notification_data(
+                DEFAULT_ACCOUNT_ID,
                 &data,
                 &None,
                 &keys,
@@ -1179,6 +1617,7 @@ mod tests {
             write_config_filtered(&path, Some(&url), forwarded);
             let id = format!("chan:13{n}");
             let outcome = handle_notification_data(
+                DEFAULT_ACCOUNT_ID,
                 &data,
                 &None,
                 &keys,
@@ -1235,6 +1674,7 @@ mod tests {
             };
             write_config_filtered(&path, Some(&url), filter);
             let outcome = handle_notification_data(
+                DEFAULT_ACCOUNT_ID,
                 &data,
                 &None,
                 &keys,
@@ -1255,6 +1695,7 @@ mod tests {
             let (url, listener) = silent_webhook().await;
             write_config_filtered(&path, Some(&url), only(false, true, true));
             let outcome = handle_notification_data(
+                DEFAULT_ACCOUNT_ID,
                 &data,
                 &None,
                 &keys,
@@ -1299,6 +1740,7 @@ mod tests {
             let (data, keys) = encrypted_message(message);
             let id = format!("chan:11{n}");
             let outcome = handle_notification_data(
+                DEFAULT_ACCOUNT_ID,
                 &data,
                 &None,
                 &keys,
@@ -1329,6 +1771,7 @@ mod tests {
             encrypted_message(r#"{"title":"Chat","data":{"type":"xchat_message_received"}}"#);
 
         let outcome = handle_notification_data(
+            DEFAULT_ACCOUNT_ID,
             &data,
             &None,
             &keys,
@@ -1353,6 +1796,7 @@ mod tests {
             encrypted_message(r#"{"notification":{"title":"Wrapped"},"data":{"type":"tweet"}}"#);
 
         let outcome = handle_notification_data(
+            DEFAULT_ACCOUNT_ID,
             &data,
             &None,
             &keys,
@@ -1381,6 +1825,7 @@ mod tests {
         let (data, keys) = encrypted_message(&message);
 
         let outcome = handle_notification_data(
+            DEFAULT_ACCOUNT_ID,
             &data,
             &None,
             &keys,
@@ -1406,6 +1851,7 @@ mod tests {
         let (data, keys) = encrypted_message(r#"{"title":"T","data":{"type":"tweet"}}"#);
 
         let outcome = handle_notification_data(
+            DEFAULT_ACCOUNT_ID,
             &data,
             &None,
             &keys,
@@ -1428,6 +1874,7 @@ mod tests {
         let (data, keys) = encrypted_message(r#"{"title":"Kept","data":{"type":"tweet"}}"#);
 
         let result = handle_notification_data(
+            DEFAULT_ACCOUNT_ID,
             &data,
             &None,
             &keys,
@@ -1443,6 +1890,245 @@ mod tests {
         let page = notifications::list(&path, None, 10).unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].title, "Kept");
+    }
+
+    /// アカウントの履歴DBに記録された通知 ID（古い順）。DB が無ければ空。
+    fn history_ids(config: &Path, account_id: &str) -> Vec<String> {
+        let db = notifications::history_path_for(config, account_id);
+        if !db.exists() {
+            return Vec::new();
+        }
+        let conn = rusqlite::Connection::open(db).unwrap();
+        let mut statement = conn
+            .prepare("SELECT id FROM notifications ORDER BY seq")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap();
+        rows.map(|id| id.unwrap()).collect()
+    }
+
+    const TWEET: &str = r#"{"title":"Shared","data":{"type":"tweet"}}"#;
+
+    #[tokio::test]
+    async fn accounts_do_not_share_filter_endpoint_secret_or_history() {
+        let path = test_temp_dir().join("c.toml");
+        let (default_url, default_hook) = silent_webhook().await;
+        let (work_url, work_server) = serve_once(OK_RESPONSE.to_string()).await;
+        write_accounts(
+            &path,
+            vec![
+                // `default` は tweet を転送しない設定。
+                account_named("default", Some(&default_url), only(false, true, true)),
+                account_named("work", Some(&work_url), NotificationFilter::default()),
+            ],
+        );
+        let (data, keys) = encrypted_message(TWEET);
+
+        // `work` は自分の転送先へ、自分の secret で署名して送る。環境変数の secret は使わない。
+        let outcome = handle_notification_data(
+            "work",
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:work",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ForwardOutcome::Forwarded);
+        let captured = work_server.await.unwrap();
+        let header = captured.header("webhook-signature").unwrap();
+        assert!(verifies("work-secret", header, &captured.body));
+        assert!(!verifies(TEST_SECRET, header, &captured.body));
+        assert!(!verifies("default-secret", header, &captured.body));
+        assert!(nothing_was_sent(&default_hook).await);
+
+        // 同じ通知が `default` にも届いても、`default` のフィルターで除外され、どこにも送らない。
+        let outcome = handle_notification_data(
+            "default",
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:default",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ForwardOutcome::Skipped);
+        assert!(nothing_was_sent(&default_hook).await);
+
+        // 履歴はアカウントごとのファイルに、それぞれの通知だけが残る。
+        assert_eq!(history_ids(&path, "work"), ["chan:work"]);
+        assert_eq!(history_ids(&path, "default"), ["chan:default"]);
+        assert_ne!(
+            notifications::history_path_for(&path, "work"),
+            notifications::history_path_for(&path, "default")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_secret_environment_variable_signs_default_only() {
+        let path = test_temp_dir().join("c.toml");
+        let (url, server) = serve_once(OK_RESPONSE.to_string()).await;
+        write_accounts(
+            &path,
+            vec![account_named(
+                "default",
+                Some(&url),
+                NotificationFilter::default(),
+            )],
+        );
+        let (data, keys) = encrypted_message(TWEET);
+
+        let outcome = handle_notification_data(
+            "default",
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:1",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, ForwardOutcome::Forwarded);
+        let captured = server.await.unwrap();
+        let header = captured.header("webhook-signature").unwrap();
+        assert!(verifies(TEST_SECRET, header, &captured.body));
+        assert!(!verifies("default-secret", header, &captured.body));
+    }
+
+    #[tokio::test]
+    async fn another_account_never_falls_back_to_the_environment_secret() {
+        let path = test_temp_dir().join("c.toml");
+        let (url, hook) = silent_webhook().await;
+        let mut work = account_named("work", Some(&url), NotificationFilter::default());
+        work.webhook_secret = None;
+        write_accounts(&path, vec![work]);
+        let (data, keys) = encrypted_message(TWEET);
+
+        let error = handle_notification_data(
+            "work",
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:2",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, AngelicAngelError::Config(_)), "{error}");
+        // どのアカウントの secret が無いかが分かり、値そのものは出ない。
+        let message = error.to_string();
+        assert!(message.contains("\"work\""), "{message}");
+        assert!(!message.contains(TEST_SECRET), "{message}");
+        assert!(nothing_was_sent(&hook).await);
+        assert_eq!(history_ids(&path, "work"), ["chan:2"]);
+    }
+
+    #[test]
+    fn missing_secret_error_names_the_account_without_a_secret_value() {
+        let default = missing_secret_error(DEFAULT_ACCOUNT_ID).to_string();
+        assert!(default.contains(config::WEBHOOK_SECRET_ENV), "{default}");
+        assert!(default.contains("\"default\""), "{default}");
+
+        let other = missing_secret_error("work-2").to_string();
+        assert!(other.contains("\"work-2\""), "{other}");
+        // 環境変数は `default` 専用なので、ほかのアカウントには案内しない。
+        assert!(!other.contains(config::WEBHOOK_SECRET_ENV), "{other}");
+    }
+
+    #[tokio::test]
+    async fn notification_for_a_removed_account_is_neither_recorded_nor_forwarded() {
+        let path = test_temp_dir().join("c.toml");
+        let (url, hook) = silent_webhook().await;
+        write_accounts(
+            &path,
+            vec![account_named(
+                "default",
+                Some(&url),
+                NotificationFilter::default(),
+            )],
+        );
+        let (data, keys) = encrypted_message(TWEET);
+
+        let outcome = handle_notification_data(
+            "ghost",
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:3",
+            Some(TEST_SECRET),
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, ForwardOutcome::AccountRemoved);
+        assert!(nothing_was_sent(&hook).await);
+        // 削除済みのアカウントの履歴ファイルを作り直さない。
+        assert!(!notifications::history_path_for(&path, "ghost").exists());
+        assert!(history_ids(&path, "default").is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_config_edits_apply_to_the_next_notification_of_that_account() {
+        let path = test_temp_dir().join("c.toml");
+        let (url, server) = serve_once(OK_RESPONSE.to_string()).await;
+        let (other_url, other_hook) = silent_webhook().await;
+        write_accounts(
+            &path,
+            vec![
+                account_named("default", Some(&other_url), NotificationFilter::default()),
+                account_named("work", None, NotificationFilter::default()),
+            ],
+        );
+        let (data, keys) = encrypted_message(TWEET);
+
+        let skipped = handle_notification_data(
+            "work",
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:4",
+            None,
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(skipped, ForwardOutcome::Skipped);
+
+        // 受信中に `work` の転送先だけを設定しても、次の通知から反映される。
+        let mut config = Config::load(&path).unwrap();
+        config.account_mut("work").unwrap().webhook_endpoint = Some(url);
+        config.save(&path).unwrap();
+        let forwarded = handle_notification_data(
+            "work",
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:5",
+            None,
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(forwarded, ForwardOutcome::Forwarded);
+        assert!(server.await.unwrap().header("webhook-signature").is_some());
+        assert!(nothing_was_sent(&other_hook).await);
     }
 
     fn hex_decode(hex: &str) -> Vec<u8> {
@@ -1547,6 +2233,7 @@ mod tests {
             .as_secs();
 
         let outcome = handle_notification_data(
+            DEFAULT_ACCOUNT_ID,
             &data,
             &None,
             &keys,
@@ -1602,6 +2289,7 @@ mod tests {
             let (data, keys) = encrypted_message(r#"{"title":"Unsigned","data":{"type":"tweet"}}"#);
 
             let result = handle_notification_data(
+                DEFAULT_ACCOUNT_ID,
                 &data,
                 &None,
                 &keys,
@@ -1628,10 +2316,18 @@ mod tests {
         let (url, listener) = silent_webhook().await;
         write_config_filtered(&path, Some(&url), only(false, true, true));
         let (data, keys) = encrypted_message(r#"{"title":"F","data":{"type":"tweet"}}"#);
-        let outcome =
-            handle_notification_data(&data, &None, &keys, &path, "chan:50", None, &no_lookup())
-                .await
-                .unwrap();
+        let outcome = handle_notification_data(
+            DEFAULT_ACCOUNT_ID,
+            &data,
+            &None,
+            &keys,
+            &path,
+            "chan:50",
+            None,
+            &no_lookup(),
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome, ForwardOutcome::Skipped);
         assert!(nothing_was_sent(&listener).await);
         assert_eq!(notifications::list(&path, None, 10).unwrap().items.len(), 1);
@@ -1640,6 +2336,7 @@ mod tests {
         write_config_with(&path, None);
         let (data, keys) = encrypted_message(r#"{"title":"U"}"#);
         let outcome = handle_notification_data(
+            DEFAULT_ACCOUNT_ID,
             &data,
             &None,
             &keys,
@@ -1661,6 +2358,7 @@ mod tests {
         let (data, keys) = encrypted_message(r#"{"title":"Plain","data":{"type":"tweet"}}"#);
 
         let result = handle_notification_data(
+            DEFAULT_ACCOUNT_ID,
             &data,
             &None,
             &keys,
@@ -1689,6 +2387,7 @@ mod tests {
         let (data, keys) = encrypted_message(r#"{"title":"Moved","data":{"type":"tweet"}}"#);
 
         let outcome = handle_notification_data(
+            DEFAULT_ACCOUNT_ID,
             &data,
             &None,
             &keys,

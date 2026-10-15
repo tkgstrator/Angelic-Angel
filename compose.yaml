@@ -5,6 +5,9 @@ services:
     restart: unless-stopped
     stop_signal: SIGINT
     # Optional; requires Docker Compose 2.24+ for `required: false`.
+    # The variables in .env (TWITTER_AUTH_TOKEN, TWITTER_CSRF_TOKEN, WEBHOOK_ENDPOINT,
+    # WEBHOOK_SECRET_KEY) apply to the `default` account only. Run more than one account
+    # in this one container by listing them as `[[accounts]]` in ./config/angelic-angel.toml.
     env_file:
       - path: .env
         required: false
@@ -13,6 +16,8 @@ services:
     # Mount the directory, not the file: saves go through a temp file + rename, and the
     # lock and the notification history live next to the config. No chown or `user:` is
     # needed: the container drops to the owner of the config file, else of ./config
-    # (65532 if root owns both).
+    # (65532 if root owns both). The config file is also where every account lives
+    # (`[[accounts]]`); an older single-account file is backed up once to
+    # angelic-angel.toml.legacy.bak on its first save, so back up ./config before upgrading.
     volumes:
       - ./config:/config

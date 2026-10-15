@@ -80,6 +80,7 @@ export interface SettingsInput {
   authToken: string
   ct0: string
   webhook: string
+  webhookSecret: string
 }
 
 export type SettingsErrors = Partial<Record<keyof SettingsInput, string>>
@@ -107,6 +108,12 @@ export function validate(input: SettingsInput, settings: SettingsDto): SettingsE
     } else if (hasControl(v)) {
       errors[key] = `${name} に使用できない文字が含まれています。`
     }
+  }
+  const secret = input.webhookSecret.trim()
+  if (secret.length > MAX_SECRET) {
+    errors.webhookSecret = 'Webhook secret が長すぎます。'
+  } else if (hasControl(secret)) {
+    errors.webhookSecret = 'Webhook secret に使用できない文字が含まれています。'
   }
   const url = input.webhook.trim()
   if (url !== '' && settings.webhook_source !== 'environment') {
@@ -171,14 +178,14 @@ function CheckResult({ check }: { check: Check }) {
   )
 }
 
-export function Settings() {
-  const { data, error, loading, reload, setData } = useLoad(api.getSettings)
+export function Settings({ accountId }: { accountId: string }) {
+  const { data, error, loading, reload, setData } = useLoad(() => api.getSettings(accountId))
   const lock = useExclusive()
   const [syncError, setSyncError] = useState<string | null>(null)
 
   async function refresh() {
     try {
-      setData(await api.getSettings())
+      setData(await api.getSettings(accountId))
       setSyncError(null)
     } catch (e) {
       setSyncError(errorText(e))
@@ -217,20 +224,27 @@ export function Settings() {
           </Button>
         </div>
       )}
-      <SettingsForm settings={data} lock={lock} onSaved={setData} />
+      <SettingsForm accountId={accountId} settings={data} lock={lock} onSaved={setData} />
       <Separator />
-      <Registration configured={data.configured} lock={lock} onChanged={refresh} />
+      <Registration
+        accountId={accountId}
+        configured={data.configured}
+        lock={lock}
+        onChanged={refresh}
+      />
       <Separator />
-      <FollowingNotifications configured={data.configured} lock={lock} />
+      <FollowingNotifications accountId={accountId} configured={data.configured} lock={lock} />
     </Screen>
   )
 }
 
 function SettingsForm({
+  accountId,
   settings,
   lock,
   onSaved,
 }: {
+  accountId: string
   settings: SettingsDto
   lock: Exclusive
   onSaved: (s: SettingsDto) => void
@@ -239,6 +253,7 @@ function SettingsForm({
   const [authToken, setAuthToken] = useState('')
   const [ct0, setCt0] = useState('')
   const [webhook, setWebhook] = useState(settings.webhook_endpoint ?? '')
+  const [webhookSecret, setWebhookSecret] = useState('')
   const [filter, setFilter] = useState(settings.notification_filter)
   const [errors, setErrors] = useState<SettingsErrors>({})
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null)
@@ -258,7 +273,7 @@ function SettingsForm({
   async function runCheck() {
     setCheck({ kind: 'checking' })
     try {
-      const r = await api.validateSettings()
+      const r = await api.validateSettings(accountId)
       setCheck(
         r.valid === true
           ? {
@@ -278,15 +293,16 @@ function SettingsForm({
   function submit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault()
     setResult(null)
-    const found = validate({ authToken, ct0, webhook }, settings)
+    const found = validate({ authToken, ct0, webhook, webhookSecret }, settings)
     setErrors(found)
     if (Object.keys(found).length > 0) return
     return lock.run('save', async () => {
       let saved: SettingsDto
       try {
-        saved = await api.putSettings({
+        saved = await api.putSettings(accountId, {
           auth_token: authToken.trim() || null,
           ct0: ct0.trim() || null,
+          webhook_secret: webhookSecret.trim() || null,
           webhook_endpoint: envLocked ? (settings.webhook_endpoint ?? '') : webhook.trim(),
           notification_filter: filter,
         })
@@ -296,6 +312,7 @@ function SettingsForm({
       }
       setAuthToken('')
       setCt0('')
+      setWebhookSecret('')
       setWebhook(saved.webhook_endpoint ?? '')
       setFilter(saved.notification_filter)
       onSaved(saved)
@@ -388,7 +405,7 @@ function SettingsForm({
         <Separator />
         <Section
           title="転送先"
-          description="受信した通知を転送する Webhook の URL です。"
+          description="受信した通知を転送する Webhook の URL と、署名に使う secret です。"
           disabled={busy}
         >
           <div className="space-y-2">
@@ -411,6 +428,25 @@ function SettingsForm({
               {envLocked
                 ? '。環境変数が優先されるため、ここでは変更できません。'
                 : '。空欄で保存すると設定を削除します。'}
+            </p>
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor={`${id}-secret`}>
+              Webhook secret <Indicator set={settings.webhook_secret_set} />
+            </Label>
+            <Input
+              id={`${id}-secret`}
+              type="password"
+              autoComplete="off"
+              spellCheck={false}
+              className="h-10"
+              value={webhookSecret}
+              onChange={(e) => setWebhookSecret(e.currentTarget.value)}
+              {...fieldProps('webhookSecret')}
+            />
+            {fieldError('webhookSecret')}
+            <p className="text-sm text-muted-foreground">
+              転送リクエストの署名に使います。保存済みの値は表示されません。空欄のまま保存すると、保存済みの値は変更されません。
             </p>
           </div>
         </Section>

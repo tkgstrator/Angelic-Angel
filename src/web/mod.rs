@@ -8,18 +8,19 @@ use crate::config::ConfigLock;
 use crate::error::{AngelicAngelError, Result};
 use axum::body::Bytes;
 use axum::extract::DefaultBodyLimit;
-use axum::extract::{FromRequest, Request, State};
+use axum::extract::{FromRequest, Path as UrlPath, Request, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
 use error::ApiError;
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use service::{Backend, LiveBackend, Service, SettingsUpdate};
+use service::{Accounts, Backend, Environment, LiveBackend, SettingsUpdate};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +29,7 @@ use tower_http::services::{ServeDir, ServeFile};
 const MAX_BODY: usize = 16 * 1024;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
-type Shared<B> = Arc<Service<B>>;
+type Shared<B> = Arc<Accounts<B>>;
 type ApiResult<T> = std::result::Result<Json<T>, ApiError>;
 
 /// JSON body extractor that reports failures in the API error shape.
@@ -85,66 +86,111 @@ async fn health() -> Response {
     response
 }
 
-async fn get_settings<B: Backend>(State(s): State<Shared<B>>) -> ApiResult<service::SettingsDto> {
-    Ok(Json(s.settings()?))
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewAccount {
+    id: String,
+}
+
+async fn list_accounts<B: Backend>(
+    State(a): State<Shared<B>>,
+) -> ApiResult<service::AccountListDto> {
+    Ok(Json(a.list()?))
+}
+
+async fn create_account<B: Backend>(
+    State(a): State<Shared<B>>,
+    ApiJson(new): ApiJson<NewAccount>,
+) -> std::result::Result<(StatusCode, Json<service::AccountDto>), ApiError> {
+    Ok((StatusCode::CREATED, Json(a.create(&new.id)?)))
+}
+
+async fn delete_account<B: Backend>(
+    State(a): State<Shared<B>>,
+    UrlPath(id): UrlPath<String>,
+) -> std::result::Result<StatusCode, ApiError> {
+    a.delete(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_settings<B: Backend>(
+    State(a): State<Shared<B>>,
+    UrlPath(id): UrlPath<String>,
+) -> ApiResult<service::SettingsDto> {
+    Ok(Json(a.get(&id)?.settings()?))
 }
 
 async fn put_settings<B: Backend>(
-    State(s): State<Shared<B>>,
+    State(a): State<Shared<B>>,
+    UrlPath(id): UrlPath<String>,
     ApiJson(update): ApiJson<SettingsUpdate>,
 ) -> ApiResult<service::SettingsDto> {
-    Ok(Json(s.update_settings(update).await?))
+    Ok(Json(a.get(&id)?.update_settings(update).await?))
 }
 
 async fn validate_settings<B: Backend>(
-    State(s): State<Shared<B>>,
+    State(a): State<Shared<B>>,
+    UrlPath(id): UrlPath<String>,
 ) -> ApiResult<service::CredentialCheckDto> {
-    Ok(Json(s.validate_credentials().await?))
+    Ok(Json(a.get(&id)?.validate_credentials().await?))
 }
 
 async fn get_registration<B: Backend>(
-    State(s): State<Shared<B>>,
+    State(a): State<Shared<B>>,
+    UrlPath(id): UrlPath<String>,
 ) -> ApiResult<service::RegistrationDto> {
-    Ok(Json(s.registration()?))
+    Ok(Json(a.get(&id)?.registration()?))
 }
 
-async fn register<B: Backend>(State(s): State<Shared<B>>) -> ApiResult<service::RegistrationDto> {
-    Ok(Json(s.register().await?))
+async fn register<B: Backend>(
+    State(a): State<Shared<B>>,
+    UrlPath(id): UrlPath<String>,
+) -> ApiResult<service::RegistrationDto> {
+    Ok(Json(a.get(&id)?.register().await?))
 }
 
-async fn unregister<B: Backend>(State(s): State<Shared<B>>) -> ApiResult<service::RegistrationDto> {
-    Ok(Json(s.unregister().await?))
+async fn unregister<B: Backend>(
+    State(a): State<Shared<B>>,
+    UrlPath(id): UrlPath<String>,
+) -> ApiResult<service::RegistrationDto> {
+    Ok(Json(a.get(&id)?.unregister().await?))
 }
 
-async fn get_status<B: Backend>(State(s): State<Shared<B>>) -> Json<service::StatusDto> {
-    Json(s.status())
+async fn get_status<B: Backend>(
+    State(a): State<Shared<B>>,
+    UrlPath(id): UrlPath<String>,
+) -> ApiResult<service::StatusDto> {
+    Ok(Json(a.get(&id)?.status()?))
 }
 
 async fn get_following_notifications<B: Backend>(
-    State(s): State<Shared<B>>,
-) -> Json<following::FollowingNotificationsDto> {
-    Json(s.following_notifications())
+    State(a): State<Shared<B>>,
+    UrlPath(id): UrlPath<String>,
+) -> ApiResult<following::FollowingNotificationsDto> {
+    Ok(Json(a.get(&id)?.following_notifications()))
 }
 
 async fn start_following_notifications<B: Backend>(
-    State(s): State<Shared<B>>,
+    State(a): State<Shared<B>>,
+    UrlPath(id): UrlPath<String>,
 ) -> std::result::Result<(StatusCode, Json<following::FollowingNotificationsDto>), ApiError> {
     Ok((
         StatusCode::ACCEPTED,
-        Json(s.start_following_notifications()?),
+        Json(a.get(&id)?.start_following_notifications()?),
     ))
 }
 
 async fn cancel_following_notifications<B: Backend>(
-    State(s): State<Shared<B>>,
-) -> (StatusCode, Json<following::FollowingNotificationsDto>) {
-    let (requested, snapshot) = s.cancel_following_notifications();
+    State(a): State<Shared<B>>,
+    UrlPath(id): UrlPath<String>,
+) -> std::result::Result<(StatusCode, Json<following::FollowingNotificationsDto>), ApiError> {
+    let (requested, snapshot) = a.get(&id)?.cancel_following_notifications();
     let status = if requested {
         StatusCode::ACCEPTED
     } else {
         StatusCode::OK
     };
-    (status, Json(snapshot))
+    Ok((status, Json(snapshot)))
 }
 
 const DEFAULT_PAGE_LIMIT: usize = 50;
@@ -200,11 +246,15 @@ fn parse_page_query(raw: Option<&str>) -> std::result::Result<PageQuery, ApiErro
 }
 
 async fn get_notifications<B: Backend>(
-    State(s): State<Shared<B>>,
+    State(a): State<Shared<B>>,
+    UrlPath(id): UrlPath<String>,
     req: Request,
 ) -> ApiResult<crate::notifications::NotificationPage> {
+    let service = a.get(&id)?;
     let query = parse_page_query(req.uri().query())?;
-    Ok(Json(s.notifications(query.before, query.limit).await?))
+    Ok(Json(
+        service.notifications(query.before, query.limit).await?,
+    ))
 }
 
 async fn api_not_found() -> ApiError {
@@ -295,29 +345,40 @@ async fn missing_assets() -> Response {
 
 // ---- router -----------------------------------------------------------------
 
-pub fn router<B: Backend>(service: Shared<B>, assets_dir: &Path) -> Router {
+pub fn router<B: Backend>(accounts: Shared<B>, assets_dir: &Path) -> Router {
     let api = Router::new()
         .route(
-            "/api/settings",
+            "/api/accounts",
+            get(list_accounts::<B>).post(create_account::<B>),
+        )
+        .route("/api/accounts/{id}", delete(delete_account::<B>))
+        .route(
+            "/api/accounts/{id}/settings",
             get(get_settings::<B>).put(put_settings::<B>),
         )
-        .route("/api/settings/validate", post(validate_settings::<B>))
         .route(
-            "/api/registration",
+            "/api/accounts/{id}/settings/validate",
+            post(validate_settings::<B>),
+        )
+        .route(
+            "/api/accounts/{id}/registration",
             get(get_registration::<B>).delete(unregister::<B>),
         )
-        .route("/api/register", post(register::<B>))
-        .route("/api/status", get(get_status::<B>))
-        .route("/api/notifications", get(get_notifications::<B>))
+        .route("/api/accounts/{id}/register", post(register::<B>))
+        .route("/api/accounts/{id}/status", get(get_status::<B>))
         .route(
-            "/api/following-notifications",
+            "/api/accounts/{id}/notifications",
+            get(get_notifications::<B>),
+        )
+        .route(
+            "/api/accounts/{id}/following-notifications",
             get(get_following_notifications::<B>)
                 .post(start_following_notifications::<B>)
                 .delete(cancel_following_notifications::<B>),
         )
         .route("/api", any(api_not_found))
         .route("/api/{*rest}", any(api_not_found))
-        .with_state(service)
+        .with_state(accounts)
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn(api_guard));
 
@@ -367,11 +428,16 @@ async fn shutdown_signal() {
     }
 }
 
-/// Runs the WebUI server until SIGINT/SIGTERM, then stops the owned receiver.
+/// Runs the WebUI server until SIGINT/SIGTERM, then stops the receivers of all accounts.
 pub async fn serve(config_path: PathBuf, bind: String, assets_dir: PathBuf) -> Result<()> {
     let _lock = ConfigLock::acquire(&config_path)?;
 
-    let service = Arc::new(Service::new(LiveBackend::default(), config_path));
+    let environment = Environment::from_process()?;
+    let service = Arc::new(Accounts::new(
+        LiveBackend::default(),
+        config_path,
+        environment,
+    ));
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .map_err(|e| AngelicAngelError::Config(format!("failed to bind {bind}: {e}")))?;
@@ -403,7 +469,7 @@ pub async fn serve(config_path: PathBuf, bind: String, assets_dir: PathBuf) -> R
 mod tests {
     use super::service::fake::FakeBackend;
     use super::*;
-    use crate::config::{self, Config};
+    use crate::config;
     use serde_json::{Value, json};
 
     struct Harness {
@@ -412,6 +478,7 @@ mod tests {
         config_path: PathBuf,
         assets: PathBuf,
         fake: Arc<FakeBackend>,
+        accounts: Arc<Accounts<Arc<FakeBackend>>>,
         _task: tokio::task::JoinHandle<()>,
     }
 
@@ -432,16 +499,20 @@ mod tests {
                 next_cursor: 0,
             }),
         );
-        let service = Arc::new(
-            Service::new(Arc::clone(&fake), config_path.clone()).with_following_timings(
-                following::Timings {
-                    request_timeout: Duration::from_millis(150),
-                    interval: Duration::from_millis(1),
-                    max_duration: Duration::from_secs(30),
-                },
-            ),
+        let accounts = Arc::new(
+            Accounts::new(
+                Arc::clone(&fake),
+                config_path.clone(),
+                service::Environment::default(),
+            )
+            .with_following_timings(following::Timings {
+                request_timeout: Duration::from_millis(150),
+                interval: Duration::from_millis(1),
+                max_duration: Duration::from_secs(30),
+            }),
         );
-        let app = router(service, &assets);
+        accounts.create("default").unwrap();
+        let app = router(Arc::clone(&accounts), &assets);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
@@ -453,6 +524,7 @@ mod tests {
             config_path,
             assets,
             fake,
+            accounts,
             _task: task,
         }
     }
@@ -480,7 +552,7 @@ mod tests {
         assert_eq!(health.status(), 200);
 
         let ok = h
-            .req(reqwest::Method::GET, "/api/settings")
+            .req(reqwest::Method::GET, "/api/accounts/default/settings")
             .send()
             .await
             .unwrap();
@@ -537,7 +609,7 @@ mod tests {
         assert_eq!(page.status(), 503);
         assert!(page.text().await.unwrap().contains("WEBUI_ASSETS_DIR"));
         let ok = h
-            .req(reqwest::Method::GET, "/api/status")
+            .req(reqwest::Method::GET, "/api/accounts/default/status")
             .send()
             .await
             .unwrap();
@@ -553,17 +625,21 @@ mod tests {
         let host = h.base.trim_start_matches("http://").to_string();
 
         let bad = h
-            .req(reqwest::Method::PUT, "/api/settings")
+            .req(reqwest::Method::PUT, "/api/accounts/default/settings")
             .header("Origin", "http://evil.example")
             .json(&setup_body())
             .send()
             .await
             .unwrap();
         assert_eq!(bad.status(), 403);
-        assert!(!h.config_path.exists());
+        assert!(
+            config::test_default_account(&h.config_path)
+                .twitter
+                .is_empty()
+        );
 
         let good = h
-            .req(reqwest::Method::PUT, "/api/settings")
+            .req(reqwest::Method::PUT, "/api/accounts/default/settings")
             .header("Origin", format!("http://{host}"))
             .json(&setup_body())
             .send()
@@ -572,11 +648,11 @@ mod tests {
         assert_eq!(good.status(), 200);
 
         for path in [
-            "/api/settings",
-            "/api/registration",
-            "/api/status",
-            "/api/notifications",
-            "/api/following-notifications",
+            "/api/accounts/default/settings",
+            "/api/accounts/default/registration",
+            "/api/accounts/default/status",
+            "/api/accounts/default/notifications",
+            "/api/accounts/default/following-notifications",
             "/api/nope",
         ] {
             let read = h
@@ -593,7 +669,7 @@ mod tests {
         }
 
         let same_origin_read = h
-            .req(reqwest::Method::GET, "/api/settings")
+            .req(reqwest::Method::GET, "/api/accounts/default/settings")
             .header("Origin", format!("http://{host}"))
             .header("Sec-Fetch-Site", "same-origin")
             .send()
@@ -602,7 +678,7 @@ mod tests {
         assert_eq!(same_origin_read.status(), 200);
 
         let direct_navigation = h
-            .req(reqwest::Method::GET, "/api/settings")
+            .req(reqwest::Method::GET, "/api/accounts/default/settings")
             .header("Sec-Fetch-Site", "none")
             .send()
             .await
@@ -620,14 +696,18 @@ mod tests {
             reqwest::Method::DELETE,
         ] {
             let resp = h
-                .req(method, "/api/registration")
+                .req(method, "/api/accounts/default/registration")
                 .header("Sec-Fetch-Site", "cross-site")
                 .send()
                 .await
                 .unwrap();
             assert_eq!(resp.status(), 403);
         }
-        assert!(!h.config_path.exists());
+        assert!(
+            config::test_default_account(&h.config_path)
+                .twitter
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -635,7 +715,7 @@ mod tests {
         let h = harness(true).await;
         let big = json!({"webhook_endpoint": "x".repeat(20 * 1024)});
         let resp = h
-            .req(reqwest::Method::PUT, "/api/settings")
+            .req(reqwest::Method::PUT, "/api/accounts/default/settings")
             .json(&big)
             .send()
             .await
@@ -645,7 +725,7 @@ mod tests {
         assert_eq!(body["error"]["code"], "payload_too_large");
 
         let resp = h
-            .req(reqwest::Method::PUT, "/api/settings")
+            .req(reqwest::Method::PUT, "/api/accounts/default/settings")
             .header("Content-Type", "application/json")
             .body("{not json")
             .send()
@@ -656,7 +736,7 @@ mod tests {
         assert_eq!(body["error"]["code"], "invalid_body");
 
         let resp = h
-            .req(reqwest::Method::PUT, "/api/settings")
+            .req(reqwest::Method::PUT, "/api/accounts/default/settings")
             .header("Content-Type", "text/plain")
             .body("x")
             .send()
@@ -669,7 +749,7 @@ mod tests {
     async fn settings_flow_never_returns_secrets() {
         let h = harness(true).await;
         let first_without_ct0 = h
-            .req(reqwest::Method::PUT, "/api/settings")
+            .req(reqwest::Method::PUT, "/api/accounts/default/settings")
             .json(&json!({"auth_token":"A","webhook_endpoint":""}))
             .send()
             .await
@@ -677,7 +757,7 @@ mod tests {
         assert_eq!(first_without_ct0.status(), 400);
 
         let saved = h
-            .req(reqwest::Method::PUT, "/api/settings")
+            .req(reqwest::Method::PUT, "/api/accounts/default/settings")
             .json(&setup_body())
             .send()
             .await
@@ -694,7 +774,7 @@ mod tests {
         assert_eq!(dto["webhook_source"], "config");
 
         let reg = h
-            .req(reqwest::Method::GET, "/api/registration")
+            .req(reqwest::Method::GET, "/api/accounts/default/registration")
             .send()
             .await
             .unwrap();
@@ -705,14 +785,14 @@ mod tests {
         );
 
         let bad_url = h
-            .req(reqwest::Method::PUT, "/api/settings")
+            .req(reqwest::Method::PUT, "/api/accounts/default/settings")
             .json(&json!({"webhook_endpoint":"ftp://x"}))
             .send()
             .await
             .unwrap();
         assert_eq!(bad_url.status(), 400);
         assert_eq!(
-            Config::load(&h.config_path).unwrap().twitter.ct0,
+            config::test_default_account(&h.config_path).twitter.ct0,
             "CT0-SECRET"
         );
     }
@@ -721,19 +801,19 @@ mod tests {
     async fn register_and_unregister_over_http() {
         let h = harness(true).await;
         let no_config = h
-            .req(reqwest::Method::POST, "/api/register")
+            .req(reqwest::Method::POST, "/api/accounts/default/register")
             .send()
             .await
             .unwrap();
         assert_eq!(no_config.status(), 409);
 
-        h.req(reqwest::Method::PUT, "/api/settings")
+        h.req(reqwest::Method::PUT, "/api/accounts/default/settings")
             .json(&setup_body())
             .send()
             .await
             .unwrap();
         let reg: Value = h
-            .req(reqwest::Method::POST, "/api/register")
+            .req(reqwest::Method::POST, "/api/accounts/default/register")
             .send()
             .await
             .unwrap()
@@ -744,7 +824,7 @@ mod tests {
         assert!(reg["uaid"].is_string());
 
         let status: Value = h
-            .req(reqwest::Method::GET, "/api/status")
+            .req(reqwest::Method::GET, "/api/accounts/default/status")
             .send()
             .await
             .unwrap()
@@ -755,7 +835,10 @@ mod tests {
         assert_eq!(status["state"], "connected");
 
         let gone: Value = h
-            .req(reqwest::Method::DELETE, "/api/registration")
+            .req(
+                reqwest::Method::DELETE,
+                "/api/accounts/default/registration",
+            )
             .send()
             .await
             .unwrap()
@@ -770,7 +853,7 @@ mod tests {
         let h = harness(true).await;
         std::fs::write(&h.config_path, "this is [not valid toml").unwrap();
         let resp = h
-            .req(reqwest::Method::GET, "/api/settings")
+            .req(reqwest::Method::GET, "/api/accounts/default/settings")
             .send()
             .await
             .unwrap();
@@ -779,7 +862,7 @@ mod tests {
         assert!(text.contains("config_invalid"));
         assert!(!text.contains("toml"));
         let status: Value = h
-            .req(reqwest::Method::GET, "/api/status")
+            .req(reqwest::Method::GET, "/api/accounts/default/status")
             .send()
             .await
             .unwrap()
@@ -796,10 +879,13 @@ mod tests {
     async fn poll_state(h: &Harness, wanted: &[&str]) -> Value {
         for _ in 0..500 {
             let body = json_of(
-                h.req(reqwest::Method::GET, "/api/following-notifications")
-                    .send()
-                    .await
-                    .unwrap(),
+                h.req(
+                    reqwest::Method::GET,
+                    "/api/accounts/default/following-notifications",
+                )
+                .send()
+                .await
+                .unwrap(),
             )
             .await;
             if wanted.contains(&body["state"].as_str().unwrap()) {
@@ -814,7 +900,10 @@ mod tests {
     async fn following_notifications_endpoint_lifecycle() {
         let h = harness(true).await;
         let idle = h
-            .req(reqwest::Method::GET, "/api/following-notifications")
+            .req(
+                reqwest::Method::GET,
+                "/api/accounts/default/following-notifications",
+            )
             .send()
             .await
             .unwrap();
@@ -833,14 +922,20 @@ mod tests {
         );
 
         let cancel_idle = h
-            .req(reqwest::Method::DELETE, "/api/following-notifications")
+            .req(
+                reqwest::Method::DELETE,
+                "/api/accounts/default/following-notifications",
+            )
             .send()
             .await
             .unwrap();
         assert_eq!(cancel_idle.status(), 200);
 
         let unconfigured = h
-            .req(reqwest::Method::POST, "/api/following-notifications")
+            .req(
+                reqwest::Method::POST,
+                "/api/accounts/default/following-notifications",
+            )
             .send()
             .await
             .unwrap();
@@ -850,13 +945,16 @@ mod tests {
             "not_configured"
         );
 
-        h.req(reqwest::Method::PUT, "/api/settings")
+        h.req(reqwest::Method::PUT, "/api/accounts/default/settings")
             .json(&setup_body())
             .send()
             .await
             .unwrap();
         let started = h
-            .req(reqwest::Method::POST, "/api/following-notifications")
+            .req(
+                reqwest::Method::POST,
+                "/api/accounts/default/following-notifications",
+            )
             .send()
             .await
             .unwrap();
@@ -878,7 +976,7 @@ mod tests {
     #[tokio::test]
     async fn following_notifications_conflict_cancel_and_credential_lock() {
         let h = harness(true).await;
-        h.req(reqwest::Method::PUT, "/api/settings")
+        h.req(reqwest::Method::PUT, "/api/accounts/default/settings")
             .json(&setup_body())
             .send()
             .await
@@ -888,13 +986,19 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
         let first = h
-            .req(reqwest::Method::POST, "/api/following-notifications")
+            .req(
+                reqwest::Method::POST,
+                "/api/accounts/default/following-notifications",
+            )
             .send()
             .await
             .unwrap();
         assert_eq!(first.status(), 202);
         let second = h
-            .req(reqwest::Method::POST, "/api/following-notifications")
+            .req(
+                reqwest::Method::POST,
+                "/api/accounts/default/following-notifications",
+            )
             .send()
             .await
             .unwrap();
@@ -905,19 +1009,24 @@ mod tests {
         );
 
         let locked = h
-            .req(reqwest::Method::PUT, "/api/settings")
+            .req(reqwest::Method::PUT, "/api/accounts/default/settings")
             .json(&json!({"auth_token":"NEW","webhook_endpoint":""}))
             .send()
             .await
             .unwrap();
         assert_eq!(locked.status(), 409);
         assert_eq!(
-            Config::load(&h.config_path).unwrap().twitter.auth_token,
+            config::test_default_account(&h.config_path)
+                .twitter
+                .auth_token,
             "AUTH-SECRET"
         );
 
         let cancel = h
-            .req(reqwest::Method::DELETE, "/api/following-notifications")
+            .req(
+                reqwest::Method::DELETE,
+                "/api/accounts/default/following-notifications",
+            )
             .send()
             .await
             .unwrap();
@@ -933,16 +1042,19 @@ mod tests {
     #[tokio::test]
     async fn following_notifications_surface_x_failures_without_success_spoofing() {
         let h = harness(true).await;
-        h.req(reqwest::Method::PUT, "/api/settings")
+        h.req(reqwest::Method::PUT, "/api/accounts/default/settings")
             .json(&setup_body())
             .send()
             .await
             .unwrap();
         *h.fake.screen_error.lock().unwrap() = Some(crate::twitter::XError::Forbidden);
-        h.req(reqwest::Method::POST, "/api/following-notifications")
-            .send()
-            .await
-            .unwrap();
+        h.req(
+            reqwest::Method::POST,
+            "/api/accounts/default/following-notifications",
+        )
+        .send()
+        .await
+        .unwrap();
         let done = poll_state(&h, &["completed", "failed", "cancelled"]).await;
         assert_eq!(done["state"], "failed");
         assert!(done["last_error"].as_str().unwrap().contains("403"));
@@ -953,7 +1065,7 @@ mod tests {
     async fn notifications_endpoint_validates_query_and_pages() {
         let h = harness(true).await;
         let empty = h
-            .req(reqwest::Method::GET, "/api/notifications")
+            .req(reqwest::Method::GET, "/api/accounts/default/notifications")
             .send()
             .await
             .unwrap();
@@ -985,10 +1097,13 @@ mod tests {
             .unwrap();
         }
         let page = json_of(
-            h.req(reqwest::Method::GET, "/api/notifications?limit=2")
-                .send()
-                .await
-                .unwrap(),
+            h.req(
+                reqwest::Method::GET,
+                "/api/accounts/default/notifications?limit=2",
+            )
+            .send()
+            .await
+            .unwrap(),
         )
         .await;
         assert_eq!(page["items"].as_array().unwrap().len(), 2);
@@ -998,7 +1113,7 @@ mod tests {
         let rest = json_of(
             h.req(
                 reqwest::Method::GET,
-                &format!("/api/notifications?limit=2&before={cursor}"),
+                &format!("/api/accounts/default/notifications?limit=2&before={cursor}"),
             )
             .send()
             .await
@@ -1020,7 +1135,10 @@ mod tests {
             "foo=1",
         ] {
             let resp = h
-                .req(reqwest::Method::GET, &format!("/api/notifications?{bad}"))
+                .req(
+                    reqwest::Method::GET,
+                    &format!("/api/accounts/default/notifications?{bad}"),
+                )
                 .send()
                 .await
                 .unwrap();
@@ -1031,7 +1149,10 @@ mod tests {
         }
 
         let max = h
-            .req(reqwest::Method::GET, "/api/notifications?limit=100")
+            .req(
+                reqwest::Method::GET,
+                "/api/accounts/default/notifications?limit=100",
+            )
             .send()
             .await
             .unwrap();
@@ -1052,7 +1173,7 @@ mod tests {
         });
 
         let first = json_of(
-            h.req(reqwest::Method::PUT, "/api/settings")
+            h.req(reqwest::Method::PUT, "/api/accounts/default/settings")
                 .json(&setup_body())
                 .send()
                 .await
@@ -1085,7 +1206,7 @@ mod tests {
             "other": false
         });
         let saved = json_of(
-            h.req(reqwest::Method::PUT, "/api/settings")
+            h.req(reqwest::Method::PUT, "/api/accounts/default/settings")
                 .json(&body)
                 .send()
                 .await
@@ -1095,7 +1216,7 @@ mod tests {
         assert_eq!(saved["notification_filter"], body["notification_filter"]);
 
         let page = json_of(
-            h.req(reqwest::Method::GET, "/api/notifications")
+            h.req(reqwest::Method::GET, "/api/accounts/default/notifications")
                 .send()
                 .await
                 .unwrap(),
@@ -1112,7 +1233,7 @@ mod tests {
 
         // フィルターを省略した保存では、既存の設定を保持する。
         let kept = json_of(
-            h.req(reqwest::Method::PUT, "/api/settings")
+            h.req(reqwest::Method::PUT, "/api/accounts/default/settings")
                 .json(&setup_body())
                 .send()
                 .await
@@ -1121,7 +1242,7 @@ mod tests {
         .await;
         assert_eq!(kept["notification_filter"], body["notification_filter"]);
         let got = json_of(
-            h.req(reqwest::Method::GET, "/api/settings")
+            h.req(reqwest::Method::GET, "/api/accounts/default/settings")
                 .send()
                 .await
                 .unwrap(),
@@ -1162,7 +1283,7 @@ mod tests {
             let mut request = setup_body();
             request["notification_filter"] = bad.clone();
             let resp = h
-                .req(reqwest::Method::PUT, "/api/settings")
+                .req(reqwest::Method::PUT, "/api/accounts/default/settings")
                 .json(&request)
                 .send()
                 .await
@@ -1174,7 +1295,7 @@ mod tests {
             }
         }
         let still = json_of(
-            h.req(reqwest::Method::GET, "/api/settings")
+            h.req(reqwest::Method::GET, "/api/accounts/default/settings")
                 .send()
                 .await
                 .unwrap(),
@@ -1192,7 +1313,7 @@ mod tests {
         )
         .unwrap();
         let resp = h
-            .req(reqwest::Method::GET, "/api/notifications")
+            .req(reqwest::Method::GET, "/api/accounts/default/notifications")
             .send()
             .await
             .unwrap();
@@ -1206,26 +1327,29 @@ mod tests {
     async fn new_routes_reject_wrong_methods_and_cross_origin_mutations() {
         let h = harness(true).await;
         let put = h
-            .req(reqwest::Method::PUT, "/api/following-notifications")
+            .req(
+                reqwest::Method::PUT,
+                "/api/accounts/default/following-notifications",
+            )
             .send()
             .await
             .unwrap();
         assert_eq!(put.status(), 405);
         let post = h
-            .req(reqwest::Method::POST, "/api/notifications")
+            .req(reqwest::Method::POST, "/api/accounts/default/notifications")
             .send()
             .await
             .unwrap();
         assert_eq!(post.status(), 405);
 
-        h.req(reqwest::Method::PUT, "/api/settings")
+        h.req(reqwest::Method::PUT, "/api/accounts/default/settings")
             .json(&setup_body())
             .send()
             .await
             .unwrap();
         for method in [reqwest::Method::POST, reqwest::Method::DELETE] {
             let resp = h
-                .req(method, "/api/following-notifications")
+                .req(method, "/api/accounts/default/following-notifications")
                 .header("Origin", "http://evil.example")
                 .send()
                 .await
@@ -1234,10 +1358,13 @@ mod tests {
         }
         assert!(h.fake.updated.lock().unwrap().is_empty());
         let state = json_of(
-            h.req(reqwest::Method::GET, "/api/following-notifications")
-                .send()
-                .await
-                .unwrap(),
+            h.req(
+                reqwest::Method::GET,
+                "/api/accounts/default/following-notifications",
+            )
+            .send()
+            .await
+            .unwrap(),
         )
         .await;
         assert_eq!(state["state"], "idle");
@@ -1246,7 +1373,10 @@ mod tests {
     async fn settings_validate_endpoint_reports_cookie_state() {
         let h = harness(true).await;
         let missing = h
-            .req(reqwest::Method::POST, "/api/settings/validate")
+            .req(
+                reqwest::Method::POST,
+                "/api/accounts/default/settings/validate",
+            )
             .send()
             .await
             .unwrap();
@@ -1254,13 +1384,16 @@ mod tests {
         assert_eq!(missing.headers()["cache-control"], "no-store");
         assert_eq!(json_of(missing).await["error"]["code"], "not_configured");
 
-        h.req(reqwest::Method::PUT, "/api/settings")
+        h.req(reqwest::Method::PUT, "/api/accounts/default/settings")
             .json(&setup_body())
             .send()
             .await
             .unwrap();
         let ok = h
-            .req(reqwest::Method::POST, "/api/settings/validate")
+            .req(
+                reqwest::Method::POST,
+                "/api/accounts/default/settings/validate",
+            )
             .send()
             .await
             .unwrap();
@@ -1275,7 +1408,10 @@ mod tests {
 
         *h.fake.screen_error.lock().unwrap() = Some(crate::twitter::XError::Unauthorized);
         let expired = h
-            .req(reqwest::Method::POST, "/api/settings/validate")
+            .req(
+                reqwest::Method::POST,
+                "/api/accounts/default/settings/validate",
+            )
             .send()
             .await
             .unwrap();
@@ -1292,7 +1428,10 @@ mod tests {
         ] {
             *h.fake.screen_error.lock().unwrap() = Some(error);
             let resp = h
-                .req(reqwest::Method::POST, "/api/settings/validate")
+                .req(
+                    reqwest::Method::POST,
+                    "/api/accounts/default/settings/validate",
+                )
                 .send()
                 .await
                 .unwrap();
@@ -1304,13 +1443,19 @@ mod tests {
         }
 
         let get = h
-            .req(reqwest::Method::GET, "/api/settings/validate")
+            .req(
+                reqwest::Method::GET,
+                "/api/accounts/default/settings/validate",
+            )
             .send()
             .await
             .unwrap();
         assert_eq!(get.status(), 405);
         let cross = h
-            .req(reqwest::Method::POST, "/api/settings/validate")
+            .req(
+                reqwest::Method::POST,
+                "/api/accounts/default/settings/validate",
+            )
             .header("Origin", "http://evil.example")
             .send()
             .await
@@ -1321,7 +1466,7 @@ mod tests {
     #[tokio::test]
     async fn settings_validate_conflicts_with_a_running_bulk_job() {
         let h = harness(true).await;
-        h.req(reqwest::Method::PUT, "/api/settings")
+        h.req(reqwest::Method::PUT, "/api/accounts/default/settings")
             .json(&setup_body())
             .send()
             .await
@@ -1329,32 +1474,473 @@ mod tests {
         h.fake
             .hang_pages
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        h.req(reqwest::Method::POST, "/api/following-notifications")
-            .send()
-            .await
-            .unwrap();
+        h.req(
+            reqwest::Method::POST,
+            "/api/accounts/default/following-notifications",
+        )
+        .send()
+        .await
+        .unwrap();
 
         let resp = h
-            .req(reqwest::Method::POST, "/api/settings/validate")
+            .req(
+                reqwest::Method::POST,
+                "/api/accounts/default/settings/validate",
+            )
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 409);
         assert_eq!(json_of(resp).await["error"]["code"], "following_job_active");
         for (method, path) in [
-            (reqwest::Method::POST, "/api/register"),
-            (reqwest::Method::DELETE, "/api/registration"),
+            (reqwest::Method::POST, "/api/accounts/default/register"),
+            (
+                reqwest::Method::DELETE,
+                "/api/accounts/default/registration",
+            ),
         ] {
             let resp = h.req(method, path).send().await.unwrap();
             assert_eq!(resp.status(), 409, "{path}");
             assert_eq!(json_of(resp).await["error"]["code"], "following_job_active");
         }
         let resp = h
-            .req(reqwest::Method::DELETE, "/api/following-notifications")
+            .req(
+                reqwest::Method::DELETE,
+                "/api/accounts/default/following-notifications",
+            )
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 202);
         poll_state(&h, &["cancelled", "failed", "completed"]).await;
+    }
+
+    async fn status_of(h: &Harness, method: reqwest::Method, path: &str) -> (u16, Value) {
+        let resp = h.req(method, path).send().await.unwrap();
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap();
+        (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn account_list_create_and_delete_over_http() {
+        let h = harness(true).await;
+        let list = h
+            .req(reqwest::Method::GET, "/api/accounts")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(list.status(), 200);
+        assert_eq!(list.headers()["cache-control"], "no-store");
+        assert_eq!(
+            json_of(list).await,
+            json!({"accounts": [
+                {"id": "default", "registered": false, "receiver_state": "unconfigured"}
+            ]})
+        );
+
+        let created = h
+            .req(reqwest::Method::POST, "/api/accounts")
+            .json(&json!({"id": "work-2"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), 201);
+        assert_eq!(created.headers()["cache-control"], "no-store");
+        assert_eq!(
+            json_of(created).await,
+            json!({"id": "work-2", "registered": false, "receiver_state": "unconfigured"})
+        );
+
+        let dup = h
+            .req(reqwest::Method::POST, "/api/accounts")
+            .json(&json!({"id": "work-2"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(dup.status(), 409);
+        assert_eq!(json_of(dup).await["error"]["code"], "account_exists");
+
+        for bad in ["Work", "-x", "has space", "a/b", "", &"a".repeat(33)] {
+            let resp = h
+                .req(reqwest::Method::POST, "/api/accounts")
+                .json(&json!({"id": bad}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{bad:?}");
+            assert_eq!(json_of(resp).await["error"]["code"], "invalid_account_id");
+        }
+        for body in [json!({}), json!({"id": 1}), json!({"id": "ok", "extra": 1})] {
+            let resp = h
+                .req(reqwest::Method::POST, "/api/accounts")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{body}");
+            assert_eq!(json_of(resp).await["error"]["code"], "invalid_body");
+        }
+        let no_type = h
+            .req(reqwest::Method::POST, "/api/accounts")
+            .body("{\"id\":\"x\"}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_type.status(), 415);
+        assert_eq!(h.accounts.list().unwrap().accounts.len(), 2);
+
+        let gone = h
+            .req(reqwest::Method::DELETE, "/api/accounts/work-2")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), 204);
+        assert_eq!(gone.headers()["cache-control"], "no-store");
+        assert!(gone.text().await.unwrap().is_empty());
+        let again = status_of(&h, reqwest::Method::DELETE, "/api/accounts/work-2").await;
+        assert_eq!(again.0, 404);
+        assert_eq!(again.1["error"]["code"], "account_not_found");
+        let invalid = status_of(&h, reqwest::Method::DELETE, "/api/accounts/Work").await;
+        assert_eq!(invalid.0, 400);
+        assert_eq!(invalid.1["error"]["code"], "invalid_account_id");
+        assert_eq!(h.accounts.list().unwrap().accounts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn every_account_route_reports_unknown_and_malformed_ids() {
+        let h = harness(true).await;
+        let routes = [
+            (reqwest::Method::GET, "settings"),
+            (reqwest::Method::PUT, "settings"),
+            (reqwest::Method::POST, "settings/validate"),
+            (reqwest::Method::GET, "registration"),
+            (reqwest::Method::DELETE, "registration"),
+            (reqwest::Method::POST, "register"),
+            (reqwest::Method::GET, "status"),
+            (reqwest::Method::GET, "notifications"),
+            (reqwest::Method::GET, "following-notifications"),
+            (reqwest::Method::POST, "following-notifications"),
+            (reqwest::Method::DELETE, "following-notifications"),
+        ];
+        for (method, tail) in routes {
+            for (id, status, code) in [
+                ("ghost", 404, "account_not_found"),
+                ("Ghost", 400, "invalid_account_id"),
+                ("a%2Fb", 400, "invalid_account_id"),
+            ] {
+                let mut request = h.req(method.clone(), &format!("/api/accounts/{id}/{tail}"));
+                if method == reqwest::Method::PUT {
+                    request = request.json(&json!({"webhook_endpoint": ""}));
+                }
+                let resp = request.send().await.unwrap();
+                assert_eq!(resp.status(), status, "{method} {id} {tail}");
+                assert_eq!(resp.headers()["cache-control"], "no-store");
+                assert_eq!(
+                    json_of(resp).await["error"]["code"],
+                    code,
+                    "{method} {id} {tail}"
+                );
+            }
+        }
+        // Nothing was created by the failed calls.
+        assert_eq!(h.accounts.list().unwrap().accounts.len(), 1);
+        // The old flat routes are gone.
+        for path in [
+            "/api/settings",
+            "/api/status",
+            "/api/registration",
+            "/api/notifications",
+        ] {
+            let resp = h.req(reqwest::Method::GET, path).send().await.unwrap();
+            assert_eq!(resp.status(), 404, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn two_accounts_over_http_have_separate_state_and_never_leak_secrets() {
+        let h = harness(true).await;
+        h.req(reqwest::Method::POST, "/api/accounts")
+            .json(&json!({"id": "shop"}))
+            .send()
+            .await
+            .unwrap();
+        let put = |id: &'static str, body: Value| {
+            let h = &h;
+            async move {
+                h.req(
+                    reqwest::Method::PUT,
+                    &format!("/api/accounts/{id}/settings"),
+                )
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+            }
+        };
+
+        let first = put(
+            "default",
+            json!({"auth_token":"A-DEFAULT","ct0":"C-DEFAULT",
+                   "webhook_endpoint":"https://example.com/default",
+                   "webhook_secret":"S-DEFAULT"}),
+        )
+        .await;
+        assert_eq!(first.status(), 200);
+        let text = first.text().await.unwrap();
+        assert!(!text.contains("DEFAULT"), "{text}");
+        let dto: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(dto["webhook_secret_set"], true);
+        assert!(dto.get("webhook_secret").is_none());
+
+        let other = json_of(
+            h.req(reqwest::Method::GET, "/api/accounts/shop/settings")
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(other["configured"], false);
+        assert_eq!(other["webhook_secret_set"], false);
+        assert_eq!(other["webhook_endpoint"], Value::Null);
+
+        let second = put(
+            "shop",
+            json!({"auth_token":"A-SHOP","ct0":"C-SHOP",
+                   "webhook_endpoint":"https://example.com/shop"}),
+        )
+        .await;
+        assert_eq!(second.status(), 200);
+        let both = [
+            ("default", "https://example.com/default", true),
+            ("shop", "https://example.com/shop", false),
+        ];
+        for (id, endpoint, secret_set) in both {
+            let text = h
+                .req(
+                    reqwest::Method::GET,
+                    &format!("/api/accounts/{id}/settings"),
+                )
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(!text.contains("S-DEFAULT") && !text.contains("A-") && !text.contains("C-"));
+            let dto: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(dto["webhook_endpoint"], endpoint);
+            assert_eq!(dto["webhook_secret_set"], secret_set, "{id}");
+        }
+
+        // A blank or null secret keeps the saved one; the secret survives other edits.
+        for secret in [json!(null), json!(""), json!("  ")] {
+            let kept = json_of(
+                put(
+                    "default",
+                    json!({"webhook_endpoint":"https://example.com/default","webhook_secret":secret}),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(kept["webhook_secret_set"], true);
+        }
+        assert_eq!(
+            config::test_default_account(&h.config_path)
+                .webhook_secret
+                .as_deref(),
+            Some("S-DEFAULT")
+        );
+
+        // Registering one account leaves the other untouched.
+        let reg = h
+            .req(reqwest::Method::POST, "/api/accounts/shop/register")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reg.status(), 200);
+        let shop = json_of(
+            h.req(reqwest::Method::GET, "/api/accounts/shop/registration")
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(shop["registered"], true);
+        let default = json_of(
+            h.req(reqwest::Method::GET, "/api/accounts/default/registration")
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(default["registered"], false);
+        let list = json_of(
+            h.req(reqwest::Method::GET, "/api/accounts")
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(list["accounts"][0]["registered"], false);
+        assert_eq!(list["accounts"][1]["registered"], true);
+        assert!(!list.to_string().contains("SHOP") && !list.to_string().contains("uaid"));
+
+        // Deleting the registered account unregisters it first and leaves the other one alone.
+        let del = h
+            .req(reqwest::Method::DELETE, "/api/accounts/shop")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(del.status(), 204);
+        assert_eq!(
+            h.fake.unregisters.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            config::test_default_account(&h.config_path)
+                .twitter
+                .auth_token,
+            "A-DEFAULT"
+        );
+        let gone = status_of(&h, reqwest::Method::GET, "/api/accounts/shop/status").await;
+        assert_eq!(gone.0, 404);
+    }
+
+    #[tokio::test]
+    async fn failed_unregistration_during_deletion_is_reported_and_keeps_the_account() {
+        let h = harness(true).await;
+        h.req(reqwest::Method::PUT, "/api/accounts/default/settings")
+            .json(&setup_body())
+            .send()
+            .await
+            .unwrap();
+        h.req(reqwest::Method::POST, "/api/accounts/default/register")
+            .send()
+            .await
+            .unwrap();
+        h.fake
+            .fail_unregister
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let resp = h
+            .req(reqwest::Method::DELETE, "/api/accounts/default")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 502);
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("provider_failure") && !text.contains("SECRET"));
+        let status = json_of(
+            h.req(reqwest::Method::GET, "/api/accounts/default/status")
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status["registered"], true);
+        assert!(
+            config::test_default_account(&h.config_path)
+                .registration
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn account_routes_reject_wrong_methods_and_cross_origin_requests() {
+        let h = harness(true).await;
+        for (method, path) in [
+            (reqwest::Method::PUT, "/api/accounts"),
+            (reqwest::Method::DELETE, "/api/accounts"),
+            (reqwest::Method::GET, "/api/accounts/default"),
+            (reqwest::Method::POST, "/api/accounts/default"),
+            (reqwest::Method::GET, "/api/accounts/default/register"),
+            (reqwest::Method::PUT, "/api/accounts/default/status"),
+        ] {
+            let resp = h.req(method.clone(), path).send().await.unwrap();
+            assert_eq!(resp.status(), 405, "{method} {path}");
+        }
+
+        for (method, path) in [
+            (reqwest::Method::GET, "/api/accounts"),
+            (reqwest::Method::POST, "/api/accounts"),
+            (reqwest::Method::DELETE, "/api/accounts/default"),
+            (reqwest::Method::GET, "/api/accounts/default/settings"),
+            (reqwest::Method::POST, "/api/accounts/default/register"),
+        ] {
+            for header in [
+                ("Origin", "http://evil.example"),
+                ("Sec-Fetch-Site", "cross-site"),
+            ] {
+                let resp = h
+                    .req(method.clone(), path)
+                    .header(header.0, header.1)
+                    .json(&json!({"id": "evil"}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 403, "{method} {path} {header:?}");
+                assert_eq!(json_of(resp).await["error"]["code"], "origin_mismatch");
+            }
+        }
+        let accounts = h.accounts.list().unwrap().accounts;
+        assert_eq!(
+            accounts.len(),
+            1,
+            "a cross-origin call changed the accounts"
+        );
+        assert_eq!(
+            h.fake.subscribes.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn creating_over_leftover_history_is_a_conflict_over_http() {
+        let h = harness(true).await;
+        let leftover = crate::notifications::history_path_for(&h.config_path, "work");
+        std::fs::write(&leftover, b"left behind").unwrap();
+        let config_before = std::fs::read(&h.config_path).unwrap();
+
+        let refused = h
+            .req(reqwest::Method::POST, "/api/accounts")
+            .json(&json!({"id": "work"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 409);
+        assert_eq!(refused.headers()["cache-control"], "no-store");
+        let text = refused.text().await.unwrap();
+        assert!(text.contains("history_cleanup_required"), "{text}");
+        assert!(!text.contains(h.config_path.to_str().unwrap()), "{text}");
+        assert_eq!(std::fs::read(&h.config_path).unwrap(), config_before);
+        assert_eq!(std::fs::read(&leftover).unwrap(), b"left behind");
+        let list = json_of(
+            h.req(reqwest::Method::GET, "/api/accounts")
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(list["accounts"].as_array().unwrap().len(), 1);
+
+        // An existing account is still reported as a duplicate, not as a history problem.
+        let dup = h
+            .req(reqwest::Method::POST, "/api/accounts")
+            .json(&json!({"id": "default"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(dup.status(), 409);
+        assert_eq!(json_of(dup).await["error"]["code"], "account_exists");
+
+        std::fs::remove_file(&leftover).unwrap();
+        let created = h
+            .req(reqwest::Method::POST, "/api/accounts")
+            .json(&json!({"id": "work"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), 201);
     }
 }

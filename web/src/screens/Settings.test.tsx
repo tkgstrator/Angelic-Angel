@@ -15,8 +15,8 @@ import {
 } from '../test/helpers'
 import { Settings } from './Settings'
 
-const PUT = 'PUT /api/settings'
-const VALIDATE = 'POST /api/settings/validate'
+const PUT = 'PUT /api/accounts/default/settings'
+const VALIDATE = 'POST /api/accounts/default/settings/validate'
 const unsaved = settings({
   configured: false,
   auth_token_set: false,
@@ -31,16 +31,17 @@ const button = (name: string) => screen.getByRole('button', { name })
 describe('Settings', () => {
   it('never prefills cookies and shows set indicators', async () => {
     mockApi(settingsRoutes())
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     expect(await screen.findByLabelText(/auth_token/)).toHaveValue('')
     expect(screen.getByLabelText(/ct0/)).toHaveValue('')
-    expect(screen.getAllByText('設定済み')).toHaveLength(2)
-    expect(screen.getByText(/空欄のまま保存すると/)).toBeInTheDocument()
+    expect(screen.getByLabelText(/Webhook secret/)).toHaveValue('')
+    expect(screen.getAllByText('設定済み')).toHaveLength(3)
+    expect(screen.getAllByText(/空欄のまま保存すると/).length).toBeGreaterThanOrEqual(1)
   })
 
   it('titles the section Cookie and puts registration and bulk notifications below it', async () => {
     mockApi(settingsRoutes())
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     const names = (await screen.findAllByRole('group')).map((g) =>
       g.getAttribute('aria-labelledby'),
@@ -59,7 +60,7 @@ describe('Settings', () => {
 
   it('ends the cookie and webhook form with save, apart from registration and bulk actions', async () => {
     mockApi(settingsRoutes())
-    const { container } = render(<Settings />)
+    const { container } = render(<Settings accountId="default" />)
     await screen.findByText('未登録')
     const form = container.querySelector('form')
     if (!form) throw new Error('form missing')
@@ -77,7 +78,7 @@ describe('Settings', () => {
 
   it('keeps the save result next to the save button', async () => {
     mockApi({ ...settingsRoutes(), [PUT]: () => json(settings()) })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await userEvent.type(await screen.findByLabelText(/ct0/), 'abc')
     await save()
     const message = await screen.findByText('保存しました。')
@@ -85,8 +86,11 @@ describe('Settings', () => {
   })
 
   it('requires both cookies on first setup', async () => {
-    const fetchMock = mockApi({ ...settingsRoutes(), 'GET /api/settings': () => json(unsaved) })
-    render(<Settings />)
+    const fetchMock = mockApi({
+      ...settingsRoutes(),
+      'GET /api/accounts/default/settings': () => json(unsaved),
+    })
+    render(<Settings accountId="default" />)
     await userEvent.click(await screen.findByRole('button', { name: '保存' }))
     expect(screen.getByText('初回設定では auth_token が必須です。')).toBeInTheDocument()
     expect(screen.getByText('初回設定では ct0 が必須です。')).toBeInTheDocument()
@@ -103,7 +107,7 @@ describe('Settings', () => {
         return json(settings({ webhook_endpoint: 'https://new.example/h' }))
       },
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     const url = await screen.findByLabelText('Webhook URL')
     await userEvent.clear(url)
     await userEvent.type(url, 'https://new.example/h')
@@ -112,6 +116,7 @@ describe('Settings', () => {
     expect(body).toEqual({
       auth_token: null,
       ct0: null,
+      webhook_secret: null,
       webhook_endpoint: 'https://new.example/h',
       notification_filter: filterOf(),
     })
@@ -126,7 +131,7 @@ describe('Settings', () => {
         return json(settings())
       },
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     const auth = await screen.findByLabelText(/auth_token/)
     await userEvent.type(auth, 'abc123')
     await save()
@@ -136,9 +141,54 @@ describe('Settings', () => {
     expect(auth).toHaveValue('')
   })
 
+  it('keeps a saved webhook secret when left blank and sends a typed one once', async () => {
+    const bodies: Record<string, unknown>[] = []
+    mockApi({
+      ...settingsRoutes(),
+      [PUT]: (init) => {
+        bodies.push(JSON.parse(String(init.body)))
+        return json(settings())
+      },
+    })
+    render(<Settings accountId="default" />)
+    const secret = await screen.findByLabelText(/Webhook secret/)
+    expect(secret).toHaveAttribute('type', 'password')
+    await save()
+    await screen.findByText('保存しました。')
+    await userEvent.type(secret, '  s3cret  ')
+    await save()
+    await waitFor(() => expect(bodies).toHaveLength(2))
+    expect(bodies[0]?.webhook_secret).toBeNull()
+    expect(bodies[1]?.webhook_secret).toBe('s3cret')
+    await waitFor(() => expect(secret).toHaveValue(''))
+  })
+
+  it('shows the webhook secret as unset and never echoes a value back', async () => {
+    mockApi({
+      ...settingsRoutes(),
+      'GET /api/accounts/default/settings': () => json(settings({ webhook_secret_set: false })),
+    })
+    const { container } = render(<Settings accountId="default" />)
+    const secret = await screen.findByLabelText(/Webhook secret/)
+    expect(screen.getByText('Webhook secret').parentElement).toHaveTextContent('未設定')
+    expect(secret).toHaveValue('')
+    expect(container.textContent).not.toContain('s3cret')
+  })
+
+  it('rejects a webhook secret with control characters without sending', async () => {
+    const fetchMock = mockApi(settingsRoutes())
+    render(<Settings accountId="default" />)
+    const secret = await screen.findByLabelText(/Webhook secret/)
+    await userEvent.type(secret, 'a')
+    await userEvent.paste('\u0007')
+    await save()
+    expect(await screen.findByText(/Webhook secret に使用できない文字/)).toBeInTheDocument()
+    expect(requests(fetchMock, PUT)).toBe(0)
+  })
+
   it('rejects an invalid webhook URL without sending', async () => {
     const fetchMock = mockApi(settingsRoutes())
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     const url = await screen.findByLabelText('Webhook URL')
     await userEvent.clear(url)
     await userEvent.type(url, 'ftp://example.com')
@@ -150,10 +200,10 @@ describe('Settings', () => {
   it('disables the webhook URL when the environment overrides it', async () => {
     mockApi({
       ...settingsRoutes(),
-      'GET /api/settings': () =>
+      'GET /api/accounts/default/settings': () =>
         json(settings({ webhook_source: 'environment', webhook_endpoint: 'https://env.example/' })),
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     expect(await screen.findByLabelText('Webhook URL')).toBeDisabled()
     expect(screen.getByText(/環境変数 WEBHOOK_ENDPOINT/)).toBeInTheDocument()
   })
@@ -161,10 +211,10 @@ describe('Settings', () => {
   it('locks cookie inputs while registered', async () => {
     mockApi({
       ...settingsRoutes(),
-      'GET /api/settings': () => json(settings({ credentials_locked: true })),
-      'GET /api/registration': () => json(registration({ registered: true })),
+      'GET /api/accounts/default/settings': () => json(settings({ credentials_locked: true })),
+      'GET /api/accounts/default/registration': () => json(registration({ registered: true })),
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     expect(await screen.findByLabelText(/auth_token/)).toBeDisabled()
     expect(screen.getByLabelText(/ct0/)).toBeDisabled()
     expect(screen.getByLabelText('Webhook URL')).toBeEnabled()
@@ -175,7 +225,7 @@ describe('Settings', () => {
       ...settingsRoutes(),
       [PUT]: () => apiError(409, 'credentials_locked', '登録を解除してください。'),
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     const auth = await screen.findByLabelText(/auth_token/)
     await userEvent.type(auth, 'abc')
     await save()
@@ -188,9 +238,10 @@ describe('Settings', () => {
     let calls = 0
     mockApi({
       ...settingsRoutes(),
-      'GET /api/settings': () => (++calls === 1 ? apiError(500, 'x', '失敗') : json(settings())),
+      'GET /api/accounts/default/settings': () =>
+        ++calls === 1 ? apiError(500, 'x', '失敗') : json(settings()),
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await userEvent.click(await screen.findByRole('button', { name: '再試行' }))
     expect(await screen.findByLabelText('Webhook URL')).toBeInTheDocument()
   })
@@ -212,7 +263,7 @@ const FILTER_NAMES = Object.values(KIND)
 describe('Settings notification filter', () => {
   it('lists the kinds with quotes nested, all enabled by default, with the explanation', async () => {
     mockApi(settingsRoutes())
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     const group = screen.getByRole('group', { name: '通知フィルター' })
     expect(within(group).getAllByRole('checkbox')).toHaveLength(8)
@@ -227,10 +278,10 @@ describe('Settings notification filter', () => {
   it('reflects the saved filter in the checkboxes', async () => {
     mockApi({
       ...settingsRoutes(),
-      'GET /api/settings': () =>
+      'GET /api/accounts/default/settings': () =>
         json(settings({ notification_filter: filterOf({ xchat_message_received: false }) })),
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     for (const name of FILTER_NAMES.filter((n) => n !== KIND.chat)) {
       expect(checkbox(name)).toBeChecked()
@@ -242,14 +293,14 @@ describe('Settings notification filter', () => {
     const body = { current: {} as { notification_filter?: NotificationFilter } }
     mockApi({
       ...settingsRoutes(),
-      'GET /api/settings': () =>
+      'GET /api/accounts/default/settings': () =>
         json(settings({ notification_filter: filterOf({ quote: false }) })),
       [PUT]: (init) => {
         body.current = JSON.parse(String(init.body))
         return json(settings({ notification_filter: filterOf({ reply: false }) }))
       },
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     expect(checkbox(/引用RT/)).not.toBeChecked()
     expect(checkbox(/リプライ/)).toBeChecked()
@@ -272,14 +323,14 @@ describe('Settings notification filter', () => {
     const body = { current: {} as { notification_filter?: NotificationFilter } }
     mockApi({
       ...settingsRoutes(),
-      'GET /api/settings': () =>
+      'GET /api/accounts/default/settings': () =>
         json(settings({ notification_filter: filterOf({ retweet: false }) })),
       [PUT]: (init) => {
         body.current = JSON.parse(String(init.body))
         return json(settings({ notification_filter: filterOf({ retweet: false }) }))
       },
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     expect(checkbox(/リツイート（RT）/)).not.toBeChecked()
     expect(checkbox(/投稿（tweet）/)).toBeChecked()
@@ -295,14 +346,14 @@ describe('Settings notification filter', () => {
     let body: { notification_filter?: NotificationFilter } = {}
     mockApi({
       ...settingsRoutes(),
-      'GET /api/settings': () => json(settings({ notification_filter: stored })),
+      'GET /api/accounts/default/settings': () => json(settings({ notification_filter: stored })),
       [PUT]: (init) => {
         body = JSON.parse(String(init.body))
         stored = body.notification_filter ?? stored
         return json(settings({ notification_filter: stored }))
       },
     })
-    const first = render(<Settings />)
+    const first = render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     await userEvent.click(checkbox(KIND.tweet))
     await userEvent.click(checkbox(KIND.retweet))
@@ -324,7 +375,7 @@ describe('Settings notification filter', () => {
     for (const name of FILTER_NAMES) expect(checkbox(name)).not.toBeChecked()
 
     first.unmount()
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     for (const name of FILTER_NAMES) expect(checkbox(name)).not.toBeChecked()
     await userEvent.click(checkbox(KIND.chat))
@@ -348,7 +399,7 @@ describe('Settings notification filter', () => {
       ...settingsRoutes(),
       [PUT]: () => json(settings({ notification_filter: filterOf({ other: false }) })),
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     await save()
     await screen.findByText('保存しました。')
@@ -358,7 +409,7 @@ describe('Settings notification filter', () => {
 
   it('keeps the edit when saving fails', async () => {
     mockApi({ ...settingsRoutes(), [PUT]: () => apiError(500, 'x', '保存失敗') })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     await userEvent.click(checkbox(KIND.tweet))
     await save()
@@ -370,7 +421,7 @@ describe('Settings notification filter', () => {
     let body: Record<string, unknown> = {}
     mockApi({
       ...settingsRoutes(),
-      'GET /api/settings': () =>
+      'GET /api/accounts/default/settings': () =>
         json(
           settings({
             credentials_locked: true,
@@ -378,13 +429,13 @@ describe('Settings notification filter', () => {
             webhook_endpoint: 'https://env.example/',
           }),
         ),
-      'GET /api/registration': () => json(registration({ registered: true })),
+      'GET /api/accounts/default/registration': () => json(registration({ registered: true })),
       [PUT]: (init) => {
         body = JSON.parse(String(init.body))
         return json(settings({ notification_filter: filterOf({ tweet: false }) }))
       },
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     expect(await screen.findByLabelText(/auth_token/)).toBeDisabled()
     expect(screen.getByLabelText('Webhook URL')).toBeDisabled()
     for (const name of FILTER_NAMES) expect(checkbox(name)).toBeEnabled()
@@ -394,6 +445,7 @@ describe('Settings notification filter', () => {
     expect(body).toEqual({
       auth_token: null,
       ct0: null,
+      webhook_secret: null,
       webhook_endpoint: 'https://env.example/',
       notification_filter: filterOf({ tweet: false }),
     })
@@ -402,7 +454,7 @@ describe('Settings notification filter', () => {
   it('is disabled together with the other actions while busy', async () => {
     let release: (r: Response) => void = () => {}
     mockApi({ ...settingsRoutes(), [PUT]: () => new Promise<Response>((r) => (release = r)) })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     await save()
     await screen.findByRole('button', { name: '保存中…' })
@@ -420,13 +472,13 @@ describe('Settings quote filter', () => {
     const body = { current: {} as { notification_filter?: NotificationFilter } }
     mockApi({
       ...settingsRoutes(),
-      'GET /api/settings': () => json(settings({ notification_filter })),
+      'GET /api/accounts/default/settings': () => json(settings({ notification_filter })),
       [PUT]: (init) => {
         body.current = JSON.parse(String(init.body))
         return json(settings({ notification_filter: body.current.notification_filter }))
       },
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     return body
   }
@@ -540,7 +592,7 @@ describe('Settings cookie check', () => {
         return json(validation({ screen_name: 'alice' }))
       },
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     expect(screen.getByText('未確認')).toBeInTheDocument()
     expect(requests(fetchMock, VALIDATE)).toBe(0)
@@ -552,15 +604,15 @@ describe('Settings cookie check', () => {
   })
 
   it('is disabled until a cookie is saved', async () => {
-    mockApi({ ...settingsRoutes(), 'GET /api/settings': () => json(unsaved) })
-    render(<Settings />)
+    mockApi({ ...settingsRoutes(), 'GET /api/accounts/default/settings': () => json(unsaved) })
+    render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     expect(button('確認')).toBeDisabled()
   })
 
   it('explains that unsaved input is not what gets checked', async () => {
     mockApi(settingsRoutes())
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     expect(await screen.findByText(/保存済みの Cookie を X に問い合わせます/)).toBeInTheDocument()
     expect(screen.queryByText(/入力中の値は未保存です/)).not.toBeInTheDocument()
     await userEvent.type(screen.getByLabelText(/ct0/), 'abc')
@@ -569,7 +621,7 @@ describe('Settings cookie check', () => {
 
   it('checks automatically after a successful save, separately from the save message', async () => {
     const fetchMock = mockApi({ ...settingsRoutes(), [PUT]: () => json(settings()) })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await userEvent.type(await screen.findByLabelText(/auth_token/), 'abc')
     await save()
     expect(await screen.findByText('保存しました。')).toBeInTheDocument()
@@ -584,14 +636,14 @@ describe('Settings cookie check', () => {
       [PUT]: () => json(settings()),
       [VALIDATE]: () => json(validation({ valid: false, screen_name: null, message: 'expired' })),
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await userEvent.type(await screen.findByLabelText(/ct0/), 'abc')
     await save()
     const alert = await screen.findByRole('alert')
     expect(alert).toHaveTextContent('無効')
     expect(alert).toHaveTextContent('期限切れ')
     expect(screen.getByText('保存しました。')).toBeInTheDocument()
-    expect(screen.getAllByText('設定済み')).toHaveLength(2)
+    expect(screen.getAllByText('設定済み')).toHaveLength(3)
     expect(screen.getByLabelText(/ct0/)).toHaveValue('')
   })
 
@@ -603,7 +655,7 @@ describe('Settings cookie check', () => {
       ...settingsRoutes(),
       [VALIDATE]: () => apiError(status, code, '外部サービスに接続できませんでした。'),
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     await userEvent.click(button('確認'))
     const result = await screen.findByText(/確認できませんでした/)
@@ -621,7 +673,7 @@ describe('Settings cookie check', () => {
         throw new TypeError('Failed to fetch')
       },
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     await userEvent.click(button('確認'))
     expect(await screen.findByText(/確認できませんでした/)).toHaveTextContent(
@@ -636,7 +688,7 @@ describe('Settings cookie check', () => {
       ...settingsRoutes(),
       [VALIDATE]: () => (++calls === 1 ? apiError(502, 'x', '一時的な障害') : json(validation())),
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     await userEvent.click(button('確認'))
     await screen.findByText('確認不可')
@@ -649,7 +701,7 @@ describe('Settings cookie check', () => {
       ...settingsRoutes(),
       [VALIDATE]: () => json(validation({ screen_name: '<b>x</b>' })),
     })
-    const { container } = render(<Settings />)
+    const { container } = render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     await userEvent.click(button('確認'))
     expect(await screen.findByText('Cookie は有効です。')).toBeInTheDocument()
@@ -664,7 +716,7 @@ describe('Settings exclusivity', () => {
       ...settingsRoutes(),
       [PUT]: () => new Promise<Response>((r) => (release = r)),
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await userEvent.type(await screen.findByLabelText(/auth_token/), 'abc')
     await save()
     expect(await screen.findByRole('button', { name: '保存中…' })).toBeDisabled()
@@ -681,7 +733,7 @@ describe('Settings exclusivity', () => {
       ...settingsRoutes(),
       [VALIDATE]: () => new Promise<Response>((r) => (release = r)),
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     await userEvent.click(button('確認'))
     expect(await screen.findByRole('button', { name: '確認中…' })).toBeDisabled()
@@ -699,9 +751,9 @@ describe('Settings exclusivity', () => {
     let release: (r: Response) => void = () => {}
     mockApi({
       ...settingsRoutes(),
-      'POST /api/register': () => new Promise<Response>((r) => (release = r)),
+      'POST /api/accounts/default/register': () => new Promise<Response>((r) => (release = r)),
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await screen.findByText('未登録')
     await userEvent.click(button('登録'))
     expect(await screen.findByRole('button', { name: '登録中…' })).toBeDisabled()
@@ -716,9 +768,10 @@ describe('Settings exclusivity', () => {
     let release: (r: Response) => void = () => {}
     mockApi({
       ...settingsRoutes(),
-      'POST /api/following-notifications': () => new Promise<Response>((r) => (release = r)),
+      'POST /api/accounts/default/following-notifications': () =>
+        new Promise<Response>((r) => (release = r)),
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await userEvent.click(await screen.findByRole('button', { name: 'オンにする' }))
     await userEvent.click(button('実行する'))
     expect(await screen.findByRole('button', { name: '開始中…' })).toBeDisabled()
@@ -747,13 +800,13 @@ describe('Settings registration and bulk notifications', () => {
     let configured = false
     mockApi({
       ...settingsRoutes(),
-      'GET /api/settings': () => json(configured ? settings() : unsaved),
+      'GET /api/accounts/default/settings': () => json(configured ? settings() : unsaved),
       [PUT]: () => {
         configured = true
         return json(settings())
       },
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await screen.findByLabelText(/auth_token/)
     expect(button('登録')).toBeDisabled()
     expect(button('オンにする')).toBeDisabled()
@@ -771,18 +824,19 @@ describe('Settings registration and bulk notifications', () => {
     let registeredNow = false
     const fetchMock = mockApi({
       ...settingsRoutes(),
-      'GET /api/settings': () => json(settings({ credentials_locked: registeredNow })),
-      'POST /api/register': () => {
+      'GET /api/accounts/default/settings': () =>
+        json(settings({ credentials_locked: registeredNow })),
+      'POST /api/accounts/default/register': () => {
         registeredNow = true
         return json(registration({ registered: true, uaid: 'u', channel_id: 'c' }))
       },
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await userEvent.click(await screen.findByRole('button', { name: '登録' }))
     await screen.findByText('登録済み')
     await waitFor(() => expect(screen.getByLabelText(/auth_token/)).toBeDisabled())
     expect(screen.getByText(/下の「受信先の登録」で登録を解除/)).toBeInTheDocument()
-    expect(requests(fetchMock, 'GET /api/settings')).toBe(2)
+    expect(requests(fetchMock, 'GET /api/accounts/default/settings')).toBe(2)
   })
 
   it('says so and offers a refetch when the settings cannot be refreshed after registering', async () => {
@@ -790,18 +844,18 @@ describe('Settings registration and bulk notifications', () => {
     let failRefresh = true
     mockApi({
       ...settingsRoutes(),
-      'GET /api/settings': () => {
+      'GET /api/accounts/default/settings': () => {
         if (!registeredNow) return json(settings())
         return failRefresh
           ? apiError(500, 'x', '更新に失敗')
           : json(settings({ credentials_locked: true }))
       },
-      'POST /api/register': () => {
+      'POST /api/accounts/default/register': () => {
         registeredNow = true
         return json(registration({ registered: true }))
       },
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await userEvent.click(await screen.findByRole('button', { name: '登録' }))
     const alert = await screen.findByRole('alert')
     expect(alert).toHaveTextContent('設定の状態を更新できません')
@@ -815,7 +869,7 @@ describe('Settings registration and bulk notifications', () => {
 
   it('keeps bulk notifications usable without a push registration', async () => {
     mockApi(settingsRoutes())
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     expect(await screen.findByText('未登録')).toBeInTheDocument()
     expect(await screen.findByRole('button', { name: 'オンにする' })).toBeEnabled()
   })
@@ -823,9 +877,9 @@ describe('Settings registration and bulk notifications', () => {
   it('does not wait for the registration to load before showing the cookie form', async () => {
     mockApi({
       ...settingsRoutes(),
-      'GET /api/registration': () => apiError(500, 'x', '登録の取得に失敗'),
+      'GET /api/accounts/default/registration': () => apiError(500, 'x', '登録の取得に失敗'),
     })
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     expect(await screen.findByLabelText(/auth_token/)).toBeInTheDocument()
     const section = await screen.findByText('登録の取得に失敗')
     expect(section).toBeInTheDocument()
@@ -839,7 +893,7 @@ describe('Settings polling side effects', () => {
   it('does not poll the cookie check', async () => {
     vi.useFakeTimers()
     const fetchMock = mockApi(settingsRoutes())
-    render(<Settings />)
+    render(<Settings accountId="default" />)
     await vi.advanceTimersByTimeAsync(10_000)
     expect(requests(fetchMock, VALIDATE)).toBe(0)
   })
@@ -848,8 +902,8 @@ describe('Settings polling side effects', () => {
 describe('Settings with a server that omits the filter', () => {
   it('fails to load through the existing retry path', async () => {
     const { notification_filter: _, ...legacy } = settings()
-    mockApi({ ...settingsRoutes(), 'GET /api/settings': () => json(legacy) })
-    render(<Settings />)
+    mockApi({ ...settingsRoutes(), 'GET /api/accounts/default/settings': () => json(legacy) })
+    render(<Settings accountId="default" />)
     expect(await screen.findByRole('alert')).toHaveTextContent('サーバーでエラーが発生しました。')
     expect(screen.getByRole('button', { name: '再試行' })).toBeInTheDocument()
     expect(screen.queryByRole('checkbox')).not.toBeInTheDocument()

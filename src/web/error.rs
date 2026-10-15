@@ -39,6 +39,38 @@ impl ApiError {
     pub fn provider(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_GATEWAY, "provider_failure", message)
     }
+
+    pub fn account_not_found() -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "account_not_found",
+            "No such account.",
+        )
+    }
+
+    pub fn is_account_not_found(&self) -> bool {
+        self.status == StatusCode::NOT_FOUND && self.code == "account_not_found"
+    }
+
+    pub fn invalid_account_id() -> Self {
+        Self::invalid(
+            "invalid_account_id",
+            "An account id uses 1-32 characters of a-z, 0-9, '_' or '-', starting with a letter or digit.",
+        )
+    }
+
+    pub fn account_exists() -> Self {
+        Self::conflict("account_exists", "An account with this id already exists.")
+    }
+
+    pub fn history_cleanup_required() -> Self {
+        Self::conflict(
+            "history_cleanup_required",
+            "Notification history files of an earlier account with this id remain next to the \
+             config file. Remove them manually before creating the account, so it does not \
+             inherit that history.",
+        )
+    }
 }
 
 impl From<AngelicAngelError> for ApiError {

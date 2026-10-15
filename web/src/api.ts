@@ -22,6 +22,7 @@ export interface Settings {
   configured: boolean
   auth_token_set: boolean
   ct0_set: boolean
+  webhook_secret_set: boolean
   webhook_endpoint: string | null
   webhook_source: WebhookSource
   credentials_locked: boolean
@@ -31,6 +32,7 @@ export interface Settings {
 export interface SettingsUpdate {
   auth_token?: string | null
   ct0?: string | null
+  webhook_secret?: string | null
   webhook_endpoint: string
   notification_filter: NotificationFilter
 }
@@ -47,16 +49,32 @@ export interface Registration {
   channel_id: string | null
 }
 
-export type ReceiverState =
-  | 'unconfigured'
-  | 'unregistered'
-  | 'stopped'
-  | 'connecting'
-  | 'connected'
-  | 'retrying'
-  | 'registering'
-  | 'unregistering'
-  | 'error'
+export const receiverStateSchema = z.enum([
+  'unconfigured',
+  'unregistered',
+  'stopped',
+  'connecting',
+  'connected',
+  'retrying',
+  'registering',
+  'unregistering',
+  'error',
+])
+
+export type ReceiverState = z.infer<typeof receiverStateSchema>
+
+/** The server enforces the same rule; it is also what a safe URL segment and file name need. */
+export const ACCOUNT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/
+
+export const accountSchema = z.object({
+  id: z.string().check(z.minLength(1)),
+  registered: z.boolean(),
+  receiver_state: receiverStateSchema,
+})
+
+export type Account = z.infer<typeof accountSchema>
+
+const accountListSchema = z.object({ accounts: z.array(accountSchema) })
 
 export interface Status {
   state: ReceiverState
@@ -162,12 +180,7 @@ export function errorText(e: unknown): string {
 
 // ---- transport ----
 
-async function request<T>(
-  method: string,
-  path: string,
-  body?: unknown,
-  verify?: (value: T) => T,
-): Promise<T> {
+async function send(method: string, path: string, body?: unknown): Promise<Response> {
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (body !== undefined) headers['Content-Type'] = 'application/json'
 
@@ -184,6 +197,16 @@ async function request<T>(
     throw new ApiError(0, 'network', fallbackMessage(0))
   }
   if (!res.ok) throw await toError(res)
+  return res
+}
+
+async function request<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  verify?: (value: T) => T,
+): Promise<T> {
+  const res = await send(method, path, body)
   try {
     const value = (await res.json()) as T
     return verify ? verify(value) : value
@@ -192,13 +215,20 @@ async function request<T>(
   }
 }
 
+/** For calls whose success is the status alone: the body, if any, is not read. */
+async function requestEmpty(method: string, path: string): Promise<void> {
+  await send(method, path)
+}
+
 export const NOTIFICATIONS_PAGE_SIZE = 50
 
-function notificationsPath(before?: string): string {
+const accountPath = (accountId: string) => `/api/accounts/${encodeURIComponent(accountId)}`
+
+function notificationsPath(accountId: string, before?: string): string {
   const query = new URLSearchParams()
   if (before !== undefined) query.set('before', before)
   query.set('limit', String(NOTIFICATIONS_PAGE_SIZE))
-  return `/api/notifications?${query}`
+  return `${accountPath(accountId)}/notifications?${query}`
 }
 
 function verifyFilter<T extends { notification_filter: NotificationFilter }>(value: T): T {
@@ -209,20 +239,34 @@ function verifyFilter<T extends { notification_filter: NotificationFilter }>(val
 }
 
 export const api = {
-  getSettings: () => request<Settings>('GET', '/api/settings', undefined, verifyFilter),
-  putSettings: (update: SettingsUpdate) =>
-    request<Settings>('PUT', '/api/settings', update, verifyFilter),
-  validateSettings: () => request<CredentialCheck>('POST', '/api/settings/validate'),
-  getRegistration: () => request<Registration>('GET', '/api/registration'),
-  register: () => request<Registration>('POST', '/api/register'),
-  unregister: () => request<Registration>('DELETE', '/api/registration'),
-  getStatus: () => request<Status>('GET', '/api/status'),
-  getFollowingNotifications: () =>
-    request<FollowingNotifications>('GET', '/api/following-notifications'),
-  startFollowingNotifications: () =>
-    request<FollowingNotifications>('POST', '/api/following-notifications'),
-  cancelFollowingNotifications: () =>
-    request<FollowingNotifications>('DELETE', '/api/following-notifications'),
-  getNotifications: (before?: string) =>
-    request<NotificationPage>('GET', notificationsPath(before), undefined, verifyFilter),
+  listAccounts: async () => {
+    const list = await request<{ accounts: Account[] }>('GET', '/api/accounts', undefined, (v) =>
+      accountListSchema.parse(v),
+    )
+    return list.accounts
+  },
+  createAccount: (id: string) =>
+    request<Account>('POST', '/api/accounts', { id }, (v) => accountSchema.parse(v)),
+  deleteAccount: (accountId: string) => requestEmpty('DELETE', accountPath(accountId)),
+  getSettings: (accountId: string) =>
+    request<Settings>('GET', `${accountPath(accountId)}/settings`, undefined, verifyFilter),
+  putSettings: (accountId: string, update: SettingsUpdate) =>
+    request<Settings>('PUT', `${accountPath(accountId)}/settings`, update, verifyFilter),
+  validateSettings: (accountId: string) =>
+    request<CredentialCheck>('POST', `${accountPath(accountId)}/settings/validate`),
+  getRegistration: (accountId: string) =>
+    request<Registration>('GET', `${accountPath(accountId)}/registration`),
+  register: (accountId: string) =>
+    request<Registration>('POST', `${accountPath(accountId)}/register`),
+  unregister: (accountId: string) =>
+    request<Registration>('DELETE', `${accountPath(accountId)}/registration`),
+  getStatus: (accountId: string) => request<Status>('GET', `${accountPath(accountId)}/status`),
+  getFollowingNotifications: (accountId: string) =>
+    request<FollowingNotifications>('GET', `${accountPath(accountId)}/following-notifications`),
+  startFollowingNotifications: (accountId: string) =>
+    request<FollowingNotifications>('POST', `${accountPath(accountId)}/following-notifications`),
+  cancelFollowingNotifications: (accountId: string) =>
+    request<FollowingNotifications>('DELETE', `${accountPath(accountId)}/following-notifications`),
+  getNotifications: (accountId: string, before?: string) =>
+    request<NotificationPage>('GET', notificationsPath(accountId, before), undefined, verifyFilter),
 }

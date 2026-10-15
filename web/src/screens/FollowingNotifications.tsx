@@ -102,13 +102,15 @@ function Progress({ dto }: { dto: Dto }) {
 
 /** Push registration is deliberately not required: only the saved cookies are. */
 export function FollowingNotifications({
+  accountId,
   configured,
   lock,
 }: {
+  accountId: string
   configured: boolean
   lock: Exclusive
 }) {
-  const poll = usePoll(api.getFollowingNotifications, POLL_MS)
+  const poll = usePoll(() => api.getFollowingNotifications(accountId), POLL_MS)
   const [confirming, setConfirming] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
 
@@ -126,8 +128,8 @@ export function FollowingNotifications({
       try {
         poll.setData(
           await (kind === 'start'
-            ? api.startFollowingNotifications()
-            : api.cancelFollowingNotifications()),
+            ? api.startFollowingNotifications(accountId)
+            : api.cancelFollowingNotifications(accountId)),
         )
       } catch (e) {
         setActionError(errorText(e))

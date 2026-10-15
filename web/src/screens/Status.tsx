@@ -44,8 +44,8 @@ function tone(state: ReceiverState): Tone {
   return 'neutral'
 }
 
-export function Status() {
-  const { data, error, loaded } = usePoll(api.getStatus, POLL_MS)
+export function Status({ accountId }: { accountId: string }) {
+  const { data, error, loaded } = usePoll(() => api.getStatus(accountId), POLL_MS)
 
   if (!data) {
     return (

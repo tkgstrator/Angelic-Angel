@@ -9,13 +9,13 @@ const registered = registration({ registered: true, uaid: 'uaid-1', channel_id: 
 
 function renderSection(configured = true, onChanged = async () => {}) {
   return renderLocked((lock) => (
-    <Registration configured={configured} lock={lock} onChanged={onChanged} />
+    <Registration accountId="default" configured={configured} lock={lock} onChanged={onChanged} />
   ))
 }
 
 describe('Registration', () => {
   it('shows the unregistered state with unregister disabled', async () => {
-    mockApi({ 'GET /api/registration': () => json(registration()) })
+    mockApi({ 'GET /api/accounts/default/registration': () => json(registration()) })
     renderSection()
     expect(await screen.findByText('未登録')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '登録解除' })).toBeDisabled()
@@ -23,7 +23,7 @@ describe('Registration', () => {
   })
 
   it('disables register when cookies are not saved and explains why', async () => {
-    mockApi({ 'GET /api/registration': () => json(registration()) })
+    mockApi({ 'GET /api/accounts/default/registration': () => json(registration()) })
     renderSection(false)
     expect(await screen.findByText(/先に上の Cookie を保存/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '登録' })).toBeDisabled()
@@ -33,8 +33,8 @@ describe('Registration', () => {
     let release: (r: Response) => void = () => {}
     const onChanged = vi.fn(async () => {})
     mockApi({
-      'GET /api/registration': () => json(registration()),
-      'POST /api/register': () => new Promise<Response>((r) => (release = r)),
+      'GET /api/accounts/default/registration': () => json(registration()),
+      'POST /api/accounts/default/register': () => new Promise<Response>((r) => (release = r)),
     })
     renderSection(true, onChanged)
     await screen.findByText('未登録')
@@ -52,8 +52,8 @@ describe('Registration', () => {
     function mockUnregister(onDelete: () => Response | Promise<Response>) {
       const calls = { deleted: 0 }
       mockApi({
-        'GET /api/registration': () => json(registered),
-        'DELETE /api/registration': () => {
+        'GET /api/accounts/default/registration': () => json(registered),
+        'DELETE /api/accounts/default/registration': () => {
           calls.deleted++
           return onDelete()
         },
@@ -150,8 +150,8 @@ describe('Registration', () => {
     let calls = 0
     const onChanged = vi.fn(async () => {})
     mockApi({
-      'GET /api/registration': () => json(registration()),
-      'POST /api/register': () =>
+      'GET /api/accounts/default/registration': () => json(registration()),
+      'POST /api/accounts/default/register': () =>
         ++calls === 1
           ? apiError(502, 'provider', '外部サービスに失敗しました。')
           : json(registered),
@@ -168,7 +168,7 @@ describe('Registration', () => {
   })
 
   it('offers retry when loading fails', async () => {
-    mockApi({ 'GET /api/registration': () => apiError(500, 'x', '読み込み失敗') })
+    mockApi({ 'GET /api/accounts/default/registration': () => apiError(500, 'x', '読み込み失敗') })
     renderSection()
     expect(await screen.findByRole('alert')).toHaveTextContent('読み込み失敗')
     expect(screen.getByRole('button', { name: '再試行' })).toBeInTheDocument()

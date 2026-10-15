@@ -46,14 +46,14 @@ function precompress(): Plugin {
 
 const target = process.env.VITE_API_TARGET ?? 'http://127.0.0.1:8080'
 
-const NOTIFICATIONS_PATH = '/api/notifications'
+const NOTIFICATIONS_PATH = /^\/api\/accounts\/[^/]+\/notifications$/
 
 // 通知 GET の応答は上流の content-length と connection を引き継がず、下流の接続管理を Node に任せる。
 export function normalizeNotificationsResponseHeaders(
   proxyRes: Pick<IncomingMessage, 'headers'>,
   req: Pick<IncomingMessage, 'method' | 'url'>,
 ): void {
-  if (req.method === 'GET' && req.url?.split('?', 1)[0] === NOTIFICATIONS_PATH) {
+  if (req.method === 'GET' && NOTIFICATIONS_PATH.test(req.url?.split('?', 1)[0] ?? '')) {
     delete proxyRes.headers['content-length']
     delete proxyRes.headers.connection
   }

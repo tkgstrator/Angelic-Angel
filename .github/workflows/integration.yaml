@@ -7,6 +7,12 @@ on:
       - "**"
   pull_request:
   workflow_call:
+    inputs:
+      ci-force-heavy:
+        description: Run full validation when called by another workflow.
+        type: boolean
+        default: true
+        required: false
 
 permissions:
   contents: read
@@ -20,6 +26,16 @@ env:
   RUST_TOOLCHAIN: 1.99.0
 
 jobs:
+  ci-change-scope:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci-change-scope.yaml
+    with:
+      doc-paths: '["AGENTS.md","CLAUDE.md","README.md","docs/development/ci-change-scope.md","docs/superpowers/plans/2026-10-10-webui.md","docs/superpowers/specs/2026-10-10-webui-design.md"]'
+      doc-prefixes: '[]'
+      runner: '"ubuntu-latest"'
+      force-heavy: ${{ inputs['ci-force-heavy'] == true }}
+
   commitlint:
     name: Commit Lint
     runs-on: ubuntu-24.04
@@ -72,41 +88,76 @@ jobs:
         run: cargo fmt --all -- --check
 
   clippy:
+    if: ${{ !cancelled() && (true) }}
+    needs: ["ci-change-scope"]
     name: Clippy
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON((needs['ci-change-scope'].result == 'success' && needs['ci-change-scope'].outputs.docs_only == 'true') && '"ubuntu-latest"' || '"ubuntu-24.04"') }}
     steps:
       - uses: actions/checkout@v5
+        if: ${{ (needs['ci-change-scope'].result != 'success' || needs['ci-change-scope'].outputs.docs_only != 'true') }}
       - name: Install build dependencies
+        if: ${{ (needs['ci-change-scope'].result != 'success' || needs['ci-change-scope'].outputs.docs_only != 'true') }}
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake
       - uses: dtolnay/rust-toolchain@master
+        if: ${{ (needs['ci-change-scope'].result != 'success' || needs['ci-change-scope'].outputs.docs_only != 'true') }}
         with:
           toolchain: 1.99.0
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        if: ${{ (needs['ci-change-scope'].result != 'success' || needs['ci-change-scope'].outputs.docs_only != 'true') }}
       - name: cargo clippy
+        if: ${{ (needs['ci-change-scope'].result != 'success' || needs['ci-change-scope'].outputs.docs_only != 'true') }}
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
+      - name: Docs-only exemption
+        if: ${{ needs['ci-change-scope'].result == 'success' && needs['ci-change-scope'].outputs.docs_only == 'true' }}
+        shell: bash
+        working-directory: .
+        env:
+          CI_CHANGE_REASON: ${{ needs['ci-change-scope'].outputs.reason }}
+        run: |
+          printf '%s\n' "$CI_CHANGE_REASON" >> "$GITHUB_STEP_SUMMARY"
   test:
+    if: ${{ !cancelled() && (true) }}
+    needs: ["ci-change-scope"]
     name: Test
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON((needs['ci-change-scope'].result == 'success' && needs['ci-change-scope'].outputs.docs_only == 'true') && '"ubuntu-latest"' || '"ubuntu-24.04"') }}
     steps:
       - uses: actions/checkout@v5
+        if: ${{ (needs['ci-change-scope'].result != 'success' || needs['ci-change-scope'].outputs.docs_only != 'true') }}
       - name: Install build dependencies
+        if: ${{ (needs['ci-change-scope'].result != 'success' || needs['ci-change-scope'].outputs.docs_only != 'true') }}
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake
       - uses: dtolnay/rust-toolchain@master
+        if: ${{ (needs['ci-change-scope'].result != 'success' || needs['ci-change-scope'].outputs.docs_only != 'true') }}
         with:
           toolchain: 1.99.0
       - uses: Swatinem/rust-cache@v2
+        if: ${{ (needs['ci-change-scope'].result != 'success' || needs['ci-change-scope'].outputs.docs_only != 'true') }}
       - name: cargo test
+        if: ${{ (needs['ci-change-scope'].result != 'success' || needs['ci-change-scope'].outputs.docs_only != 'true') }}
         run: cargo test --locked --all-targets --all-features
 
+      - name: Docs-only exemption
+        if: ${{ needs['ci-change-scope'].result == 'success' && needs['ci-change-scope'].outputs.docs_only == 'true' }}
+        shell: bash
+        working-directory: .
+        env:
+          CI_CHANGE_REASON: ${{ needs['ci-change-scope'].outputs.reason }}
+        run: |
+          printf '%s\n' "$CI_CHANGE_REASON" >> "$GITHUB_STEP_SUMMARY"
   docker:
+    if: ${{ !cancelled() && (true) }}
+    needs: ["ci-change-scope"]
     name: Docker Smoke
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON((needs['ci-change-scope'].result == 'success' && needs['ci-change-scope'].outputs.docs_only == 'true') && '"ubuntu-latest"' || '"ubuntu-24.04"') }}
     steps:
       - uses: actions/checkout@v5
+        if: ${{ (needs['ci-change-scope'].result != 'success' || needs['ci-change-scope'].outputs.docs_only != 'true') }}
       - uses: docker/setup-buildx-action@v3
+        if: ${{ (needs['ci-change-scope'].result != 'success' || needs['ci-change-scope'].outputs.docs_only != 'true') }}
       - name: Build image
+        if: ${{ (needs['ci-change-scope'].result != 'success' || needs['ci-change-scope'].outputs.docs_only != 'true') }}
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -116,4 +167,14 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Smoke test
+        if: ${{ (needs['ci-change-scope'].result != 'success' || needs['ci-change-scope'].outputs.docs_only != 'true') }}
         run: scripts/docker-smoke.sh angelic-angel:ci
+
+      - name: Docs-only exemption
+        if: ${{ needs['ci-change-scope'].result == 'success' && needs['ci-change-scope'].outputs.docs_only == 'true' }}
+        shell: bash
+        working-directory: .
+        env:
+          CI_CHANGE_REASON: ${{ needs['ci-change-scope'].outputs.reason }}
+        run: |
+          printf '%s\n' "$CI_CHANGE_REASON" >> "$GITHUB_STEP_SUMMARY"

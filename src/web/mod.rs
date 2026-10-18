@@ -430,7 +430,9 @@ async fn shutdown_signal() {
 
 async fn wait_stop(mut receiver: tokio::sync::watch::Receiver<bool>) {
     while !*receiver.borrow_and_update() {
-        if receiver.changed().await.is_err() { break; }
+        if receiver.changed().await.is_err() {
+            break;
+        }
     }
 }
 
@@ -448,9 +450,13 @@ pub async fn serve(config_path: PathBuf, bind: String, assets_dir: PathBuf) -> R
     let machine = match machine_settings {
         Some(settings) => {
             let state = crate::machine::Machine::new(
-                settings, Arc::clone(&service), &config_path, crate::twitter::XApi::new(),
+                settings,
+                Arc::clone(&service),
+                &config_path,
+                crate::twitter::XApi::new(),
             )?;
-            let listener = tokio::net::TcpListener::bind(state.bind()).await
+            let listener = tokio::net::TcpListener::bind(state.bind())
+                .await
                 .map_err(|_| AngelicAngelError::Config("failed to bind machine listener".into()))?;
             Some((listener, crate::machine::router(state)))
         },
@@ -471,7 +477,9 @@ pub async fn serve(config_path: PathBuf, bind: String, assets_dir: PathBuf) -> R
             let admin = axum::serve(listener, app).with_graceful_shutdown(wait_stop(admin_stop));
             let machine = async {
                 if let Some((listener, app)) = machine {
-                    axum::serve(listener, app).with_graceful_shutdown(wait_stop(machine_stop)).await?;
+                    axum::serve(listener, app)
+                        .with_graceful_shutdown(wait_stop(machine_stop))
+                        .await?;
                 }
                 Ok::<(), std::io::Error>(())
             };
@@ -485,7 +493,9 @@ pub async fn serve(config_path: PathBuf, bind: String, assets_dir: PathBuf) -> R
         let _ = stop.send(true);
         match outcome {
             Some(result) => result,
-            None => tokio::time::timeout(SHUTDOWN_GRACE, &mut servers).await.unwrap_or(Ok(())),
+            None => tokio::time::timeout(SHUTDOWN_GRACE, &mut servers)
+                .await
+                .unwrap_or(Ok(())),
         }
     };
 

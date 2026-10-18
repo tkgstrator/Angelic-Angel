@@ -545,13 +545,20 @@ impl<B: Backend> Service<B> {
         Ok(guard)
     }
 
-    pub(crate) fn machine_credentials(&self) -> std::result::Result<(TwitterConfig, String), ApiError> {
+    pub(crate) fn machine_credentials(
+        &self,
+    ) -> std::result::Result<(TwitterConfig, String), ApiError> {
         let mut account = self.load()?;
-        if self.env.defines_account(&self.id) && Config::load_optional(&self.config_path)?
-            .is_none_or(|c| c.account(&self.id).is_none()) {
+        if self.env.defines_account(&self.id)
+            && Config::load_optional(&self.config_path)?
+                .is_none_or(|c| c.account(&self.id).is_none())
+        {
             account.credential_revision.clear();
         }
-        Ok((self.env.twitter(&self.id, &account.twitter), account.credential_revision))
+        Ok((
+            self.env.twitter(&self.id, &account.twitter),
+            account.credential_revision,
+        ))
     }
 
     fn load(&self) -> std::result::Result<Account, ApiError> {

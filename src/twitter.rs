@@ -180,19 +180,43 @@ fn parse_identity(body: &[u8]) -> std::result::Result<Identity, XError> {
     if value.get("errors").is_some() {
         return Err(XError::Malformed);
     }
-    let user_id = value.get("id_str").and_then(serde_json::Value::as_str)
-        .filter(|v| is_valid_user_id(v)).ok_or(XError::Malformed)?;
-    let screen_name = value.get("screen_name").and_then(serde_json::Value::as_str)
-        .filter(|v| is_valid_screen_name(v)).ok_or(XError::Malformed)?;
-    let name = value.get("name").and_then(serde_json::Value::as_str)
-        .filter(|v| v.len() <= 512).ok_or(XError::Malformed)?;
-    let avatar_url = value.get("profile_image_url_https").and_then(serde_json::Value::as_str)
-        .filter(|raw| raw.len() <= 2048).and_then(|raw| Url::parse(raw).ok())
-        .filter(|url| url.scheme() == "https" && url.host_str() == Some("pbs.twimg.com")
-            && url.username().is_empty() && url.password().is_none() && url.port().is_none()
-            && url.path().starts_with("/profile_images/") && url.query().is_none()
-            && url.fragment().is_none()).map(|url| url.to_string());
-    Ok(Identity { user_id: user_id.into(), screen_name: screen_name.into(), name: name.into(), avatar_url })
+    let user_id = value
+        .get("id_str")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| is_valid_user_id(v))
+        .ok_or(XError::Malformed)?;
+    let screen_name = value
+        .get("screen_name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| is_valid_screen_name(v))
+        .ok_or(XError::Malformed)?;
+    let name = value
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| v.len() <= 512)
+        .ok_or(XError::Malformed)?;
+    let avatar_url = value
+        .get("profile_image_url_https")
+        .and_then(serde_json::Value::as_str)
+        .filter(|raw| raw.len() <= 2048)
+        .and_then(|raw| Url::parse(raw).ok())
+        .filter(|url| {
+            url.scheme() == "https"
+                && url.host_str() == Some("pbs.twimg.com")
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.port().is_none()
+                && url.path().starts_with("/profile_images/")
+                && url.query().is_none()
+                && url.fragment().is_none()
+        })
+        .map(|url| url.to_string());
+    Ok(Identity {
+        user_id: user_id.into(),
+        screen_name: screen_name.into(),
+        name: name.into(),
+        avatar_url,
+    })
 }
 
 fn parse_post(body: &[u8], expected_user: &str) -> std::result::Result<String, XError> {
@@ -200,11 +224,18 @@ fn parse_post(body: &[u8], expected_user: &str) -> std::result::Result<String, X
     if value.get("errors").is_some() {
         return Err(XError::Malformed);
     }
-    let result = value.pointer("/data/create_tweet/tweet_results/result").ok_or(XError::Malformed)?;
-    let id = result.get("rest_id").and_then(serde_json::Value::as_str)
-        .filter(|v| is_valid_user_id(v)).ok_or(XError::Malformed)?;
-    let author = result.pointer("/core/user_results/result/rest_id")
-        .and_then(serde_json::Value::as_str).ok_or(XError::Malformed)?;
+    let result = value
+        .pointer("/data/create_tweet/tweet_results/result")
+        .ok_or(XError::Malformed)?;
+    let id = result
+        .get("rest_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| is_valid_user_id(v))
+        .ok_or(XError::Malformed)?;
+    let author = result
+        .pointer("/core/user_results/result/rest_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(XError::Malformed)?;
     if author != expected_user {
         return Err(XError::Malformed);
     }
@@ -356,15 +387,21 @@ impl XApi {
 
     /// Metadata readiness is cache-only: listing accounts never contacts X or GitHub.
     pub async fn machine_ready(&self) -> bool {
-        self.metadata.lock().await.as_ref()
+        self.metadata
+            .lock()
+            .await
+            .as_ref()
             .is_some_and(|(_, fetched)| fetched.elapsed() < TRANSACTION_TTL)
             && self.cached_transaction().is_some()
     }
 
-    pub async fn prepare_post(&self) -> std::result::Result<crate::x_metadata::CreateTweet, XError> {
+    pub async fn prepare_post(
+        &self,
+    ) -> std::result::Result<crate::x_metadata::CreateTweet, XError> {
         let mut slot = self.metadata.lock().await;
         if let Some((operation, fetched)) = slot.as_ref()
-            && fetched.elapsed() < TRANSACTION_TTL {
+            && fetched.elapsed() < TRANSACTION_TTL
+        {
             self.transaction().await?;
             return Ok(operation.clone());
         }
@@ -376,7 +413,10 @@ impl XApi {
     }
 
     pub async fn identity(&self, twitter: &TwitterConfig) -> std::result::Result<Identity, XError> {
-        let url = format!("{}/account/verify_credentials.json?skip_status=true&include_entities=false", self.endpoints.api_base);
+        let url = format!(
+            "{}/account/verify_credentials.json?skip_status=true&include_entities=false",
+            self.endpoints.api_base
+        );
         let body = self.send(self.client.get(url), twitter).await?;
         parse_identity(&body)
     }
@@ -398,11 +438,19 @@ impl XApi {
         if let Some(id) = reply {
             variables["reply"] = json!({"in_reply_to_tweet_id": id, "exclude_reply_user_ids": []});
         }
-        let url = format!("{}/{}/CreateTweet", self.endpoints.graphql_base, operation.query_id);
-        let body = self.send(self.client.post(url).json(&json!({
-            "queryId": operation.query_id, "variables": variables,
-            "features": operation.features, "fieldToggles": operation.field_toggles
-        })), twitter).await?;
+        let url = format!(
+            "{}/{}/CreateTweet",
+            self.endpoints.graphql_base, operation.query_id
+        );
+        let body = self
+            .send(
+                self.client.post(url).json(&json!({
+                    "queryId": operation.query_id, "variables": variables,
+                    "features": operation.features, "fieldToggles": operation.field_toggles
+                })),
+                twitter,
+            )
+            .await?;
         parse_post(&body, expected_user)
     }
 
@@ -705,7 +753,9 @@ mod tests {
         assert!(!public.contains("SECRET"));
         assert_eq!(identity.user_id, "123");
         assert!(identity.avatar_url.is_some());
-        let bad = String::from_utf8(body.to_vec()).unwrap().replace("pbs.twimg.com", "evil.invalid");
+        let bad = String::from_utf8(body.to_vec())
+            .unwrap()
+            .replace("pbs.twimg.com", "evil.invalid");
         assert!(parse_identity(bad.as_bytes()).unwrap().avatar_url.is_none());
         assert!(parse_identity(br#"{"errors":[{"message":"PRIVATE"}]}"#).is_err());
     }
@@ -908,10 +958,20 @@ mod tests {
         let metadata = api.prepare_post().await.unwrap();
         assert!(api.machine_ready().await);
         assert_eq!(api.identity(&twitter()).await.unwrap().user_id, "123");
-        assert_eq!(api.create_post(&twitter(), &metadata, "fixture", Some("456"), "123").await.unwrap(), "789");
+        assert_eq!(
+            api.create_post(&twitter(), &metadata, "fixture", Some("456"), "123")
+                .await
+                .unwrap(),
+            "789"
+        );
         let requests = log.lock().unwrap();
-        let catalogue = requests.iter().find(|r| r.path == "/catalogue.json").unwrap();
-        for header in CREDENTIAL_HEADERS { assert!(!catalogue.headers.contains_key(header)); }
+        let catalogue = requests
+            .iter()
+            .find(|r| r.path == "/catalogue.json")
+            .unwrap();
+        for header in CREDENTIAL_HEADERS {
+            assert!(!catalogue.headers.contains_key(header));
+        }
         let post = requests.iter().find(|r| r.method == "POST").unwrap();
         assert_valid_id(post);
         let body: serde_json::Value = serde_json::from_str(&post.body).unwrap();
@@ -928,9 +988,12 @@ mod tests {
         let target = sink.base.clone();
         let server = serve(recording(Log::default(), move |_| {
             let mut response = reply(302, "");
-            response.headers_mut().insert("location", target.parse().unwrap());
             response
-        })).await;
+                .headers_mut()
+                .insert("location", target.parse().unwrap());
+            response
+        }))
+        .await;
         let api = injected(&server.base);
         assert!(api.prepare_post().await.is_err());
         assert!(!api.machine_ready().await);
@@ -942,16 +1005,34 @@ mod tests {
     #[tokio::test]
     async fn machine_http_and_graphql_errors_are_safe() {
         for status in [200, 401, 403, 429, 500] {
-            let server = serve(recording(Log::default(), move |_| reply(status,
-                r#"{"errors":[{"message":"SYNTHETIC-PRIVATE-UPSTREAM"}]}"#))).await;
+            let server = serve(recording(Log::default(), move |_| {
+                reply(
+                    status,
+                    r#"{"errors":[{"message":"SYNTHETIC-PRIVATE-UPSTREAM"}]}"#,
+                )
+            }))
+            .await;
             let api = injected(&server.base);
-            let metadata = crate::x_metadata::parse(include_str!("../tests/fixtures/machine-metadata.json")).unwrap();
-            let error = api.create_post(&twitter(), &metadata, "fixture", None, "123").await.unwrap_err();
+            let metadata =
+                crate::x_metadata::parse(include_str!("../tests/fixtures/machine-metadata.json"))
+                    .unwrap();
+            let error = api
+                .create_post(&twitter(), &metadata, "fixture", None, "123")
+                .await
+                .unwrap_err();
             assert!(!error.to_string().contains("SYNTHETIC-PRIVATE-UPSTREAM"));
-            if status == 401 { assert_eq!(error, XError::Unauthorized); }
-            if status == 403 { assert_eq!(error, XError::Forbidden); }
-            if status == 429 { assert_eq!(error, XError::RateLimited); }
-            if status == 200 { assert_eq!(error, XError::Malformed); }
+            if status == 401 {
+                assert_eq!(error, XError::Unauthorized);
+            }
+            if status == 403 {
+                assert_eq!(error, XError::Forbidden);
+            }
+            if status == 429 {
+                assert_eq!(error, XError::RateLimited);
+            }
+            if status == 200 {
+                assert_eq!(error, XError::Malformed);
+            }
         }
     }
 

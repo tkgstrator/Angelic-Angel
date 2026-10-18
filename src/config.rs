@@ -74,9 +74,22 @@ pub struct Account {
     /// Explicit opt-in for machine text posts and replies. Missing always means disabled.
     #[serde(default)]
     pub machine_post_enabled: bool,
+    /// Explicit opt-in for machine likes. Missing always means disabled.
+    #[serde(default)]
+    pub machine_like_enabled: bool,
+    /// Explicit opt-in for machine follows. Missing always means disabled.
+    #[serde(default)]
+    pub machine_follow_enabled: bool,
     /// Opaque incarnation/revision, never derived from a credential in public responses.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub credential_revision: String,
+    /// The machine client that created this account through the machine API. Only that client may
+    /// manage it there. Missing means nobody: accounts made in the WebUI, by env or by older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_owner: Option<String>,
+    /// The immutable X user id the cookies were verified against when the machine API stored them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_user_id: Option<String>,
     /// 環境変数で認証情報を渡す運用では `[accounts.twitter]` を持たない設定ファイルになる。
     #[serde(default, skip_serializing_if = "TwitterConfig::is_empty")]
     pub twitter: TwitterConfig,
@@ -94,7 +107,11 @@ impl Account {
         Self {
             id: id.into(),
             machine_post_enabled: false,
+            machine_like_enabled: false,
+            machine_follow_enabled: false,
             credential_revision: uuid::Uuid::new_v4().to_string(),
+            machine_owner: None,
+            x_user_id: None,
             twitter: TwitterConfig::default(),
             registration: None,
             webhook_endpoint: None,
@@ -134,7 +151,11 @@ impl TryFrom<RawConfig> for Config {
             (None, true) => vec![Account {
                 id: DEFAULT_ACCOUNT_ID.to_string(),
                 machine_post_enabled: false,
+                machine_like_enabled: false,
+                machine_follow_enabled: false,
                 credential_revision: String::new(),
+                machine_owner: None,
+                x_user_id: None,
                 twitter: raw.twitter.unwrap_or_default(),
                 registration: raw.registration,
                 webhook_endpoint: raw.webhook_endpoint,
@@ -1813,5 +1834,50 @@ tweet = false
         let invalid =
             toml::from_str::<Config>("[[accounts]]\nid='default'\nmachine_post_enabled='true'\n");
         assert!(invalid.is_err());
+    }
+
+    #[test]
+    fn machine_action_permissions_default_off_and_roundtrip_independently() {
+        for parsed in [
+            Account::new("default"),
+            default_of(LEGACY),
+            default_of("[[accounts]]\nid='default'\n"),
+            default_of("[[accounts]]\nid='default'\nmachine_post_enabled=true\n"),
+        ] {
+            assert!(!parsed.machine_like_enabled);
+            assert!(!parsed.machine_follow_enabled);
+        }
+        let path = temp_dir().join("action-permission.toml");
+        let original = account("default", "synthetic-auth");
+        Config {
+            accounts: vec![original, Account::new("other")],
+        }
+        .save(&path)
+        .unwrap();
+        let revision = test_default_account(&path).credential_revision;
+        for like in [false, true] {
+            for follow in [false, true] {
+                Config::modify_account::<_, AngelicAngelError>(&path, "default", |current| {
+                    let mut account = current.unwrap();
+                    account.machine_like_enabled = like;
+                    account.machine_follow_enabled = follow;
+                    Ok((Some(account), ()))
+                })
+                .unwrap();
+                let saved = test_default_account(&path);
+                assert_eq!(saved.machine_like_enabled, like);
+                assert_eq!(saved.machine_follow_enabled, follow);
+                assert!(!saved.machine_post_enabled);
+                assert_eq!(saved.credential_revision, revision);
+                let config = Config::load(&path).unwrap();
+                let other = config.account("other").unwrap();
+                assert!(!other.machine_like_enabled);
+                assert!(!other.machine_follow_enabled);
+            }
+        }
+        for key in ["machine_like_enabled", "machine_follow_enabled"] {
+            let text = format!("[[accounts]]\nid='default'\n{key}='true'\n");
+            assert!(toml::from_str::<Config>(&text).is_err());
+        }
     }
 }

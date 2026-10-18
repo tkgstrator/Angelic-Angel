@@ -26,6 +26,10 @@ const MAX_CREDENTIAL_LEN: usize = 1024;
 const MAX_WEBHOOK_SECRET_LEN: usize = 4096;
 const MAX_URL_LEN: usize = 2048;
 
+#[path = "service_machine.rs"]
+mod machine_access;
+pub(crate) use machine_access::MachineProfile;
+
 /// Remote operations and the receiver loop, abstracted so tests can use a fake.
 pub trait Backend: Send + Sync + 'static {
     fn subscribe(&self) -> impl Future<Output = Result<PushSubscription>> + Send;
@@ -193,6 +197,8 @@ impl Environment {
 #[derive(Debug, Serialize, PartialEq)]
 pub struct SettingsDto {
     pub machine_post_enabled: bool,
+    pub machine_like_enabled: bool,
+    pub machine_follow_enabled: bool,
     pub configured: bool,
     pub auth_token_set: bool,
     pub ct0_set: bool,
@@ -262,6 +268,12 @@ pub struct SettingsUpdate {
     /// Omission keeps the saved permission; new accounts default to disabled.
     #[serde(default)]
     pub machine_post_enabled: Option<bool>,
+    /// Omission keeps the saved permission; new accounts default to disabled.
+    #[serde(default)]
+    pub machine_like_enabled: Option<bool>,
+    /// Omission keeps the saved permission; new accounts default to disabled.
+    #[serde(default)]
+    pub machine_follow_enabled: Option<bool>,
     #[serde(default)]
     pub auth_token: Option<String>,
     #[serde(default)]
@@ -313,6 +325,8 @@ fn settings_dto(env: &Environment, account: &Account) -> SettingsDto {
     let (secret, _) = env.webhook_secret(&account.id, account.webhook_secret.as_deref());
     SettingsDto {
         machine_post_enabled: account.machine_post_enabled,
+        machine_like_enabled: account.machine_like_enabled,
+        machine_follow_enabled: account.machine_follow_enabled,
         configured: has_credentials(&twitter),
         auth_token_set: !twitter.auth_token.is_empty(),
         ct0_set: !twitter.ct0.is_empty(),
@@ -552,6 +566,14 @@ impl<B: Backend> Service<B> {
 
     pub(crate) fn machine_post_enabled(&self) -> std::result::Result<bool, ApiError> {
         Ok(self.load()?.machine_post_enabled)
+    }
+
+    pub(crate) fn machine_like_enabled(&self) -> std::result::Result<bool, ApiError> {
+        Ok(self.load()?.machine_like_enabled)
+    }
+
+    pub(crate) fn machine_follow_enabled(&self) -> std::result::Result<bool, ApiError> {
+        Ok(self.load()?.machine_follow_enabled)
     }
 
     pub(crate) fn machine_credentials(
@@ -893,6 +915,12 @@ impl<B: Backend> Service<B> {
             if let Some(enabled) = update.machine_post_enabled {
                 account.machine_post_enabled = enabled;
             }
+            if let Some(enabled) = update.machine_like_enabled {
+                account.machine_like_enabled = enabled;
+            }
+            if let Some(enabled) = update.machine_follow_enabled {
+                account.machine_follow_enabled = enabled;
+            }
             account.twitter = twitter;
             if !endpoint_from_env {
                 account.webhook_endpoint = webhook;
@@ -910,13 +938,21 @@ impl<B: Backend> Service<B> {
 
     pub async fn register(&self) -> std::result::Result<RegistrationDto, ApiError> {
         let mut slot = self.receiver.try_lock().map_err(|_| ApiError::busy())?;
+        self.register_locked(&mut slot).await
+    }
+
+    /// [`Service::register`] for a caller that already holds the mutation lock as `slot`.
+    pub(crate) async fn register_locked(
+        &self,
+        slot: &mut Option<JoinHandle<()>>,
+    ) -> std::result::Result<RegistrationDto, ApiError> {
         self.ensure_no_following_job()?;
         let account = self.load()?;
 
         if let Some(registration) = account.registration.clone() {
             let running = slot.as_ref().is_some_and(|h| !h.is_finished());
             if !running {
-                self.start_receiver(&mut slot, registration).await;
+                self.start_receiver(slot, registration).await;
             }
             return Ok(registration_dto(&account));
         }
@@ -930,7 +966,7 @@ impl<B: Backend> Service<B> {
         }
 
         let _operation = OperationGuard::new(&self.telemetry, Operation::Registering);
-        self.stop_receiver(&mut slot).await;
+        self.stop_receiver(slot).await;
 
         let subscription = self
             .remote("AutoPush registration", self.backend.subscribe())
@@ -969,7 +1005,7 @@ impl<B: Backend> Service<B> {
             },
         };
 
-        self.start_receiver(&mut slot, registration).await;
+        self.start_receiver(slot, registration).await;
         Ok(registration_dto(&saved))
     }
 
@@ -985,15 +1021,23 @@ impl<B: Backend> Service<B> {
 
     pub async fn unregister(&self) -> std::result::Result<RegistrationDto, ApiError> {
         let mut slot = self.receiver.try_lock().map_err(|_| ApiError::busy())?;
+        self.unregister_locked(&mut slot).await
+    }
+
+    /// [`Service::unregister`] for a caller that already holds the mutation lock as `slot`.
+    pub(crate) async fn unregister_locked(
+        &self,
+        slot: &mut Option<JoinHandle<()>>,
+    ) -> std::result::Result<RegistrationDto, ApiError> {
         self.ensure_no_following_job()?;
         let account = self.load()?;
         let Some(registration) = account.registration.clone() else {
-            self.stop_receiver(&mut slot).await;
+            self.stop_receiver(slot).await;
             return Ok(registration_dto(&account));
         };
 
         let _operation = OperationGuard::new(&self.telemetry, Operation::Unregistering);
-        self.stop_receiver(&mut slot).await;
+        self.stop_receiver(slot).await;
 
         if let Err(error) = self
             .remote(
@@ -1002,7 +1046,7 @@ impl<B: Backend> Service<B> {
             )
             .await
         {
-            self.start_receiver(&mut slot, registration).await;
+            self.start_receiver(slot, registration).await;
             return Err(error);
         }
 
@@ -1020,7 +1064,7 @@ impl<B: Backend> Service<B> {
                 .as_ref()
                 .map_or_else(no_registration, registration_dto)),
             Err(error) => {
-                self.start_receiver(&mut slot, registration).await;
+                self.start_receiver(slot, registration).await;
                 Err(error)
             },
         }
@@ -1035,6 +1079,14 @@ impl<B: Backend> Service<B> {
     /// `removed` makes any handle resolved earlier fail afterwards.
     async fn delete(&self) -> std::result::Result<(), ApiError> {
         let mut slot = self.receiver.try_lock().map_err(|_| ApiError::busy())?;
+        self.delete_locked(&mut slot).await
+    }
+
+    /// [`Service::delete`] for a caller that already holds the mutation lock as `slot`.
+    pub(crate) async fn delete_locked(
+        &self,
+        slot: &mut Option<JoinHandle<()>>,
+    ) -> std::result::Result<(), ApiError> {
         self.ensure_live()?;
         if self.env.defines_account(&self.id) {
             return Err(ApiError::conflict(
@@ -1050,7 +1102,7 @@ impl<B: Backend> Service<B> {
         let _operation = registration
             .as_ref()
             .map(|_| OperationGuard::new(&self.telemetry, Operation::Unregistering));
-        self.stop_receiver(&mut slot).await;
+        self.stop_receiver(slot).await;
         if let Some(registration) = &registration
             && let Err(error) = self
                 .remote(
@@ -1059,7 +1111,7 @@ impl<B: Backend> Service<B> {
                 )
                 .await
         {
-            self.start_receiver(&mut slot, registration.clone()).await;
+            self.start_receiver(slot, registration.clone()).await;
             return Err(error);
         }
 
@@ -1075,7 +1127,7 @@ impl<B: Backend> Service<B> {
         });
         if let Err(error) = removal {
             if let Some(registration) = registration {
-                self.start_receiver(&mut slot, registration).await;
+                self.start_receiver(slot, registration).await;
             }
             return Err(error);
         }
@@ -1193,6 +1245,16 @@ impl<B: Backend> Accounts<B> {
     /// Creates an account with no cookies yet: 400 for a malformed id, 409 for an existing one or
     /// when history files of that id are still on disk.
     pub fn create(&self, id: &str) -> std::result::Result<AccountDto, ApiError> {
+        self.create_account(Account::new(id))
+    }
+
+    /// [`Accounts::create`] for an account that starts with its settings already filled in.
+    pub(crate) fn create_account(
+        &self,
+        account: Account,
+    ) -> std::result::Result<AccountDto, ApiError> {
+        let owned_id = account.id.clone();
+        let id = owned_id.as_str();
         validate_id(id)?;
         if self.env.defines_account(id) {
             return Err(ApiError::account_exists());
@@ -1228,7 +1290,6 @@ impl<B: Backend> Accounts<B> {
                 );
                 return Err(ApiError::history_cleanup_required());
             }
-            let account = Account::new(id);
             Ok((Some(account.clone()), account))
         })?;
         Ok(self.service_for(id).summary(&account))
@@ -1562,6 +1623,8 @@ mod tests {
     fn first_setup() -> SettingsUpdate {
         SettingsUpdate {
             machine_post_enabled: None,
+            machine_like_enabled: None,
+            machine_follow_enabled: None,
             auth_token: Some("auth-secret".into()),
             ct0: Some("ct0-secret".into()),
             webhook_secret: None,
@@ -1591,6 +1654,8 @@ mod tests {
         service
             .update_settings(SettingsUpdate {
                 machine_post_enabled: None,
+                machine_like_enabled: None,
+                machine_follow_enabled: None,
                 auth_token: None,
                 ct0: Some(String::new()),
                 webhook_secret: None,
@@ -1608,6 +1673,8 @@ mod tests {
             let err = service
                 .update_settings(SettingsUpdate {
                     machine_post_enabled: None,
+                    machine_like_enabled: None,
+                    machine_follow_enabled: None,
                     auth_token: None,
                     ct0: None,
                     webhook_secret: None,
@@ -1621,6 +1688,8 @@ mod tests {
         let err = service
             .update_settings(SettingsUpdate {
                 machine_post_enabled: None,
+                machine_like_enabled: None,
+                machine_follow_enabled: None,
                 auth_token: Some("a b".into()),
                 ct0: None,
                 webhook_secret: None,
@@ -1649,6 +1718,8 @@ mod tests {
         let err = service
             .update_settings(SettingsUpdate {
                 machine_post_enabled: None,
+                machine_like_enabled: None,
+                machine_follow_enabled: None,
                 auth_token: Some("other".into()),
                 ct0: None,
                 webhook_secret: None,
@@ -1661,6 +1732,8 @@ mod tests {
         service
             .update_settings(SettingsUpdate {
                 machine_post_enabled: None,
+                machine_like_enabled: None,
+                machine_follow_enabled: None,
                 auth_token: Some("auth-secret".into()),
                 ct0: None,
                 webhook_secret: None,
@@ -1880,6 +1953,8 @@ mod tests {
         let err = service
             .update_settings(SettingsUpdate {
                 machine_post_enabled: None,
+                machine_like_enabled: None,
+                machine_follow_enabled: None,
                 auth_token: Some("other".into()),
                 ct0: None,
                 webhook_secret: None,
@@ -1896,6 +1971,8 @@ mod tests {
         service
             .update_settings(SettingsUpdate {
                 machine_post_enabled: None,
+                machine_like_enabled: None,
+                machine_follow_enabled: None,
                 auth_token: None,
                 ct0: None,
                 webhook_secret: None,
@@ -1911,6 +1988,8 @@ mod tests {
         service
             .update_settings(SettingsUpdate {
                 machine_post_enabled: None,
+                machine_like_enabled: None,
+                machine_follow_enabled: None,
                 auth_token: Some("other".into()),
                 ct0: None,
                 webhook_secret: None,
@@ -2032,6 +2111,8 @@ mod tests {
         let dto = service
             .update_settings(SettingsUpdate {
                 machine_post_enabled: None,
+                machine_like_enabled: None,
+                machine_follow_enabled: None,
                 auth_token: None,
                 ct0: None,
                 webhook_secret: None,
@@ -2057,6 +2138,8 @@ mod tests {
         let dto = service
             .update_settings(SettingsUpdate {
                 machine_post_enabled: None,
+                machine_like_enabled: None,
+                machine_follow_enabled: None,
                 auth_token: None,
                 ct0: None,
                 webhook_secret: None,
@@ -2080,6 +2163,8 @@ mod tests {
         tokio::task::yield_now().await;
         let update = |filter| SettingsUpdate {
             machine_post_enabled: None,
+            machine_like_enabled: None,
+            machine_follow_enabled: None,
             auth_token: None,
             ct0: None,
             webhook_secret: None,
@@ -2112,6 +2197,8 @@ mod tests {
         service
             .update_settings(SettingsUpdate {
                 machine_post_enabled: None,
+                machine_like_enabled: None,
+                machine_follow_enabled: None,
                 auth_token: None,
                 ct0: None,
                 webhook_secret: None,
@@ -2133,6 +2220,8 @@ mod tests {
         service
             .update_settings(SettingsUpdate {
                 machine_post_enabled: None,
+                machine_like_enabled: None,
+                machine_follow_enabled: None,
                 auth_token: None,
                 ct0: None,
                 webhook_secret: None,
@@ -2172,6 +2261,8 @@ mod tests {
         let dto = service
             .update_settings(SettingsUpdate {
                 machine_post_enabled: None,
+                machine_like_enabled: None,
+                machine_follow_enabled: None,
                 auth_token: None,
                 ct0: None,
                 webhook_secret: None,
@@ -2218,6 +2309,8 @@ mod tests {
         };
         let update = |quote, quote_self, reply| SettingsUpdate {
             machine_post_enabled: None,
+            machine_like_enabled: None,
+            machine_follow_enabled: None,
             auth_token: None,
             ct0: None,
             webhook_secret: None,
@@ -2422,6 +2515,8 @@ mod tests {
         service
             .update_settings(SettingsUpdate {
                 machine_post_enabled: None,
+                machine_like_enabled: None,
+                machine_follow_enabled: None,
                 auth_token: None,
                 ct0: None,
                 webhook_secret: None,
@@ -2442,6 +2537,8 @@ mod tests {
     fn with_cookies(auth: &str, webhook: &str) -> SettingsUpdate {
         SettingsUpdate {
             machine_post_enabled: None,
+            machine_like_enabled: None,
+            machine_follow_enabled: None,
             auth_token: Some(auth.into()),
             ct0: Some(format!("ct0-of-{auth}")),
             webhook_secret: None,
@@ -2453,6 +2550,8 @@ mod tests {
     fn keep_everything() -> SettingsUpdate {
         SettingsUpdate {
             machine_post_enabled: None,
+            machine_like_enabled: None,
+            machine_follow_enabled: None,
             auth_token: None,
             ct0: None,
             webhook_secret: None,
@@ -3932,5 +4031,110 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    fn action_update(like: Option<bool>, follow: Option<bool>) -> SettingsUpdate {
+        SettingsUpdate {
+            machine_like_enabled: like,
+            machine_follow_enabled: follow,
+            ..keep_everything()
+        }
+    }
+
+    #[tokio::test]
+    async fn machine_action_permissions_are_independent_persistent_and_kept_when_omitted() {
+        let (_, accounts, path) = rig();
+        let one = account(&accounts, "one");
+        let two = account(&accounts, "two");
+        one.update_settings(first_setup()).await.unwrap();
+        two.update_settings(first_setup()).await.unwrap();
+        let initial = one.settings().unwrap();
+        assert!(!initial.machine_like_enabled);
+        assert!(!initial.machine_follow_enabled);
+        let revision = Config::load(&path)
+            .unwrap()
+            .account("one")
+            .unwrap()
+            .credential_revision
+            .clone();
+        let like = action_update(Some(true), None);
+        let saved = one.update_settings(like).await.unwrap();
+        assert!(saved.machine_like_enabled);
+        assert!(!saved.machine_follow_enabled);
+        assert!(!saved.machine_post_enabled);
+        let omitted = action_update(None, None);
+        let kept = one.update_settings(omitted).await.unwrap();
+        assert!(kept.machine_like_enabled);
+        assert!(!kept.machine_follow_enabled);
+        let post = permission_update(Some(true));
+        let saved = one.update_settings(post).await.unwrap();
+        assert!(saved.machine_post_enabled);
+        assert!(saved.machine_like_enabled);
+        assert!(!saved.machine_follow_enabled);
+        let follow = action_update(None, Some(true));
+        let saved = one.update_settings(follow).await.unwrap();
+        assert!(saved.machine_like_enabled);
+        assert!(saved.machine_follow_enabled);
+        let other = two.settings().unwrap();
+        assert!(!other.machine_like_enabled);
+        assert!(!other.machine_follow_enabled);
+        assert_eq!(
+            Config::load(&path)
+                .unwrap()
+                .account("one")
+                .unwrap()
+                .credential_revision,
+            revision
+        );
+        one.register().await.unwrap();
+        let off = action_update(Some(false), Some(false));
+        let saved = one.update_settings(off).await.unwrap();
+        assert!(!saved.machine_like_enabled);
+        assert!(!saved.machine_follow_enabled);
+        assert!(saved.machine_post_enabled);
+        let config = Config::load(&path).unwrap();
+        let stored = config.account("one").unwrap();
+        assert!(!stored.machine_like_enabled);
+        assert!(!stored.machine_follow_enabled);
+        assert_eq!(stored.credential_revision, revision);
+        one.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn environment_only_action_permissions_are_off_and_editable_while_registered() {
+        let (_, accounts, path) = rig_with(env_with_cookies(), fast_following());
+        let service = accounts.get("default").unwrap();
+        let initial = service.settings().unwrap();
+        assert!(!initial.machine_like_enabled);
+        assert!(!initial.machine_follow_enabled);
+        let both = action_update(Some(true), Some(true));
+        let saved = service.update_settings(both).await.unwrap();
+        assert!(saved.machine_like_enabled);
+        assert!(saved.machine_follow_enabled);
+        let stored = config::test_default_account(&path);
+        assert!(stored.machine_like_enabled);
+        assert!(stored.machine_follow_enabled);
+        assert!(stored.twitter.is_empty());
+        let revision = stored.credential_revision;
+        service.register().await.unwrap();
+        let off = action_update(Some(false), Some(false));
+        let saved = service.update_settings(off).await.unwrap();
+        assert!(!saved.machine_like_enabled);
+        assert!(!saved.machine_follow_enabled);
+        let stored = config::test_default_account(&path);
+        assert!(stored.twitter.is_empty());
+        assert_eq!(stored.credential_revision, revision);
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn machine_action_permission_save_failures_do_not_report_success() {
+        let (_, service, path) = setup();
+        service.update_settings(first_setup()).await.unwrap();
+        std::fs::write(&path, "synthetic = [invalid toml").unwrap();
+        let like = action_update(Some(true), None);
+        assert!(service.update_settings(like).await.is_err());
+        let follow = action_update(None, Some(true));
+        assert!(service.update_settings(follow).await.is_err());
     }
 }

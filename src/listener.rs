@@ -601,7 +601,7 @@ async fn send_to_webhook(
 }
 
 /// HTTPS のみ許可し、HTTP は loopback または Docker ホスト名宛てに限る。
-fn checked_webhook_url(raw: &str) -> Result<Url> {
+pub(crate) fn checked_webhook_url(raw: &str) -> Result<Url> {
     let rejected = || {
         AngelicAngelError::Config(
             "webhook URL must be HTTPS (HTTP only for loopback or host.docker.internal)".into(),

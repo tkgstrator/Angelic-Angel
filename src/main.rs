@@ -5,6 +5,7 @@ mod error;
 mod listener;
 mod machine;
 mod machine_ledger;
+mod machine_types;
 mod notifications;
 #[cfg(unix)]
 mod privileges;

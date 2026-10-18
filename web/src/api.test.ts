@@ -111,23 +111,78 @@ describe('notification_filter at the API boundary', () => {
 })
 
 describe('machine permission at the API boundary', () => {
-  it.each([undefined, null, 'true', 'false', 1, {}])(
-    'rejects invalid permission %s',
-    async (value) => {
-      mockApi({
-        'GET /api/accounts/default/settings': () =>
-          json({ ...settings(), machine_post_enabled: value }),
-        'PUT /api/accounts/default/settings': () =>
-          json({ ...settings(), machine_post_enabled: value }),
-      })
-      await expect(api.getSettings('default')).rejects.toMatchObject({ code: 'bad_response' })
-      await expect(
-        api.putSettings('default', {
-          webhook_endpoint: '',
-          notification_filter: allowAll,
-          machine_post_enabled: false,
-        }),
-      ).rejects.toMatchObject({ code: 'bad_response' })
-    },
-  )
+  const KEYS = ['machine_post_enabled', 'machine_like_enabled', 'machine_follow_enabled'] as const
+  const permissions = {
+    machine_post_enabled: false,
+    machine_like_enabled: false,
+    machine_follow_enabled: false,
+  }
+
+  it.each(
+    KEYS.flatMap((key) =>
+      [undefined, null, 'true', 'false', 1, {}].map((value) => [key, value] as const),
+    ),
+  )('rejects invalid %s permission %s', async (key, value) => {
+    mockApi({
+      'GET /api/accounts/default/settings': () => json({ ...settings(), [key]: value }),
+      'PUT /api/accounts/default/settings': () => json({ ...settings(), [key]: value }),
+    })
+    await expect(api.getSettings('default')).rejects.toMatchObject({ code: 'bad_response' })
+    await expect(
+      api.putSettings('default', {
+        webhook_endpoint: '',
+        notification_filter: allowAll,
+        ...permissions,
+      }),
+    ).rejects.toMatchObject({ code: 'bad_response' })
+  })
+
+  it('rejects a response that lacks a permission key instead of assuming off', async () => {
+    const { machine_like_enabled: _like, ...withoutLike } = settings()
+    mockApi({ 'GET /api/accounts/default/settings': () => json(withoutLike) })
+    await expect(api.getSettings('default')).rejects.toMatchObject({ code: 'bad_response' })
+  })
+
+  it('accepts and returns all three permissions as booleans', async () => {
+    const saved = settings({
+      machine_post_enabled: true,
+      machine_like_enabled: true,
+      machine_follow_enabled: false,
+    })
+    mockApi({
+      'GET /api/accounts/default/settings': () => json(saved),
+      'PUT /api/accounts/default/settings': () => json(saved),
+    })
+    const read = await api.getSettings('default')
+    expect(read).toMatchObject({
+      machine_post_enabled: true,
+      machine_like_enabled: true,
+      machine_follow_enabled: false,
+    })
+    const written = await api.putSettings('default', {
+      webhook_endpoint: '',
+      notification_filter: allowAll,
+      machine_like_enabled: true,
+    })
+    expect(written.machine_like_enabled).toBe(true)
+    expect(written.machine_follow_enabled).toBe(false)
+  })
+
+  it('sends only the permissions it is given, so an omitted one is retained by the server', async () => {
+    let body: Record<string, unknown> = {}
+    mockApi({
+      'PUT /api/accounts/default/settings': (init) => {
+        body = JSON.parse(String(init.body))
+        return json(settings())
+      },
+    })
+    await api.putSettings('default', {
+      webhook_endpoint: '',
+      notification_filter: allowAll,
+      machine_follow_enabled: true,
+    })
+    expect(body).toMatchObject({ machine_follow_enabled: true })
+    expect(body).not.toHaveProperty('machine_post_enabled')
+    expect(body).not.toHaveProperty('machine_like_enabled')
+  })
 })

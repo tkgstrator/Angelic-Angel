@@ -1,0 +1,23 @@
+{
+  "TweetDetail": {
+    "@method": "GET",
+    "@path": "/i/api/graphql/synthetic-detail-1/TweetDetail",
+    "queryId": "synthetic-detail-1",
+    "variables": { "focalTweetId": "999", "catalogue_only_variable": "must-not-be-sent" },
+    "features": { "synthetic_detail_feature": true, "synthetic_other_feature": false },
+    "fieldToggles": { "synthetic_detail_toggle": false }
+  },
+  "UserByRestId": {
+    "@method": "GET",
+    "@path": "/i/api/graphql/synthetic-user-1/UserByRestId",
+    "queryId": "synthetic-user-1",
+    "variables": { "userId": "999", "catalogue_only_variable": "must-not-be-sent" },
+    "features": { "synthetic_user_feature": true }
+  },
+  "FavoriteTweet": {
+    "@method": "POST",
+    "@path": "/i/api/graphql/synthetic-like-1/FavoriteTweet",
+    "queryId": "synthetic-like-1",
+    "variables": { "tweet_id": "999", "catalogue_only_variable": "must-not-be-sent" }
+  }
+}

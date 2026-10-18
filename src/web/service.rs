@@ -3895,7 +3895,8 @@ mod tests {
         let service = accounts.get("default").unwrap();
         assert!(!service.settings().unwrap().machine_post_enabled);
         assert!(
-            service.update_settings(permission_update(Some(true)))
+            service
+                .update_settings(permission_update(Some(true)))
                 .await
                 .unwrap()
                 .machine_post_enabled
@@ -3906,7 +3907,8 @@ mod tests {
         let revision = stored.credential_revision;
         service.register().await.unwrap();
         assert!(
-            !service.update_settings(permission_update(Some(false)))
+            !service
+                .update_settings(permission_update(Some(false)))
                 .await
                 .unwrap()
                 .machine_post_enabled

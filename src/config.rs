@@ -1810,9 +1810,8 @@ tweet = false
                     .machine_post_enabled
             );
         }
-        let invalid = toml::from_str::<Config>(
-            "[[accounts]]\nid='default'\nmachine_post_enabled='true'\n",
-        );
+        let invalid =
+            toml::from_str::<Config>("[[accounts]]\nid='default'\nmachine_post_enabled='true'\n");
         assert!(invalid.is_err());
     }
 }

@@ -487,7 +487,15 @@ async fn credential_update_and_delete_cannot_overtake_dispatch() {
         .update_settings(update())
         .await
         .unwrap();
-    assert!(!h.state.accounts.get("default").unwrap().settings().unwrap().machine_post_enabled);
+    assert!(
+        !h.state
+            .accounts
+            .get("default")
+            .unwrap()
+            .settings()
+            .unwrap()
+            .machine_post_enabled
+    );
     set_permission(&h, true).await;
     let new_body = h.body().await;
     assert_ne!(
@@ -610,7 +618,8 @@ async fn disabled_posts_and_replies_never_reserve_or_contact_x() {
     assert_eq!(h.state.x.preparations.load(Ordering::SeqCst), 0);
     // Refused-before-reservation keys may be used after an explicit grant.
     set_permission(&h, true).await;
-    let result: Value = h.send("disabled", &body)
+    let result: Value = h
+        .send("disabled", &body)
         .send()
         .await
         .unwrap()
@@ -660,7 +669,10 @@ async fn posting_readiness_requires_scope_permission_credentials_and_metadata() 
 async fn toggles_do_not_grant_scopes_accounts_or_machine_settings_access() {
     let h = harness("read").await;
     let body = h.body().await;
-    assert_eq!(h.send("scope-denied", &body).send().await.unwrap().status(), 403);
+    assert_eq!(
+        h.send("scope-denied", &body).send().await.unwrap().status(),
+        403
+    );
     assert_eq!(h.state.x.posts.load(Ordering::SeqCst), 0);
     let h = harness("read,post").await;
     Config::modify_account::<_, AngelicAngelError>(&h.path, "private", |current| {
@@ -669,16 +681,39 @@ async fn toggles_do_not_grant_scopes_accounts_or_machine_settings_access() {
         Ok((Some(account), ()))
     })
     .unwrap();
-    assert_eq!(h.client.post(format!("{}{PREFIX}/accounts/private/posts", h.base))
-        .bearer_auth(TOKEN).header("idempotency-key", "private").json(&body)
-        .send().await.unwrap().status(), 403);
+    assert_eq!(
+        h.client
+            .post(format!("{}{PREFIX}/accounts/private/posts", h.base))
+            .bearer_auth(TOKEN)
+            .header("idempotency-key", "private")
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
     let mut injected = h.body().await;
     injected["machine_post_enabled"] = json!(true);
-    assert_eq!(h.send("inject", &injected).send().await.unwrap().status(), 400);
-    for path in ["/api/accounts/default/settings", "/api/machine/v1/accounts/default/settings"] {
-        assert_eq!(h.client.put(format!("{}{path}", h.base)).bearer_auth(TOKEN)
-            .json(&json!({"machine_post_enabled":true,"webhook_endpoint":""}))
-            .send().await.unwrap().status(), 404);
+    assert_eq!(
+        h.send("inject", &injected).send().await.unwrap().status(),
+        400
+    );
+    for path in [
+        "/api/accounts/default/settings",
+        "/api/machine/v1/accounts/default/settings",
+    ] {
+        assert_eq!(
+            h.client
+                .put(format!("{}{path}", h.base))
+                .bearer_auth(TOKEN)
+                .json(&json!({"machine_post_enabled":true,"webhook_endpoint":""}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
     }
     assert_eq!(h.state.x.identities.load(Ordering::SeqCst), 0);
     assert_eq!(h.state.x.posts.load(Ordering::SeqCst), 0);
@@ -688,7 +723,8 @@ async fn toggles_do_not_grant_scopes_accounts_or_machine_settings_access() {
 async fn disabling_preserves_key_results_and_never_replays_after_reenable() {
     let h = harness("read,post,operations").await;
     let body = h.body().await;
-    let first: Value = h.send("saved", &body)
+    let first: Value = h
+        .send("saved", &body)
         .send()
         .await
         .unwrap()
@@ -696,7 +732,8 @@ async fn disabling_preserves_key_results_and_never_replays_after_reenable() {
         .await
         .unwrap();
     set_permission(&h, false).await;
-    let replay: Value = h.send("saved", &body)
+    let replay: Value = h
+        .send("saved", &body)
         .send()
         .await
         .unwrap()
@@ -718,10 +755,17 @@ async fn disabling_preserves_key_results_and_never_replays_after_reenable() {
     assert_eq!(result, first);
     let mut changed = body.clone();
     changed["text"] = json!("different synthetic text");
-    assert_eq!(h.send("saved", &changed).send().await.unwrap().status(), 409);
-    assert_eq!(h.send("new-disabled", &body).send().await.unwrap().status(), 403);
+    assert_eq!(
+        h.send("saved", &changed).send().await.unwrap().status(),
+        409
+    );
+    assert_eq!(
+        h.send("new-disabled", &body).send().await.unwrap().status(),
+        403
+    );
     set_permission(&h, true).await;
-    let replay: Value = h.send("saved", &body)
+    let replay: Value = h
+        .send("saved", &body)
         .send()
         .await
         .unwrap()
@@ -743,18 +787,30 @@ async fn disabling_cannot_overtake_preflight_or_dispatch_and_success_blocks_new_
     h.state.x.prepare_entered.notified().await;
     let service = h.state.accounts.get("default").unwrap();
     let disable = || {
-        serde_json::from_value(json!({"machine_post_enabled":false,"webhook_endpoint":""}))
-            .unwrap()
+        serde_json::from_value(json!({"machine_post_enabled":false,"webhook_endpoint":""})).unwrap()
     };
-    assert_eq!(service.update_settings(disable()).await.unwrap_err().code, "busy");
+    assert_eq!(
+        service.update_settings(disable()).await.unwrap_err().code,
+        "busy"
+    );
     assert!(service.settings().unwrap().machine_post_enabled);
     h.state.x.prepare_release.notify_one();
     h.state.x.entered.notified().await;
-    assert_eq!(service.update_settings(disable()).await.unwrap_err().code, "busy");
+    assert_eq!(
+        service.update_settings(disable()).await.unwrap_err().code,
+        "busy"
+    );
     h.state.x.release.notify_one();
     assert_eq!(task.await.unwrap().status(), 200);
     service.update_settings(disable()).await.unwrap();
-    assert_eq!(h.send("after-disable", &body).send().await.unwrap().status(), 403);
+    assert_eq!(
+        h.send("after-disable", &body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
     assert_eq!(h.state.x.posts.load(Ordering::SeqCst), 1);
 }
 
@@ -780,7 +836,8 @@ async fn dispatch_rechecks_permission_and_persists_a_nonreplayable_failure() {
     assert_eq!(result["error"], "account_post_disabled");
     assert_eq!(h.state.x.posts.load(Ordering::SeqCst), 0);
     set_permission(&h, true).await;
-    let replay: Value = h.send("recheck", &body)
+    let replay: Value = h
+        .send("recheck", &body)
         .send()
         .await
         .unwrap()
@@ -850,7 +907,6 @@ async fn waiting_same_key_rechecks_existing_before_disabled_permission() {
     assert_eq!(h.state.x.posts.load(Ordering::SeqCst), 0);
 }
 
-
 #[tokio::test]
 async fn off_save_wins_over_waiting_new_request_without_reservation() {
     let h = harness("read,post").await;
@@ -886,7 +942,13 @@ async fn off_save_wins_over_waiting_new_request_without_reservation() {
         "webhook_endpoint":"", "machine_post_enabled":true
     }))
     .unwrap();
-    assert!(private.update_settings(update).await.unwrap().machine_post_enabled);
+    assert!(
+        private
+            .update_settings(update)
+            .await
+            .unwrap()
+            .machine_post_enabled
+    );
     drop(guard);
     assert_eq!(request.await.unwrap_err().0, StatusCode::FORBIDDEN);
     assert!(
@@ -900,7 +962,6 @@ async fn off_save_wins_over_waiting_new_request_without_reservation() {
     assert_eq!(h.state.x.preparations.load(Ordering::SeqCst), 0);
     assert_eq!(h.state.x.posts.load(Ordering::SeqCst), 0);
 }
-
 
 #[tokio::test]
 async fn failed_permission_result_storage_still_prevents_dispatch() {
@@ -941,18 +1002,31 @@ async fn legacy_and_environment_only_accounts_cannot_post_without_explicit_permi
     )
     .unwrap();
     let body = h.body().await;
-    assert_eq!(h.send("legacy-off", &body).send().await.unwrap().status(), 403);
+    assert_eq!(
+        h.send("legacy-off", &body).send().await.unwrap().status(),
+        403
+    );
     assert_eq!(h.state.x.identities.load(Ordering::SeqCst), 0);
     assert_eq!(h.state.x.posts.load(Ordering::SeqCst), 0);
     let path = h.path.with_file_name("env-only.toml");
     let accounts = Arc::new(Accounts::new(
         Arc::new(FakeBackend::default()),
         path.clone(),
-        Environment::new(Some("fixture-env-auth"), Some("fixture-env-csrf"), None, None)
-            .unwrap(),
+        Environment::new(
+            Some("fixture-env-auth"),
+            Some("fixture-env-csrf"),
+            None,
+            None,
+        )
+        .unwrap(),
     ));
-    let state = Machine::new(settings("read,post"), accounts, &path, Arc::new(FakeX::default()))
-        .unwrap();
+    let state = Machine::new(
+        settings("read,post"),
+        accounts,
+        &path,
+        Arc::new(FakeX::default()),
+    )
+    .unwrap();
     let readiness = account_readiness(&state, "default").await.unwrap();
     let body = json!({"text":"synthetic fixture", "expectedXUserId":"123",
         "expectedCredentialRevision":readiness["credential_revision"]});

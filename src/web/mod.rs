@@ -2076,6 +2076,18 @@ mod tests {
                 assert_eq!(dto["machine_follow_enabled"], follow);
             }
         }
+        // Reset every permission to OFF first: the loop above ends with like and follow ON.
+        h.req(reqwest::Method::PUT, "/api/accounts/default/settings")
+            .json(&json!({
+                "webhook_endpoint": "",
+                "machine_like_enabled": false,
+                "machine_follow_enabled": false,
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
         // Omitting a key keeps the saved value for that permission only.
         let keep_like = json!({"webhook_endpoint":"", "machine_like_enabled":true});
         let keep_post = json!({"webhook_endpoint":"", "machine_post_enabled":true});

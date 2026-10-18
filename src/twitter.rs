@@ -167,6 +167,81 @@ impl XError {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+pub struct Identity {
+    pub user_id: String,
+    pub screen_name: String,
+    pub name: String,
+    pub avatar_url: Option<String>,
+}
+
+fn parse_identity(body: &[u8]) -> std::result::Result<Identity, XError> {
+    let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| XError::Malformed)?;
+    if value.get("errors").is_some() {
+        return Err(XError::Malformed);
+    }
+    let user_id = value
+        .get("id_str")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| is_valid_user_id(v))
+        .ok_or(XError::Malformed)?;
+    let screen_name = value
+        .get("screen_name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| is_valid_screen_name(v))
+        .ok_or(XError::Malformed)?;
+    let name = value
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| v.len() <= 512)
+        .ok_or(XError::Malformed)?;
+    let avatar_url = value
+        .get("profile_image_url_https")
+        .and_then(serde_json::Value::as_str)
+        .filter(|raw| raw.len() <= 2048)
+        .and_then(|raw| Url::parse(raw).ok())
+        .filter(|url| {
+            url.scheme() == "https"
+                && url.host_str() == Some("pbs.twimg.com")
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.port().is_none()
+                && url.path().starts_with("/profile_images/")
+                && url.query().is_none()
+                && url.fragment().is_none()
+        })
+        .map(|url| url.to_string());
+    Ok(Identity {
+        user_id: user_id.into(),
+        screen_name: screen_name.into(),
+        name: name.into(),
+        avatar_url,
+    })
+}
+
+fn parse_post(body: &[u8], expected_user: &str) -> std::result::Result<String, XError> {
+    let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| XError::Malformed)?;
+    if value.get("errors").is_some() {
+        return Err(XError::Malformed);
+    }
+    let result = value
+        .pointer("/data/create_tweet/tweet_results/result")
+        .ok_or(XError::Malformed)?;
+    let id = result
+        .get("rest_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| is_valid_user_id(v))
+        .ok_or(XError::Malformed)?;
+    let author = result
+        .pointer("/core/user_results/result/rest_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(XError::Malformed)?;
+    if author != expected_user {
+        return Err(XError::Malformed);
+    }
+    Ok(id.to_string())
+}
+
 /// One page of `friends/ids`; ids are validated digit strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FollowingPage {
@@ -218,24 +293,29 @@ fn transport(error: reqwest::Error) -> XError {
 }
 
 /// Reads at most `MAX_RESPONSE_BYTES`; bodies are never logged.
-async fn read_body(response: Response) -> std::result::Result<Vec<u8>, XError> {
+async fn read_body(mut response: Response) -> std::result::Result<Vec<u8>, XError> {
     if response
         .content_length()
         .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
     {
         return Err(XError::Malformed);
     }
-    let bytes = response.bytes().await.map_err(transport)?;
-    if bytes.len() > MAX_RESPONSE_BYTES {
-        return Err(XError::Malformed);
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(transport)? {
+        if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(XError::Malformed);
+        }
+        bytes.extend_from_slice(&chunk);
     }
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 /// 接続先。本番は固定の X のホストで、テストだけが差し替える。
 struct Endpoints {
     settings_base: String,
     api_base: String,
+    graphql_base: String,
+    catalogue_url: String,
     /// 最初に取るページ。bootstrap の手掛かりが無いときだけ `fallback_url` を取る。
     home_url: String,
     fallback_url: String,
@@ -249,6 +329,8 @@ impl Endpoints {
         Self {
             settings_base: TWITTER_SETTINGS_BASE.to_string(),
             api_base: TWITTER_API_BASE.to_string(),
+            graphql_base: "https://x.com/i/api/graphql".to_string(),
+            catalogue_url: crate::x_metadata::CATALOGUE_URL.to_string(),
             home_url: TWITTER_HOME_URL.to_string(),
             fallback_url: TWITTER_HOME_FALLBACK_URL.to_string(),
             asset_base: Url::parse(ASSET_BASE).expect("静的な URL"),
@@ -267,6 +349,7 @@ pub struct XApi {
     bootstrap_gate: Mutex<()>,
     bootstrap_timeout: Duration,
     transaction_ttl: Duration,
+    metadata: Mutex<Option<(crate::x_metadata::CreateTweet, Instant)>>,
 }
 
 impl XApi {
@@ -298,7 +381,77 @@ impl XApi {
             bootstrap_gate: Mutex::new(()),
             bootstrap_timeout,
             transaction_ttl,
+            metadata: Mutex::new(None),
         }
+    }
+
+    /// Metadata readiness is cache-only: listing accounts never contacts X or GitHub.
+    pub async fn machine_ready(&self) -> bool {
+        self.metadata
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|(_, fetched)| fetched.elapsed() < TRANSACTION_TTL)
+            && self.cached_transaction().is_some()
+    }
+
+    pub async fn prepare_post(
+        &self,
+    ) -> std::result::Result<crate::x_metadata::CreateTweet, XError> {
+        let mut slot = self.metadata.lock().await;
+        if let Some((operation, fetched)) = slot.as_ref()
+            && fetched.elapsed() < TRANSACTION_TTL
+        {
+            self.transaction().await?;
+            return Ok(operation.clone());
+        }
+        let source = self.fetch_text(&self.endpoints.catalogue_url, 0).await?;
+        let operation = crate::x_metadata::parse(&source)?;
+        self.transaction().await?;
+        *slot = Some((operation.clone(), Instant::now()));
+        Ok(operation)
+    }
+
+    pub async fn identity(&self, twitter: &TwitterConfig) -> std::result::Result<Identity, XError> {
+        let url = format!(
+            "{}/account/verify_credentials.json?skip_status=true&include_entities=false",
+            self.endpoints.api_base
+        );
+        let body = self.send(self.client.get(url), twitter).await?;
+        parse_identity(&body)
+    }
+
+    /// Only locally constructed text/reply variables are sent; catalogue variables are ignored.
+    pub async fn create_post(
+        &self,
+        twitter: &TwitterConfig,
+        operation: &crate::x_metadata::CreateTweet,
+        text: &str,
+        reply: Option<&str>,
+        expected_user: &str,
+    ) -> std::result::Result<String, XError> {
+        let mut variables = json!({
+            "tweet_text": text, "dark_request": false,
+            "media": {"media_entities": [], "possibly_sensitive": false},
+            "semantic_annotation_ids": []
+        });
+        if let Some(id) = reply {
+            variables["reply"] = json!({"in_reply_to_tweet_id": id, "exclude_reply_user_ids": []});
+        }
+        let url = format!(
+            "{}/{}/CreateTweet",
+            self.endpoints.graphql_base, operation.query_id
+        );
+        let body = self
+            .send(
+                self.client.post(url).json(&json!({
+                    "queryId": operation.query_id, "variables": variables,
+                    "features": operation.features, "fieldToggles": operation.field_toggles
+                })),
+                twitter,
+            )
+            .await?;
+        parse_post(&body, expected_user)
     }
 
     fn settings_url(&self) -> String {
@@ -592,6 +745,31 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
+    #[test]
+    fn machine_identity_is_minimal_and_avatar_is_allowlisted() {
+        let body = br#"{"id_str":"123","screen_name":"fixture","name":"Fixture","profile_image_url_https":"https://pbs.twimg.com/profile_images/1/a.jpg","auth_token":"SECRET"}"#;
+        let identity = parse_identity(body).unwrap();
+        let public = serde_json::to_string(&identity).unwrap();
+        assert!(!public.contains("SECRET"));
+        assert_eq!(identity.user_id, "123");
+        assert!(identity.avatar_url.is_some());
+        let bad = String::from_utf8(body.to_vec())
+            .unwrap()
+            .replace("pbs.twimg.com", "evil.invalid");
+        assert!(parse_identity(bad.as_bytes()).unwrap().avatar_url.is_none());
+        assert!(parse_identity(br#"{"errors":[{"message":"PRIVATE"}]}"#).is_err());
+    }
+
+    #[test]
+    fn machine_graphql_requires_result_author_and_no_errors() {
+        let body = br#"{"data":{"create_tweet":{"tweet_results":{"result":{"rest_id":"789","core":{"user_results":{"result":{"rest_id":"123"}}}}}}}}"#;
+        assert_eq!(parse_post(body, "123").unwrap(), "789");
+        assert!(parse_post(body, "456").is_err());
+        assert!(parse_post(br#"{"errors":[{"message":"secret"}],"data":{}}"#, "123").is_err());
+        assert!(parse_post(br#"{"data":{}}"#, "123").is_err());
+        assert!(parse_post(b"not json", "123").is_err());
+    }
+
     const SCRIPT_PATH: &str = "/ondemand.s.c0ffee1a.js";
     const CREDENTIAL_HEADERS: [&str; 5] = [
         "authorization",
@@ -644,6 +822,8 @@ mod tests {
         Endpoints {
             settings_base: format!("{base}/1.1"),
             api_base: format!("{base}/i/api/1.1"),
+            graphql_base: format!("{base}/i/api/graphql"),
+            catalogue_url: format!("{base}/catalogue.json"),
             home_url: format!("{base}/home"),
             fallback_url: format!("{base}/home-fallback"),
             asset_base: Url::parse(base).unwrap(),
@@ -761,6 +941,99 @@ mod tests {
             (fixture::relative_now() - time).abs() < 60,
             "時刻が現在に近い"
         );
+    }
+
+    #[tokio::test]
+    async fn machine_catalogue_is_anonymous_and_post_uses_the_existing_signer() {
+        let log = Log::default();
+        let server = serve(recording(Arc::clone(&log), |seen| match seen.path.as_str() {
+            "/catalogue.json" => reply(200, include_str!("../tests/fixtures/machine-metadata.json")),
+            "/i/api/1.1/account/verify_credentials.json" => reply(200,
+                r#"{"id_str":"123","screen_name":"fixture","name":"Fixture"}"#),
+            "/i/api/graphql/synthetic-query-1/CreateTweet" => reply(200,
+                r#"{"data":{"create_tweet":{"tweet_results":{"result":{"rest_id":"789","core":{"user_results":{"result":{"rest_id":"123"}}}}}}}}"#),
+            _ => reply(404, "not found"),
+        })).await;
+        let api = injected(&server.base);
+        let metadata = api.prepare_post().await.unwrap();
+        assert!(api.machine_ready().await);
+        assert_eq!(api.identity(&twitter()).await.unwrap().user_id, "123");
+        assert_eq!(
+            api.create_post(&twitter(), &metadata, "fixture", Some("456"), "123")
+                .await
+                .unwrap(),
+            "789"
+        );
+        let requests = log.lock().unwrap();
+        let catalogue = requests
+            .iter()
+            .find(|r| r.path == "/catalogue.json")
+            .unwrap();
+        for header in CREDENTIAL_HEADERS {
+            assert!(!catalogue.headers.contains_key(header));
+        }
+        let post = requests.iter().find(|r| r.method == "POST").unwrap();
+        assert_valid_id(post);
+        let body: serde_json::Value = serde_json::from_str(&post.body).unwrap();
+        assert_eq!(body["queryId"], "synthetic-query-1");
+        assert_eq!(body["variables"]["tweet_text"], "fixture");
+        assert_eq!(body["variables"]["reply"]["in_reply_to_tweet_id"], "456");
+        assert_eq!(body["features"]["synthetic_feature_enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn machine_catalogue_redirects_and_missing_features_fail_closed() {
+        let sink_log = Log::default();
+        let sink = serve(recording(Arc::clone(&sink_log), |_| reply(200, "{}"))).await;
+        let target = sink.base.clone();
+        let server = serve(recording(Log::default(), move |_| {
+            let mut response = reply(302, "");
+            response
+                .headers_mut()
+                .insert("location", target.parse().unwrap());
+            response
+        }))
+        .await;
+        let api = injected(&server.base);
+        assert!(api.prepare_post().await.is_err());
+        assert!(!api.machine_ready().await);
+        assert!(sink_log.lock().unwrap().is_empty());
+        let server = serve(recording(Log::default(), |_| reply(200, "{}"))).await;
+        assert!(injected(&server.base).prepare_post().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn machine_http_and_graphql_errors_are_safe() {
+        for status in [200, 401, 403, 429, 500] {
+            let server = serve(recording(Log::default(), move |_| {
+                reply(
+                    status,
+                    r#"{"errors":[{"message":"SYNTHETIC-PRIVATE-UPSTREAM"}]}"#,
+                )
+            }))
+            .await;
+            let api = injected(&server.base);
+            let metadata =
+                crate::x_metadata::parse(include_str!("../tests/fixtures/machine-metadata.json"))
+                    .unwrap();
+            let error = api
+                .create_post(&twitter(), &metadata, "fixture", None, "123")
+                .await
+                .unwrap_err();
+            assert!(!error.to_string().contains("SYNTHETIC-PRIVATE-UPSTREAM"));
+            if status == 401 {
+                assert_eq!(error, XError::Unauthorized);
+            }
+            if status == 403 {
+                assert_eq!(error, XError::Forbidden);
+            }
+            if status == 429 {
+                assert_eq!(error, XError::RateLimited);
+            }
+            if status == 200 {
+                assert_eq!(error, XError::Malformed);
+            }
+        }
     }
 
     #[tokio::test]

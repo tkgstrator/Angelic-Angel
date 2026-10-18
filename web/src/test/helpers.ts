@@ -52,6 +52,7 @@ export const filterOf = (over: Partial<NotificationFilter> = {}): NotificationFi
 })
 
 export const settings = (over: Partial<Settings> = {}): Settings => ({
+  machine_post_enabled: false,
   configured: true,
   auth_token_set: true,
   ct0_set: true,

@@ -8,6 +8,7 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Separator } from '@/components/ui/separator'
+import { Switch } from '@/components/ui/switch'
 import {
   api,
   cleanMessage,
@@ -132,7 +133,7 @@ function Indicator({ set }: { set: boolean }) {
 }
 
 const TITLE = '設定'
-const DESCRIPTION = 'Cookie、通知の転送先、受信先の登録を設定します。'
+const DESCRIPTION = 'Cookie、通知の転送先、APIからの投稿許可、受信先の登録を設定します。'
 const SCREEN_NAME = /^[A-Za-z0-9_]{1,15}$/
 
 type Check =
@@ -255,6 +256,7 @@ function SettingsForm({
   const [webhook, setWebhook] = useState(settings.webhook_endpoint ?? '')
   const [webhookSecret, setWebhookSecret] = useState('')
   const [filter, setFilter] = useState(settings.notification_filter)
+  const [machinePostEnabled, setMachinePostEnabled] = useState(settings.machine_post_enabled)
   const [errors, setErrors] = useState<SettingsErrors>({})
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null)
   const [check, setCheck] = useState<Check>({ kind: 'none' })
@@ -305,6 +307,7 @@ function SettingsForm({
           webhook_secret: webhookSecret.trim() || null,
           webhook_endpoint: envLocked ? (settings.webhook_endpoint ?? '') : webhook.trim(),
           notification_filter: filter,
+          machine_post_enabled: machinePostEnabled,
         })
       } catch (err) {
         setResult({ ok: false, text: errorText(err) })
@@ -315,6 +318,7 @@ function SettingsForm({
       setWebhookSecret('')
       setWebhook(saved.webhook_endpoint ?? '')
       setFilter(saved.notification_filter)
+      setMachinePostEnabled(saved.machine_post_enabled)
       onSaved(saved)
       setResult({ ok: true, text: '保存しました。' })
       if (saved.configured) await runCheck()
@@ -498,6 +502,24 @@ function SettingsForm({
               )
             })}
           </div>
+        </Section>
+        <Separator />
+        <Section
+          title="Machine API"
+          description="このアカウントへのAPI投稿・返信を許可します。サービストークン側の許可も必要です。変更は保存後に反映されます。"
+          disabled={busy}
+        >
+          <div className="flex items-center gap-3">
+            <Switch
+              id={`${id}-machine-post`}
+              checked={machinePostEnabled}
+              onCheckedChange={setMachinePostEnabled}
+            />
+            <Label htmlFor={`${id}-machine-post`}>APIからの投稿・返信を許可</Label>
+          </div>
+          <p className="text-sm text-muted-foreground">
+            送信処理中は保存できません。無効化しても開始済みの送信は取り消せません。
+          </p>
         </Section>
         <SectionActions>
           {result && (

@@ -71,6 +71,12 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,
+    /// Explicit opt-in for machine text posts and replies. Missing always means disabled.
+    #[serde(default)]
+    pub machine_post_enabled: bool,
+    /// Opaque incarnation/revision, never derived from a credential in public responses.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub credential_revision: String,
     /// 環境変数で認証情報を渡す運用では `[accounts.twitter]` を持たない設定ファイルになる。
     #[serde(default, skip_serializing_if = "TwitterConfig::is_empty")]
     pub twitter: TwitterConfig,
@@ -87,6 +93,8 @@ impl Account {
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
+            machine_post_enabled: false,
+            credential_revision: uuid::Uuid::new_v4().to_string(),
             twitter: TwitterConfig::default(),
             registration: None,
             webhook_endpoint: None,
@@ -125,6 +133,8 @@ impl TryFrom<RawConfig> for Config {
             (Some(accounts), false) => accounts,
             (None, true) => vec![Account {
                 id: DEFAULT_ACCOUNT_ID.to_string(),
+                machine_post_enabled: false,
+                credential_revision: String::new(),
                 twitter: raw.twitter.unwrap_or_default(),
                 registration: raw.registration,
                 webhook_endpoint: raw.webhook_endpoint,
@@ -294,7 +304,29 @@ impl Config {
     /// backup fails the save.
     pub fn save(&self, path: &Path) -> Result<()> {
         validate_accounts(&self.accounts)?;
-        let content = toml::to_string_pretty(self)
+        // Explicit saves may repair readable but malformed TOML. Its previous revisions cannot
+        // be trusted, so issue fresh ones rather than reusing this in-memory snapshot's revisions.
+        // Read/permission/UTF-8 failures still abort; modify() also still requires a valid load.
+        let previous = match Self::load_optional(path) {
+            Ok(previous) => previous,
+            Err(AngelicAngelError::Toml(_)) => None,
+            Err(error) => return Err(error),
+        };
+        let mut next = self.clone();
+        for account in &mut next.accounts {
+            let unchanged = previous
+                .as_ref()
+                .and_then(|c| c.account(&account.id))
+                .filter(|old| {
+                    old.twitter.auth_token == account.twitter.auth_token
+                        && old.twitter.ct0 == account.twitter.ct0
+                        && !old.credential_revision.is_empty()
+                });
+            account.credential_revision = unchanged
+                .map(|old| old.credential_revision.clone())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        }
+        let content = toml::to_string_pretty(&next)
             .map_err(|e| AngelicAngelError::Config(format!("failed to serialize config: {}", e)))?;
         backup_legacy_file(path)?;
         write_private_atomic(path, content.as_bytes())
@@ -1032,6 +1064,127 @@ mod tests {
     }
 
     #[test]
+    fn machine_revision_is_durable_and_rotates_on_credentials_or_recreation() {
+        let path = temp_dir().join("revision.toml");
+        let mut config = Config {
+            accounts: vec![Account::new("default")],
+        };
+        config.accounts[0].twitter = TwitterConfig {
+            auth_token: "fixture-auth".into(),
+            ct0: "fixture-csrf".into(),
+        };
+        config.save(&path).unwrap();
+        let first = test_default_account(&path).credential_revision;
+        config.save(&path).unwrap();
+        assert_eq!(first, test_default_account(&path).credential_revision);
+        config.accounts[0].twitter.ct0 = "rotated-fixture-csrf".into();
+        config.save(&path).unwrap();
+        let second = test_default_account(&path).credential_revision;
+        assert_ne!(first, second);
+        Config::default().save(&path).unwrap();
+        config.save(&path).unwrap();
+        assert_ne!(second, test_default_account(&path).credential_revision);
+    }
+
+    #[test]
+    fn explicit_save_repairs_invalid_toml_with_fresh_revisions() {
+        for damaged in ["[[accounts]\nbroken", "accounts = 'not-an-array'\n"] {
+            let path = temp_dir().join("repair.toml");
+            Config {
+                accounts: vec![
+                    account("default", "fixture-a"),
+                    account("work", "fixture-b"),
+                ],
+            }
+            .save(&path)
+            .unwrap();
+            let snapshot = Config::load(&path).unwrap();
+            std::fs::write(&path, damaged).unwrap();
+
+            snapshot.save(&path).unwrap();
+
+            let repaired = Config::load(&path).unwrap();
+            assert_eq!(repaired.accounts.len(), snapshot.accounts.len());
+            for old in &snapshot.accounts {
+                let new = repaired.account(&old.id).unwrap();
+                assert_eq!(new.twitter.auth_token, old.twitter.auth_token);
+                assert_eq!(new.twitter.ct0, old.twitter.ct0);
+                assert_ne!(new.credential_revision, old.credential_revision);
+                assert!(uuid::Uuid::parse_str(&new.credential_revision).is_ok());
+            }
+            repaired.save(&path).unwrap();
+            let stable = Config::load(&path).unwrap();
+            for expected in &repaired.accounts {
+                let actual = stable.account(&expected.id).unwrap();
+                assert_eq!(actual.credential_revision, expected.credential_revision);
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_save_does_not_overwrite_unreadable_or_non_utf8_config() {
+        let directory = temp_dir();
+        let path = directory.join("unreadable.toml");
+        std::fs::create_dir(&path).unwrap();
+        let marker = path.join("fixture-marker");
+        std::fs::write(&marker, "unchanged").unwrap();
+        assert!(matches!(
+            Config::default().save(&path),
+            Err(AngelicAngelError::Io(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "unchanged");
+
+        let path = directory.join("non-utf8.toml");
+        let bytes = [0xff_u8, 0xfe, 0x80];
+        std::fs::write(&path, bytes).unwrap();
+        let result = Config::default().save(&path);
+        assert!(matches!(
+            result,
+            Err(AngelicAngelError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_save_preserves_permission_denied_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_dir().join("denied.toml");
+        std::fs::write(&path, "accounts = []\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Match the existing permission test's root exception, restoring permissions either way.
+        let blocked = std::fs::File::open(&path).is_err();
+        let result = Config::default().save(&path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if !blocked {
+            return;
+        }
+        assert!(matches!(
+            result,
+            Err(AngelicAngelError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "accounts = []\n");
+    }
+
+    #[test]
+    fn modify_still_fails_closed_on_invalid_toml() {
+        let path = temp_dir().join("invalid.toml");
+        let damaged = "[[accounts]\nbroken";
+        std::fs::write(&path, damaged).unwrap();
+        let called = std::cell::Cell::new(false);
+        let result = Config::modify(&path, |_| {
+            called.set(true);
+            Ok::<_, AngelicAngelError>((Some(Config::default()), ()))
+        });
+        assert!(matches!(result, Err(AngelicAngelError::Toml(_))));
+        assert!(!called.get());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), damaged);
+    }
+
+    #[test]
     fn config_without_twitter_table_parses_and_never_writes_one() {
         let account = default_of("webhook_endpoint = \"https://example.com/h\"\n");
         assert!(account.twitter.is_empty());
@@ -1624,5 +1777,41 @@ tweet = false
         assert_eq!(r, (Some("cfg".into()), WebhookSource::Config));
         let r = resolve_webhook_secret_with("work", Some("env"), None);
         assert_eq!(r, (None, WebhookSource::None));
+    }
+
+    #[test]
+    fn machine_post_permission_defaults_off_and_roundtrips_without_revision_changes() {
+        assert!(!Account::new("default").machine_post_enabled);
+        assert!(!default_of(LEGACY).machine_post_enabled);
+        assert!(!default_of("[[accounts]]\nid='default'\n").machine_post_enabled);
+        let path = temp_dir().join("permission.toml");
+        let original = account("default", "synthetic-auth");
+        Config {
+            accounts: vec![original, Account::new("other")],
+        }
+        .save(&path)
+        .unwrap();
+        let revision = test_default_account(&path).credential_revision;
+        for enabled in [true, false] {
+            Config::modify_account::<_, AngelicAngelError>(&path, "default", |current| {
+                let mut account = current.unwrap();
+                account.machine_post_enabled = enabled;
+                Ok((Some(account), ()))
+            })
+            .unwrap();
+            let saved = test_default_account(&path);
+            assert_eq!(saved.machine_post_enabled, enabled);
+            assert_eq!(saved.credential_revision, revision);
+            assert!(
+                !Config::load(&path)
+                    .unwrap()
+                    .account("other")
+                    .unwrap()
+                    .machine_post_enabled
+            );
+        }
+        let invalid =
+            toml::from_str::<Config>("[[accounts]]\nid='default'\nmachine_post_enabled='true'\n");
+        assert!(invalid.is_err());
     }
 }

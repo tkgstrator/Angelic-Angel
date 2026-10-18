@@ -1,0 +1,9 @@
+{
+  "CreateTweet": {
+    "@method": "POST",
+    "@path": "/i/api/graphql/synthetic-query-1/CreateTweet",
+    "queryId": "synthetic-query-1",
+    "features": { "synthetic_feature_enabled": true },
+    "fieldToggles": { "synthetic_field_enabled": false }
+  }
+}

@@ -1,6 +1,6 @@
 //! HTTP server: local-only JSON API plus static WebUI assets.
 
-mod error;
+pub mod error;
 pub mod following;
 pub mod service;
 

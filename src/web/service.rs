@@ -26,6 +26,10 @@ const MAX_CREDENTIAL_LEN: usize = 1024;
 const MAX_WEBHOOK_SECRET_LEN: usize = 4096;
 const MAX_URL_LEN: usize = 2048;
 
+#[path = "service_machine.rs"]
+mod machine_access;
+pub(crate) use machine_access::MachineProfile;
+
 /// Remote operations and the receiver loop, abstracted so tests can use a fake.
 pub trait Backend: Send + Sync + 'static {
     fn subscribe(&self) -> impl Future<Output = Result<PushSubscription>> + Send;
@@ -934,13 +938,21 @@ impl<B: Backend> Service<B> {
 
     pub async fn register(&self) -> std::result::Result<RegistrationDto, ApiError> {
         let mut slot = self.receiver.try_lock().map_err(|_| ApiError::busy())?;
+        self.register_locked(&mut slot).await
+    }
+
+    /// [`Service::register`] for a caller that already holds the mutation lock as `slot`.
+    pub(crate) async fn register_locked(
+        &self,
+        slot: &mut Option<JoinHandle<()>>,
+    ) -> std::result::Result<RegistrationDto, ApiError> {
         self.ensure_no_following_job()?;
         let account = self.load()?;
 
         if let Some(registration) = account.registration.clone() {
             let running = slot.as_ref().is_some_and(|h| !h.is_finished());
             if !running {
-                self.start_receiver(&mut slot, registration).await;
+                self.start_receiver(slot, registration).await;
             }
             return Ok(registration_dto(&account));
         }
@@ -954,7 +966,7 @@ impl<B: Backend> Service<B> {
         }
 
         let _operation = OperationGuard::new(&self.telemetry, Operation::Registering);
-        self.stop_receiver(&mut slot).await;
+        self.stop_receiver(slot).await;
 
         let subscription = self
             .remote("AutoPush registration", self.backend.subscribe())
@@ -993,7 +1005,7 @@ impl<B: Backend> Service<B> {
             },
         };
 
-        self.start_receiver(&mut slot, registration).await;
+        self.start_receiver(slot, registration).await;
         Ok(registration_dto(&saved))
     }
 
@@ -1009,15 +1021,23 @@ impl<B: Backend> Service<B> {
 
     pub async fn unregister(&self) -> std::result::Result<RegistrationDto, ApiError> {
         let mut slot = self.receiver.try_lock().map_err(|_| ApiError::busy())?;
+        self.unregister_locked(&mut slot).await
+    }
+
+    /// [`Service::unregister`] for a caller that already holds the mutation lock as `slot`.
+    pub(crate) async fn unregister_locked(
+        &self,
+        slot: &mut Option<JoinHandle<()>>,
+    ) -> std::result::Result<RegistrationDto, ApiError> {
         self.ensure_no_following_job()?;
         let account = self.load()?;
         let Some(registration) = account.registration.clone() else {
-            self.stop_receiver(&mut slot).await;
+            self.stop_receiver(slot).await;
             return Ok(registration_dto(&account));
         };
 
         let _operation = OperationGuard::new(&self.telemetry, Operation::Unregistering);
-        self.stop_receiver(&mut slot).await;
+        self.stop_receiver(slot).await;
 
         if let Err(error) = self
             .remote(
@@ -1026,7 +1046,7 @@ impl<B: Backend> Service<B> {
             )
             .await
         {
-            self.start_receiver(&mut slot, registration).await;
+            self.start_receiver(slot, registration).await;
             return Err(error);
         }
 
@@ -1044,7 +1064,7 @@ impl<B: Backend> Service<B> {
                 .as_ref()
                 .map_or_else(no_registration, registration_dto)),
             Err(error) => {
-                self.start_receiver(&mut slot, registration).await;
+                self.start_receiver(slot, registration).await;
                 Err(error)
             },
         }
@@ -1059,6 +1079,14 @@ impl<B: Backend> Service<B> {
     /// `removed` makes any handle resolved earlier fail afterwards.
     async fn delete(&self) -> std::result::Result<(), ApiError> {
         let mut slot = self.receiver.try_lock().map_err(|_| ApiError::busy())?;
+        self.delete_locked(&mut slot).await
+    }
+
+    /// [`Service::delete`] for a caller that already holds the mutation lock as `slot`.
+    pub(crate) async fn delete_locked(
+        &self,
+        slot: &mut Option<JoinHandle<()>>,
+    ) -> std::result::Result<(), ApiError> {
         self.ensure_live()?;
         if self.env.defines_account(&self.id) {
             return Err(ApiError::conflict(
@@ -1074,7 +1102,7 @@ impl<B: Backend> Service<B> {
         let _operation = registration
             .as_ref()
             .map(|_| OperationGuard::new(&self.telemetry, Operation::Unregistering));
-        self.stop_receiver(&mut slot).await;
+        self.stop_receiver(slot).await;
         if let Some(registration) = &registration
             && let Err(error) = self
                 .remote(
@@ -1083,7 +1111,7 @@ impl<B: Backend> Service<B> {
                 )
                 .await
         {
-            self.start_receiver(&mut slot, registration.clone()).await;
+            self.start_receiver(slot, registration.clone()).await;
             return Err(error);
         }
 
@@ -1099,7 +1127,7 @@ impl<B: Backend> Service<B> {
         });
         if let Err(error) = removal {
             if let Some(registration) = registration {
-                self.start_receiver(&mut slot, registration).await;
+                self.start_receiver(slot, registration).await;
             }
             return Err(error);
         }
@@ -1217,6 +1245,16 @@ impl<B: Backend> Accounts<B> {
     /// Creates an account with no cookies yet: 400 for a malformed id, 409 for an existing one or
     /// when history files of that id are still on disk.
     pub fn create(&self, id: &str) -> std::result::Result<AccountDto, ApiError> {
+        self.create_account(Account::new(id))
+    }
+
+    /// [`Accounts::create`] for an account that starts with its settings already filled in.
+    pub(crate) fn create_account(
+        &self,
+        account: Account,
+    ) -> std::result::Result<AccountDto, ApiError> {
+        let owned_id = account.id.clone();
+        let id = owned_id.as_str();
         validate_id(id)?;
         if self.env.defines_account(id) {
             return Err(ApiError::account_exists());
@@ -1252,7 +1290,6 @@ impl<B: Backend> Accounts<B> {
                 );
                 return Err(ApiError::history_cleanup_required());
             }
-            let account = Account::new(id);
             Ok((Some(account.clone()), account))
         })?;
         Ok(self.service_for(id).summary(&account))

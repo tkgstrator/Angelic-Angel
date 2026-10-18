@@ -28,11 +28,21 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const TIMEOUT: Duration = Duration::from_secs(2);
 
+#[path = "machine_accounts.rs"]
+mod accounts;
 #[cfg(test)]
 #[path = "machine_tests.rs"]
 mod tests;
 const PREFIX: &str = "/api/machine/v1";
-const OPERATIONS: [&str; 6] = ["read", "identity", "post", "operations", "like", "follow"];
+const OPERATIONS: [&str; 7] = [
+    "read",
+    "identity",
+    "post",
+    "operations",
+    "like",
+    "follow",
+    "accounts",
+];
 
 type Failure = (StatusCode, Json<Value>);
 type Api<T> = std::result::Result<Json<T>, Failure>;
@@ -115,18 +125,19 @@ impl Settings {
         {
             return Err(invalid());
         }
-        let accounts: BTreeSet<_> = accounts
-            .ok_or_else(invalid)?
-            .split(',')
-            .map(str::to_owned)
-            .collect();
         let operations: BTreeSet<_> = operations
             .ok_or_else(invalid)?
             .split(',')
             .map(str::to_owned)
             .collect();
-        if accounts.is_empty()
-            || accounts.iter().any(|id| validate_account_id(id).is_err())
+        // Managing accounts through the API makes the static allowlist optional.
+        let manages = operations.contains("accounts");
+        let accounts: BTreeSet<_> = match accounts {
+            Some(list) if !list.is_empty() => list.split(',').map(str::to_owned).collect(),
+            _ if manages => BTreeSet::new(),
+            _ => return Err(invalid()),
+        };
+        if accounts.iter().any(|id| validate_account_id(id).is_err())
             || operations.is_empty()
             || operations
                 .iter()
@@ -321,6 +332,27 @@ impl<B: Backend, X: MachineBackend> Machine<B, X> {
         self.settings.bind
     }
 
+    /// Whether this principal created the account through the machine API. A configuration that
+    /// cannot be read counts as "not owned".
+    fn owns(&self, id: &str) -> bool {
+        self.accounts
+            .machine_owners()
+            .is_ok_and(|owners| owners.get(id) == Some(&self.settings.client))
+    }
+
+    /// The allowlist and scope check, extended to the accounts this principal owns. A principal
+    /// that manages accounts cannot tell a missing account from another client's: both are 404.
+    fn allow(&self, id: &str, operation: &str) -> std::result::Result<(), Failure> {
+        if self.settings.accounts.contains(id) || self.owns(id) {
+            return self.settings.allow(None, operation);
+        }
+        self.settings.allow(None, operation)?;
+        if self.settings.operations.contains("accounts") {
+            return Err(failure(StatusCode::NOT_FOUND, "account_not_found"));
+        }
+        Err(failure(StatusCode::FORBIDDEN, "scope_denied"))
+    }
+
     fn revision(
         &self,
         id: &str,
@@ -371,6 +403,7 @@ async fn auth<B: Backend, X: MachineBackend>(
 pub fn router<B: Backend, X: MachineBackend>(state: Shared<B, X>) -> Router {
     Router::new()
         .route(&format!("{PREFIX}/accounts"), get(list::<B, X>))
+        .merge(accounts::routes::<B, X>())
         .route(
             &format!("{PREFIX}/accounts/{{id}}/readiness"),
             get(readiness::<B, X>),
@@ -418,9 +451,14 @@ async fn list<B: Backend, X: MachineBackend>(State(state): State<Shared<B, X>>) 
         .accounts
         .list()
         .map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE, "accounts_unavailable"))?;
+    let owners = state
+        .accounts
+        .machine_owners()
+        .map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE, "accounts_unavailable"))?;
     let mut accounts = Vec::new();
     for account in list.accounts {
-        if state.settings.accounts.contains(&account.id) {
+        let owned = owners.get(&account.id) == Some(&state.settings.client);
+        if owned || state.settings.accounts.contains(&account.id) {
             accounts.push(account_readiness(&state, &account.id).await?);
         }
     }
@@ -446,6 +484,9 @@ async fn account_readiness<B: Backend, X: MachineBackend>(
     let status = service
         .status()
         .map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE, "accounts_unavailable"))?;
+    let profile = service
+        .machine_profile()
+        .map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE, "accounts_unavailable"))?;
     let configured = !twitter.auth_token.is_empty() && !twitter.ct0.is_empty();
     let metadata_ready = state.x.ready().await;
     let post_allowed = state.settings.operations.contains("post")
@@ -469,6 +510,8 @@ async fn account_readiness<B: Backend, X: MachineBackend>(
     Ok(
         json!({"id": id, "registered": status.registered, "receiver_state": status.state,
         "credential_revision": revision, "credentials_configured": configured,
+        "x_user_id": profile.x_user_id,
+        "permissions": {"post": profile.post, "like": profile.like, "follow": profile.follow},
         "metadata_ready": metadata_ready, "post_ready": configured && metadata_ready && post_allowed,
         "capabilities": {"identity": state.settings.operations.contains("identity"),
             "text_post": configured && metadata_ready && post_allowed,
@@ -482,7 +525,7 @@ async fn readiness<B: Backend, X: MachineBackend>(
     State(state): State<Shared<B, X>>,
     Path(id): Path<String>,
 ) -> Api<Value> {
-    state.settings.allow(Some(&id), "read")?;
+    state.allow(&id, "read")?;
     Ok(Json(account_readiness(&state, &id).await?))
 }
 
@@ -490,7 +533,7 @@ async fn identity<B: Backend, X: MachineBackend>(
     State(state): State<Shared<B, X>>,
     Path(id): Path<String>,
 ) -> Api<Value> {
-    state.settings.allow(Some(&id), "identity")?;
+    state.allow(&id, "identity")?;
     let service = state
         .accounts
         .get(&id)
@@ -576,7 +619,7 @@ async fn create<B: Backend, X: MachineBackend>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Api<Operation> {
-    state.settings.allow(Some(&id), "post")?;
+    state.allow(&id, "post")?;
     require_json(&headers)?;
     let request: Post = serde_json::from_slice(&body)
         .map_err(|_| failure(StatusCode::BAD_REQUEST, "invalid_request"))?;
@@ -718,7 +761,7 @@ async fn lookup_post<B: Backend, X: MachineBackend>(
     State(state): State<Shared<B, X>>,
     Path((id, post_id)): Path<(String, String)>,
 ) -> Api<PostInfo> {
-    state.settings.allow(Some(&id), "read")?;
+    state.allow(&id, "read")?;
     if !is_valid_user_id(&post_id) {
         return Err(failure(StatusCode::BAD_REQUEST, "invalid_request"));
     }
@@ -738,7 +781,7 @@ async fn lookup_user<B: Backend, X: MachineBackend>(
     State(state): State<Shared<B, X>>,
     Path((id, user_id)): Path<(String, String)>,
 ) -> Api<UserProfile> {
-    state.settings.allow(Some(&id), "read")?;
+    state.allow(&id, "read")?;
     if !is_valid_user_id(&user_id) {
         return Err(failure(StatusCode::BAD_REQUEST, "invalid_request"));
     }
@@ -868,7 +911,7 @@ async fn like<B: Backend, X: MachineBackend>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Api<Operation> {
-    state.settings.allow(Some(&id), "like")?;
+    state.allow(&id, "like")?;
     require_json(&headers)?;
     let request: Like = serde_json::from_slice(&body)
         .map_err(|_| failure(StatusCode::BAD_REQUEST, "invalid_request"))?;
@@ -885,7 +928,7 @@ async fn follow<B: Backend, X: MachineBackend>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Api<Operation> {
-    state.settings.allow(Some(&id), "follow")?;
+    state.allow(&id, "follow")?;
     require_json(&headers)?;
     let request: Follow = serde_json::from_slice(&body)
         .map_err(|_| failure(StatusCode::BAD_REQUEST, "invalid_request"))?;
@@ -1056,7 +1099,7 @@ async fn result<B: Backend, X: MachineBackend>(
     State(state): State<Shared<B, X>>,
     Path((id, operation)): Path<(String, String)>,
 ) -> Api<Operation> {
-    state.settings.allow(Some(&id), "operations")?;
+    state.allow(&id, "operations")?;
     let operation = state
         .ledger
         .get(&id, &state.settings.client, &operation)

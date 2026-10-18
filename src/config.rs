@@ -83,6 +83,13 @@ pub struct Account {
     /// Opaque incarnation/revision, never derived from a credential in public responses.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub credential_revision: String,
+    /// The machine client that created this account through the machine API. Only that client may
+    /// manage it there. Missing means nobody: accounts made in the WebUI, by env or by older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_owner: Option<String>,
+    /// The immutable X user id the cookies were verified against when the machine API stored them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_user_id: Option<String>,
     /// 環境変数で認証情報を渡す運用では `[accounts.twitter]` を持たない設定ファイルになる。
     #[serde(default, skip_serializing_if = "TwitterConfig::is_empty")]
     pub twitter: TwitterConfig,
@@ -103,6 +110,8 @@ impl Account {
             machine_like_enabled: false,
             machine_follow_enabled: false,
             credential_revision: uuid::Uuid::new_v4().to_string(),
+            machine_owner: None,
+            x_user_id: None,
             twitter: TwitterConfig::default(),
             registration: None,
             webhook_endpoint: None,
@@ -145,6 +154,8 @@ impl TryFrom<RawConfig> for Config {
                 machine_like_enabled: false,
                 machine_follow_enabled: false,
                 credential_revision: String::new(),
+                machine_owner: None,
+                x_user_id: None,
                 twitter: raw.twitter.unwrap_or_default(),
                 registration: raw.registration,
                 webhook_endpoint: raw.webhook_endpoint,

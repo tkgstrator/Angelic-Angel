@@ -30,8 +30,14 @@ Twitter/X  ──push──▶  Mozilla AutoPush Server  ◀──WebSocket─�
 ### Important Notes
 
 - **Data source**: All notification data is received from Mozilla's Web Push server (`push.services.mozilla.com`). Angelic Angel does not access Twitter/X directly for notification data.
-- **Minimal API usage**: The Twitter/X API is only called during the initial push subscription registration (`register` command, or the automatic registration of the first `listen` with credentials in the environment) and when you explicitly start the WebUI's bulk notification operation. No API calls are made while listening for notifications.
-- **No scraping**: This tool does not perform any web scraping. It uses the standard W3C Push API flow, the same mechanism browsers use to deliver push notifications.
+- **Minimal API usage**: Notification reception uses Web Push. Initial registration, explicit WebUI operations and the optional machine API contact X; account/readiness listings do not.
+- **Web Push**: Notification delivery uses the standard W3C Push API flow. Explicit X operations also obtain public bootstrap/signature metadata; retrieved JavaScript is parsed, never executed.
+
+### Optional machine API (v0.5)
+
+`serve` can additionally expose a dedicated Bearer-authenticated listener (default `127.0.0.1:8081`), completely separate from the local management UI on port 8080. It supports scoped account/readiness/identity reads, text posts/replies, and durable operation result queries. Cookies and webhook secrets never leave Angel through this API. It is disabled when `MACHINE_SERVICE_TOKEN` is absent; empty tokens and incomplete scopes are rejected. `listen` and all existing CLI commands retain their existing behavior; the machine API is enabled only by `serve`.
+
+Configure a new service token, `MACHINE_CLIENT_ID`, `MACHINE_ACCOUNTS` and `MACHINE_OPERATIONS` before starting `angelic-angel --config /config/angelic-angel.toml serve`. See [Machine API](docs/machine-api.md) for the complete configuration, request format, revision checks, indefinite idempotency retention and `unknown` recovery rules. Lookup, likes, follows, media and quotes are not provided; this does not yet eliminate the Bot's other Cookie dependencies.
 
 ## Requirements
 

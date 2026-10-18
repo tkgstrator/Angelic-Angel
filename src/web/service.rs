@@ -535,6 +535,25 @@ impl<B: Backend> Service<B> {
         Ok(())
     }
 
+    /// Machine operations hold the same lock as credential updates and deletion until dispatch
+    /// and result persistence finish. A previously resolved, deleted handle is checked again.
+    pub(crate) async fn machine_lock(
+        &self,
+    ) -> std::result::Result<tokio::sync::MutexGuard<'_, Option<JoinHandle<()>>>, ApiError> {
+        let guard = self.receiver.lock().await;
+        self.ensure_live()?;
+        Ok(guard)
+    }
+
+    pub(crate) fn machine_credentials(&self) -> std::result::Result<(TwitterConfig, String), ApiError> {
+        let mut account = self.load()?;
+        if self.env.defines_account(&self.id) && Config::load_optional(&self.config_path)?
+            .is_none_or(|c| c.account(&self.id).is_none()) {
+            account.credential_revision.clear();
+        }
+        Ok((self.env.twitter(&self.id, &account.twitter), account.credential_revision))
+    }
+
     fn load(&self) -> std::result::Result<Account, ApiError> {
         self.ensure_live()?;
         load_account(&self.config_path, &self.id, &self.env)

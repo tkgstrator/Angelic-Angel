@@ -71,6 +71,9 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,
+    /// Opaque incarnation/revision, never derived from a credential in public responses.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub credential_revision: String,
     /// 環境変数で認証情報を渡す運用では `[accounts.twitter]` を持たない設定ファイルになる。
     #[serde(default, skip_serializing_if = "TwitterConfig::is_empty")]
     pub twitter: TwitterConfig,
@@ -87,6 +90,7 @@ impl Account {
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
+            credential_revision: uuid::Uuid::new_v4().to_string(),
             twitter: TwitterConfig::default(),
             registration: None,
             webhook_endpoint: None,
@@ -125,6 +129,7 @@ impl TryFrom<RawConfig> for Config {
             (Some(accounts), false) => accounts,
             (None, true) => vec![Account {
                 id: DEFAULT_ACCOUNT_ID.to_string(),
+                credential_revision: String::new(),
                 twitter: raw.twitter.unwrap_or_default(),
                 registration: raw.registration,
                 webhook_endpoint: raw.webhook_endpoint,
@@ -294,7 +299,19 @@ impl Config {
     /// backup fails the save.
     pub fn save(&self, path: &Path) -> Result<()> {
         validate_accounts(&self.accounts)?;
-        let content = toml::to_string_pretty(self)
+        let previous = Self::load_optional(path)?;
+        let mut next = self.clone();
+        for account in &mut next.accounts {
+            let unchanged = previous.as_ref().and_then(|c| c.account(&account.id)).filter(|old| {
+                old.twitter.auth_token == account.twitter.auth_token
+                    && old.twitter.ct0 == account.twitter.ct0
+                    && !old.credential_revision.is_empty()
+            });
+            account.credential_revision = unchanged
+                .map(|old| old.credential_revision.clone())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        }
+        let content = toml::to_string_pretty(&next)
             .map_err(|e| AngelicAngelError::Config(format!("failed to serialize config: {}", e)))?;
         backup_legacy_file(path)?;
         write_private_atomic(path, content.as_bytes())
@@ -1029,6 +1046,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!((t.auth_token.as_str(), t.ct0.as_str()), ("e", "f"));
+    }
+
+    #[test]
+    fn machine_revision_is_durable_and_rotates_on_credentials_or_recreation() {
+        let path = temp_dir().join("revision.toml");
+        let mut config = Config { accounts: vec![Account::new("default")] };
+        config.accounts[0].twitter = TwitterConfig { auth_token: "fixture-auth".into(), ct0: "fixture-csrf".into() };
+        config.save(&path).unwrap();
+        let first = test_default_account(&path).credential_revision;
+        config.save(&path).unwrap();
+        assert_eq!(first, test_default_account(&path).credential_revision);
+        config.accounts[0].twitter.ct0 = "rotated-fixture-csrf".into();
+        config.save(&path).unwrap();
+        let second = test_default_account(&path).credential_revision;
+        assert_ne!(first, second);
+        Config::default().save(&path).unwrap();
+        config.save(&path).unwrap();
+        assert_ne!(second, test_default_account(&path).credential_revision);
     }
 
     #[test]

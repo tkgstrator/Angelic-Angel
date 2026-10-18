@@ -428,16 +428,34 @@ async fn shutdown_signal() {
     }
 }
 
+async fn wait_stop(mut receiver: tokio::sync::watch::Receiver<bool>) {
+    while !*receiver.borrow_and_update() {
+        if receiver.changed().await.is_err() { break; }
+    }
+}
+
 /// Runs the WebUI server until SIGINT/SIGTERM, then stops the receivers of all accounts.
 pub async fn serve(config_path: PathBuf, bind: String, assets_dir: PathBuf) -> Result<()> {
     let _lock = ConfigLock::acquire(&config_path)?;
 
     let environment = Environment::from_process()?;
+    let machine_settings = crate::machine::Settings::from_process()?;
     let service = Arc::new(Accounts::new(
         LiveBackend::default(),
-        config_path,
+        config_path.clone(),
         environment,
     ));
+    let machine = match machine_settings {
+        Some(settings) => {
+            let state = crate::machine::Machine::new(
+                settings, Arc::clone(&service), &config_path, crate::twitter::XApi::new(),
+            )?;
+            let listener = tokio::net::TcpListener::bind(state.bind()).await
+                .map_err(|_| AngelicAngelError::Config("failed to bind machine listener".into()))?;
+            Some((listener, crate::machine::router(state)))
+        },
+        None => None,
+    };
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .map_err(|e| AngelicAngelError::Config(format!("failed to bind {bind}: {e}")))?;
@@ -446,18 +464,29 @@ pub async fn serve(config_path: PathBuf, bind: String, assets_dir: PathBuf) -> R
     service.startup().await;
     eprintln!("listening on http://{}", listener.local_addr()?);
 
-    let stop = Arc::new(tokio::sync::Notify::new());
-    let trigger = Arc::clone(&stop);
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-        shutdown_signal().await;
-        trigger.notify_one();
-    });
-    let result = tokio::select! {
-        result = server => result,
-        _ = async {
-            stop.notified().await;
-            tokio::time::sleep(SHUTDOWN_GRACE).await;
-        } => Ok(()),
+    let (stop, admin_stop) = tokio::sync::watch::channel(false);
+    let machine_stop = stop.subscribe();
+    let result = {
+        let servers = async {
+            let admin = axum::serve(listener, app).with_graceful_shutdown(wait_stop(admin_stop));
+            let machine = async {
+                if let Some((listener, app)) = machine {
+                    axum::serve(listener, app).with_graceful_shutdown(wait_stop(machine_stop)).await?;
+                }
+                Ok::<(), std::io::Error>(())
+            };
+            tokio::try_join!(async { admin.await }, machine).map(|_| ())
+        };
+        tokio::pin!(servers);
+        let outcome = tokio::select! {
+            result = &mut servers => Some(result),
+            _ = shutdown_signal() => None,
+        };
+        let _ = stop.send(true);
+        match outcome {
+            Some(result) => result,
+            None => tokio::time::timeout(SHUTDOWN_GRACE, &mut servers).await.unwrap_or(Ok(())),
+        }
     };
 
     service.shutdown().await;

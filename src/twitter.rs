@@ -1,15 +1,17 @@
 use crate::config::TwitterConfig;
 use crate::error::{AngelicAngelError, Result};
+use crate::machine_types::{FollowResult, LikeResult, PostInfo, UserProfile, UserRelation};
 use crate::push::PushSubscription;
 use crate::transaction::{
     Transaction, entry_script_urls, is_signer_url, module_import_urls, module_priority,
     ondemand_file_hash,
 };
+use crate::x_metadata::{ActionMetadata, ReadOperation};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::header::{CONTENT_TYPE, HeaderValue, LOCATION};
-use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
+use reqwest::{Client, Request, RequestBuilder, Response, StatusCode, Url};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::fmt;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -43,6 +45,16 @@ const FRIENDS_PAGE_SIZE: &str = "5000";
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_USER_ID_LEN: usize = 20;
 const MAX_SCREEN_NAME_LEN: usize = 15;
+/// Upper bound for one lookup or action request, kept below the caller's own 30 second limit.
+const ACTION_TIMEOUT: Duration = Duration::from_secs(12);
+/// A catalogue that resolved only some operations is read again soon instead of after hours.
+const PARTIAL_ACTIONS_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_POST_TEXT_CHARS: usize = 25_000;
+const MAX_PROFILE_TEXT_BYTES: usize = 4096;
+/// X's error code for a post the account has already favorited.
+const ALREADY_FAVORITED_CODE: u64 = 139;
+/// Flags the web client sends with `friendships/create`; the target `user_id` is appended.
+const FRIENDSHIPS_CREATE_FORM: &str = "include_profile_interstitial_type=1&include_blocking=1&include_blocked_by=1&include_followed_by=1&include_want_retweets=1&include_mute_edge=1&include_can_dm=1&include_can_media_tag=1&include_ext_has_nft_avatar=1&include_ext_is_blue_verified=1&include_ext_verified_type=1&include_ext_profile_image_shape=1&skip_status=1";
 
 /// Adds a credential header; an unrepresentable value is passed through so reqwest reports a builder error.
 fn secret_header(request: RequestBuilder, name: &'static str, value: String) -> RequestBuilder {
@@ -142,6 +154,9 @@ pub enum XError {
     Status(u16),
     Transport,
     Malformed,
+    /// A write was sent but its outcome could not be confirmed. It may or may not have taken
+    /// effect, so it must not be sent again automatically.
+    Uncertain,
 }
 
 impl fmt::Display for XError {
@@ -153,6 +168,7 @@ impl fmt::Display for XError {
             Self::Status(code) => write!(f, "X returned an error (HTTP {code})."),
             Self::Transport => f.write_str("Could not reach X."),
             Self::Malformed => f.write_str("X returned an unexpected response."),
+            Self::Uncertain => f.write_str("X may have applied the request. Result unknown."),
         }
     }
 }
@@ -166,6 +182,8 @@ impl XError {
         )
     }
 }
+
+type XResult<T> = std::result::Result<T, XError>;
 
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct Identity {
@@ -242,6 +260,508 @@ fn parse_post(body: &[u8], expected_user: &str) -> std::result::Result<String, X
     Ok(id.to_string())
 }
 
+// ---- lookup and action responses ------------------------------------------
+//
+// Every parser below keeps only what X stated explicitly. A field that is missing, `null`,
+// unreadable, or contradicted by a second source is unknown (`None`), never `false`, `0` or a
+// guess. Bodies are never logged and never copied into an error.
+
+fn parse_json(body: &[u8]) -> XResult<Value> {
+    serde_json::from_slice(body).map_err(|_| XError::Malformed)
+}
+
+/// The value at a JSON pointer, unless it is missing or `null`.
+fn json_at<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    value.pointer(path).filter(|found| !found.is_null())
+}
+
+fn array_at<'a>(value: &'a Value, path: &str) -> Option<&'a Vec<Value>> {
+    json_at(value, path).and_then(Value::as_array)
+}
+
+fn text_at<'a>(value: &'a Value, path: &str) -> Option<&'a str> {
+    json_at(value, path).and_then(Value::as_str)
+}
+
+fn flag_at(value: &Value, path: &str) -> Option<bool> {
+    json_at(value, path).and_then(Value::as_bool)
+}
+
+fn count_at(value: &Value, path: &str) -> Option<u64> {
+    json_at(value, path).and_then(Value::as_u64)
+}
+
+fn date_at(value: &Value, path: &str) -> Option<String> {
+    text_at(value, path).and_then(parse_x_date)
+}
+
+/// A well-formed ID at `path`. Anything else, including a non-string, is unknown.
+fn valid_id_at<'a>(value: &'a Value, path: &str) -> Option<&'a str> {
+    text_at(value, path).filter(|id| is_valid_user_id(id))
+}
+
+fn id_at(value: &Value, path: &str) -> Option<String> {
+    valid_id_at(value, path).map(str::to_owned)
+}
+
+/// An ID that may be absent but, when X states it, must be well formed.
+fn optional_id(value: &Value, path: &str) -> XResult<Option<String>> {
+    if json_at(value, path).is_none() {
+        return Ok(None);
+    }
+    id_at(value, path).map(Some).ok_or(XError::Malformed)
+}
+
+/// Two readings of one fact (for example the current and the legacy field). When both exist and
+/// disagree, the fact is unknown.
+fn agreed<T: PartialEq>(first: Option<T>, second: Option<T>) -> Option<T> {
+    match (first, second) {
+        (Some(a), Some(b)) if a != b => None,
+        (Some(a), _) => Some(a),
+        (None, other) => other,
+    }
+}
+
+/// Whether the body reports GraphQL errors. An empty list does not count.
+fn has_errors(root: &Value) -> bool {
+    match json_at(root, "/errors") {
+        Some(errors) => errors.as_array().is_none_or(|list| !list.is_empty()),
+        None => false,
+    }
+}
+
+/// "Not there" is believed only when X reported no errors alongside it.
+fn absent<T>(root: &Value) -> XResult<Option<T>> {
+    if has_errors(root) {
+        return Err(XError::Malformed);
+    }
+    Ok(None)
+}
+
+fn month_number(name: &str) -> Option<u32> {
+    match name {
+        "Jan" => Some(1),
+        "Feb" => Some(2),
+        "Mar" => Some(3),
+        "Apr" => Some(4),
+        "May" => Some(5),
+        "Jun" => Some(6),
+        "Jul" => Some(7),
+        "Aug" => Some(8),
+        "Sep" => Some(9),
+        "Oct" => Some(10),
+        "Nov" => Some(11),
+        "Dec" => Some(12),
+        _ => None,
+    }
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    let century = year.is_multiple_of(100);
+    let leap = year.is_multiple_of(4) && (!century || year.is_multiple_of(400));
+    match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn is_weekday(text: &str) -> bool {
+    let names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    names.contains(&text)
+}
+
+/// A fixed-width unsigned decimal. Signs, spaces and other characters are not numbers here.
+fn digits(text: &str, width: usize) -> Option<u32> {
+    if text.len() != width || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// X's `created_at` (`Wed Oct 10 20:19:24 +0000 2018`) as UTC ISO 8601. Anything that is not
+/// exactly that shape, or not a real date, is unknown.
+fn parse_x_date(text: &str) -> Option<String> {
+    let parts: Vec<&str> = text.split(' ').collect();
+    let [weekday, month, day, time, zone, year] = parts.as_slice() else {
+        return None;
+    };
+    if *zone != "+0000" || !is_weekday(weekday) {
+        return None;
+    }
+    let clock: Vec<&str> = time.split(':').collect();
+    let [hour, minute, second] = clock.as_slice() else {
+        return None;
+    };
+    let hour = digits(hour, 2)?;
+    let minute = digits(minute, 2)?;
+    let second = digits(second, 2)?;
+    let day = digits(day, 2)?;
+    let year = digits(year, 4)?;
+    let month = month_number(month)?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    if day == 0 || day > days_in_month(year, month) {
+        return None;
+    }
+    let date = format!("{year:04}-{month:02}-{day:02}");
+    let clock = format!("{hour:02}:{minute:02}:{second:02}");
+    Some(format!("{date}T{clock}Z"))
+}
+
+/// X escapes `& < > " '` in post text. `&amp;` is decoded last so `&amp;lt;` stays `&lt;`.
+fn decode_entities(text: &str) -> String {
+    let text = text.replace("&lt;", "<").replace("&gt;", ">");
+    let text = text.replace("&quot;", "\"").replace("&#39;", "'");
+    text.replace("&amp;", "&")
+}
+
+/// A tweet found in a timeline: its object, its author object, and the IDs both state.
+struct Tweet<'a> {
+    node: &'a Value,
+    user: &'a Value,
+    id: &'a str,
+    author_id: &'a str,
+}
+
+impl Tweet<'_> {
+    /// The author's ID, only when the tweet's own `user_id_str` names the same account as its
+    /// author object.
+    fn confirmed_author(&self) -> Option<&str> {
+        let stated = text_at(self.node, "/legacy/user_id_str");
+        (stated == Some(self.author_id)).then_some(self.author_id)
+    }
+}
+
+/// The `Tweet` object of a timeline result. Tombstones and other unavailable results have none.
+fn tweet_node(result: &Value) -> Option<&Value> {
+    match text_at(result, "/__typename") {
+        Some("Tweet") => Some(result),
+        Some("TweetWithVisibilityResults") => json_at(result, "/tweet"),
+        _ => None,
+    }
+}
+
+fn is_user_object(user: &Value) -> bool {
+    matches!(text_at(user, "/__typename"), None | Some("User"))
+}
+
+/// A timeline result as a tweet with a well-formed ID and author object; otherwise `None`.
+fn read_tweet(result: &Value) -> Option<Tweet<'_>> {
+    let node = tweet_node(result)?;
+    let id = valid_id_at(node, "/rest_id")?;
+    let user = json_at(node, "/core/user_results/result")?;
+    if !is_user_object(user) {
+        return None;
+    }
+    let author_id = valid_id_at(user, "/rest_id")?;
+    Some(Tweet {
+        node,
+        user,
+        id,
+        author_id,
+    })
+}
+
+/// The tweet object that states `post_id` as its ID, whether or not the rest of it is readable.
+fn find_named<'a>(results: &[&'a Value], post_id: &str) -> Option<&'a Value> {
+    let mut nodes = results.iter().copied().filter_map(tweet_node);
+    nodes.find(|node| text_at(node, "/rest_id") == Some(post_id))
+}
+
+/// Whether the author object is explicitly something other than a user (suspended, removed).
+fn has_unavailable_author(node: &Value) -> bool {
+    match json_at(node, "/core/user_results/result") {
+        Some(user) => !is_user_object(user),
+        None => false,
+    }
+}
+
+/// The quoted post embedded in a tweet, when X included it.
+fn embedded_tweet(node: &Value) -> Option<Tweet<'_>> {
+    let quoted = json_at(node, "/quoted_status_result/result");
+    quoted.and_then(read_tweet)
+}
+
+/// The author of `tweet`, only when it is the post `id` and names that author itself.
+fn author_of(tweet: Option<&Tweet<'_>>, id: Option<&str>) -> Option<String> {
+    let tweet = tweet?;
+    if Some(tweet.id) != id {
+        return None;
+    }
+    tweet.confirmed_author().map(str::to_owned)
+}
+
+/// The tweet results of one timeline entry: a single item, or every item of a module.
+fn push_results<'a>(entry: &'a Value, results: &mut Vec<&'a Value>) {
+    results.extend(entry.pointer("/content/itemContent/tweet_results/result"));
+    let items = array_at(entry, "/content/items");
+    for item in items.into_iter().flatten() {
+        results.extend(item.pointer("/item/itemContent/tweet_results/result"));
+    }
+}
+
+/// The entries one timeline instruction adds (or the single entry it replaces).
+fn entries_of(instruction: &Value) -> Vec<&Value> {
+    let many = array_at(instruction, "/entries");
+    let one = instruction.get("entry");
+    many.into_iter().flatten().chain(one).collect()
+}
+
+/// Every tweet result in a `TweetDetail` response, in response order.
+fn timeline_results(root: &Value) -> XResult<Vec<&Value>> {
+    let path = "/data/threaded_conversation_with_injections_v2/instructions";
+    let instructions = array_at(root, path).ok_or(XError::Malformed)?;
+    let mut results = Vec::new();
+    for instruction in instructions {
+        for entry in entries_of(instruction) {
+            push_results(entry, &mut results);
+        }
+        let module_items = array_at(instruction, "/moduleItems");
+        for item in module_items.into_iter().flatten() {
+            results.extend(item.pointer("/item/itemContent/tweet_results/result"));
+        }
+    }
+    Ok(results)
+}
+
+/// A screen name from the current or the legacy user field; it must be well formed.
+fn screen_name_of(user: &Value) -> Option<String> {
+    let core = text_at(user, "/core/screen_name");
+    let name = core.or(text_at(user, "/legacy/screen_name"));
+    let valid = name.filter(|n| is_valid_screen_name(n));
+    valid.map(str::to_owned)
+}
+
+/// The text of a post: the long-form text when X sent it, otherwise the legacy text.
+fn post_text(node: &Value, legacy: &Value) -> XResult<String> {
+    let long = text_at(node, "/note_tweet/note_tweet_results/result/text");
+    let full = text_at(legacy, "/full_text");
+    let text = long.or(full).ok_or(XError::Malformed)?;
+    if text.is_empty() || text.chars().count() > MAX_POST_TEXT_CHARS {
+        return Err(XError::Malformed);
+    }
+    Ok(decode_entities(text))
+}
+
+/// The replied-to user. X's `in_reply_to_user_id_str` and the author of the replied-to post (when
+/// the response contains it) must agree. A fact that is stated but unreadable or contradicted is
+/// not the same as a missing one, so it makes the answer unknown. Without a replied-to post ID
+/// there is nothing to be a reply to, so the user is unknown too.
+fn reply_user(tweets: &[Tweet<'_>], legacy: &Value, parent: Option<&str>) -> Option<String> {
+    let parent_id = parent?;
+    let stated = json_at(legacy, "/in_reply_to_user_id_str");
+    let explicit = id_at(legacy, "/in_reply_to_user_id_str");
+    let found = tweets.iter().find(|tweet| tweet.id == parent_id);
+    let parent_author = author_of(found, Some(parent_id));
+    if stated.is_some() && explicit.is_none() {
+        return None;
+    }
+    if found.is_some() && parent_author.is_none() {
+        return None;
+    }
+    agreed(explicit, parent_author)
+}
+
+/// A post from a `TweetDetail` response. `Ok(None)` means X did not return that post (deleted,
+/// hidden, tombstoned, no conversation at all and no error); a post whose own fields contradict
+/// each other is an error.
+fn parse_tweet_detail(body: &[u8], post_id: &str) -> XResult<Option<PostInfo>> {
+    let root = parse_json(body)?;
+    if !json_at(&root, "/data").is_some_and(Value::is_object) {
+        return Err(XError::Malformed);
+    }
+    if json_at(&root, "/data/threaded_conversation_with_injections_v2").is_none() {
+        return absent(&root);
+    }
+    let results = timeline_results(&root)?;
+    let tweets: Vec<Tweet<'_>> = results.iter().copied().filter_map(read_tweet).collect();
+    let Some(focal) = tweets.iter().find(|tweet| tweet.id == post_id) else {
+        // A post that is present but unreadable is not a deleted one, unless its author is
+        // explicitly unavailable.
+        return match find_named(&results, post_id) {
+            Some(node) if !has_unavailable_author(node) => Err(XError::Malformed),
+            _ => absent(&root),
+        };
+    };
+    let author_id = focal.confirmed_author().ok_or(XError::Malformed)?;
+    let legacy = json_at(focal.node, "/legacy").ok_or(XError::Malformed)?;
+    let text = post_text(focal.node, legacy)?;
+    let author_screen_name = screen_name_of(focal.user).ok_or(XError::Malformed)?;
+    let conversation_id = id_at(legacy, "/conversation_id_str");
+    let conversation_id = conversation_id.ok_or(XError::Malformed)?;
+    let reply_to_post_id = optional_id(legacy, "/in_reply_to_status_id_str")?;
+    let quoted_post_id = id_at(legacy, "/quoted_status_id_str");
+    let embedded = embedded_tweet(focal.node);
+    let quoted_author_id = author_of(embedded.as_ref(), quoted_post_id.as_deref());
+    let reply_to_user_id = reply_user(&tweets, legacy, reply_to_post_id.as_deref());
+    Ok(Some(PostInfo {
+        id: post_id.to_owned(),
+        text,
+        author_id: author_id.to_owned(),
+        author_screen_name,
+        conversation_id,
+        created_at: date_at(legacy, "/created_at"),
+        reply_to_post_id,
+        reply_to_user_id,
+        quoted_post_id,
+        quoted_author_id,
+    }))
+}
+
+fn profile_text(text: Option<&str>) -> Option<String> {
+    let fits = text.filter(|t| t.len() <= MAX_PROFILE_TEXT_BYTES);
+    fits.map(str::to_owned)
+}
+
+/// A relation flag X may state both under `relationship_perspectives` and under `legacy`.
+fn relation_flag(user: &Value, key: &str) -> Option<bool> {
+    let current = format!("/relationship_perspectives/{key}");
+    let legacy = format!("/legacy/{key}");
+    agreed(flag_at(user, &current), flag_at(user, &legacy))
+}
+
+fn relation_of(user: &Value) -> UserRelation {
+    UserRelation {
+        blocked_by: relation_flag(user, "blocked_by"),
+        blocking: relation_flag(user, "blocking"),
+        followed_by: relation_flag(user, "followed_by"),
+        following: relation_flag(user, "following"),
+        follow_request_sent: flag_at(user, "/legacy/follow_request_sent"),
+    }
+}
+
+/// `Some(true)` only when the profile explicitly carries the automated-account label. A missing
+/// label says nothing either way, so it is never `Some(false)`.
+fn automated_label(user: &Value) -> Option<bool> {
+    let label = text_at(user, "/affiliates_highlighted_label/label/userLabelType");
+    (label == Some("AutomatedLabel")).then_some(true)
+}
+
+fn profile_of(user: &Value, user_id: &str, screen_name: String) -> UserProfile {
+    let core_date = date_at(user, "/core/created_at");
+    let created_at = core_date.or(date_at(user, "/legacy/created_at"));
+    let bio = text_at(user, "/profile_bio/description");
+    let description = bio.or(text_at(user, "/legacy/description"));
+    let core_name = text_at(user, "/core/name");
+    let name = core_name.or(text_at(user, "/legacy/name"));
+    let privacy = flag_at(user, "/privacy/protected");
+    let is_protected = agreed(privacy, flag_at(user, "/legacy/protected"));
+    UserProfile {
+        user_id: user_id.to_owned(),
+        screen_name,
+        name: profile_text(name),
+        description: profile_text(description),
+        created_at,
+        automated_label: automated_label(user),
+        default_profile_image: flag_at(user, "/legacy/default_profile_image"),
+        is_protected,
+        followers_count: count_at(user, "/legacy/followers_count"),
+        following_count: count_at(user, "/legacy/friends_count"),
+        posts_count: count_at(user, "/legacy/statuses_count"),
+        relation: relation_of(user),
+    }
+}
+
+/// A profile from a `UserByRestId` response. `Ok(None)` means X stated that the account is not
+/// available (suspended) or returned no user and no error (removed, never existed); a different
+/// account than the one asked for is an error.
+fn parse_user_profile(body: &[u8], user_id: &str) -> XResult<Option<UserProfile>> {
+    let root = parse_json(body)?;
+    if !json_at(&root, "/data").is_some_and(Value::is_object) {
+        return Err(XError::Malformed);
+    }
+    let Some(wrapper) = json_at(&root, "/data/user") else {
+        return absent(&root);
+    };
+    if !wrapper.is_object() {
+        return Err(XError::Malformed);
+    }
+    let Some(user) = json_at(&root, "/data/user/result") else {
+        return absent(&root);
+    };
+    if !is_user_object(user) {
+        return Ok(None);
+    }
+    if text_at(user, "/rest_id") != Some(user_id) {
+        return Err(XError::Malformed);
+    }
+    let screen_name = screen_name_of(user).ok_or(XError::Malformed)?;
+    Ok(Some(profile_of(user, user_id, screen_name)))
+}
+
+fn is_already_favorited(error: &Value) -> bool {
+    let top = count_at(error, "/code");
+    let nested = count_at(error, "/extensions/code");
+    agreed(top, nested) == Some(ALREADY_FAVORITED_CODE)
+}
+
+/// Whether every reported error is X's "already favorited" code, and there is at least one.
+fn only_already_favorited(root: &Value) -> bool {
+    match array_at(root, "/errors") {
+        Some(list) if !list.is_empty() => list.iter().all(is_already_favorited),
+        _ => false,
+    }
+}
+
+/// The result of `FavoriteTweet`. Success needs X's own confirmation (`favorite_tweet`); the one
+/// error accepted is "already favorited", which leaves the post liked all the same.
+fn parse_favorite(body: &[u8], post_id: &str) -> XResult<LikeResult> {
+    let root = parse_json(body)?;
+    let already_liked = has_errors(&root);
+    if already_liked && !only_already_favorited(&root) {
+        return Err(XError::Malformed);
+    }
+    let word = text_at(&root, "/data/favorite_tweet");
+    let done = word.is_some_and(|w| !w.is_empty());
+    if !already_liked && !done {
+        return Err(XError::Malformed);
+    }
+    Ok(LikeResult {
+        post_id: post_id.to_owned(),
+        already_liked,
+    })
+}
+
+/// The result of `friendships/create`. Only X returning the requested user proves the follow; its
+/// `following` and `follow_request_sent` are reported as stated and never decide success.
+fn parse_friendship(body: &[u8], user_id: &str) -> XResult<FollowResult> {
+    let root = parse_json(body)?;
+    if has_errors(&root) || text_at(&root, "/id_str") != Some(user_id) {
+        return Err(XError::Malformed);
+    }
+    Ok(FollowResult {
+        user_id: user_id.to_owned(),
+        following: flag_at(&root, "/following"),
+        follow_request_sent: flag_at(&root, "/follow_request_sent"),
+    })
+}
+
+/// A response that arrived but could not be confirmed after a write was sent.
+fn unconfirmed<T>(result: XResult<T>) -> XResult<T> {
+    result.map_err(|_| XError::Uncertain)
+}
+
+/// How long resolved operations are reused: `full` (the generator's lifetime) when every
+/// operation resolved, and no longer than `PARTIAL_ACTIONS_TTL` otherwise so a gap is retried soon.
+fn actions_ttl(actions: &ActionMetadata, full: Duration) -> Duration {
+    if actions.is_complete() {
+        full
+    } else {
+        full.min(PARTIAL_ACTIONS_TTL)
+    }
+}
+
+fn is_valid_post_id(id: &str) -> bool {
+    is_valid_user_id(id)
+}
+
+fn has_toggles(toggles: &Value) -> bool {
+    toggles.as_object().is_some_and(|map| !map.is_empty())
+}
+
 /// One page of `friends/ids`; ids are validated digit strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FollowingPage {
@@ -290,6 +810,32 @@ fn transport(error: reqwest::Error) -> XError {
         "X request did not complete"
     );
     XError::Transport
+}
+
+/// Status handling for a write that was sent. A 2xx and the 4xx answers that X gives when it
+/// refuses a request are definite; 3xx, 5xx and anything else leave the outcome unknown.
+fn classify_write(status: StatusCode) -> std::result::Result<(), XError> {
+    match status.as_u16() {
+        200..=299 => Ok(()),
+        401 => Err(XError::Unauthorized),
+        403 => Err(XError::Forbidden),
+        429 => Err(XError::RateLimited),
+        code @ 400..=499 => Err(XError::Status(code)),
+        _ => Err(XError::Uncertain),
+    }
+}
+
+/// A write that failed after it was handed to the client may have been processed by X, so it is
+/// not reported as a plain transport failure. Only a connection that was never established is
+/// known not to have carried the request.
+fn write_transport(error: reqwest::Error) -> XError {
+    let never_sent = error.is_connect();
+    let failure = transport(error);
+    if never_sent {
+        failure
+    } else {
+        XError::Uncertain
+    }
 }
 
 /// Reads at most `MAX_RESPONSE_BYTES`; bodies are never logged.
@@ -350,6 +896,12 @@ pub struct XApi {
     bootstrap_timeout: Duration,
     transaction_ttl: Duration,
     metadata: Mutex<Option<(crate::x_metadata::CreateTweet, Instant)>>,
+    /// カタログから解決した参照・いいね系の操作。全部そろったときだけ長く保持する。
+    /// 取得中も読めるよう、取得の直列化 (`actions_gate`) とは別に持つ。await をまたいで保持しない。
+    actions: StdMutex<Option<(ActionMetadata, Instant)>>,
+    actions_gate: Mutex<()>,
+    /// 参照・書込み 1 リクエストの上限。テストだけが短くする。
+    action_timeout: Duration,
 }
 
 impl XApi {
@@ -382,6 +934,9 @@ impl XApi {
             bootstrap_timeout,
             transaction_ttl,
             metadata: Mutex::new(None),
+            actions: StdMutex::new(None),
+            actions_gate: Mutex::new(()),
+            action_timeout: ACTION_TIMEOUT,
         }
     }
 
@@ -452,6 +1007,191 @@ impl XApi {
             )
             .await?;
         parse_post(&body, expected_user)
+    }
+
+    /// Resolves the lookup and like operations from the public catalogue. Each operation is
+    /// judged on its own, so a catalogue that lacks one still serves the others; see
+    /// `has_lookup_post` and its siblings. Following needs no catalogue entry, only the
+    /// transaction signer.
+    pub async fn prepare_actions(&self) -> XResult<ActionMetadata> {
+        if let Some(actions) = self.cached_actions() {
+            self.transaction().await?;
+            return Ok(actions);
+        }
+        let _gate = self.actions_gate.lock().await;
+        if let Some(actions) = self.cached_actions() {
+            self.transaction().await?;
+            return Ok(actions);
+        }
+        let fetch = self.fetch_text(&self.endpoints.catalogue_url, 0);
+        let source = match tokio::time::timeout(self.action_timeout, fetch).await {
+            Ok(fetched) => fetched?,
+            Err(_) => return Err(XError::Transport),
+        };
+        let actions = crate::x_metadata::parse_actions(&source)?;
+        self.transaction().await?;
+        tracing::debug!(
+            lookup_post = actions.has_lookup_post(),
+            lookup_user = actions.has_lookup_user(),
+            like = actions.has_like(),
+            "X action operations resolved"
+        );
+        let mut slot = self.actions.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some((actions.clone(), Instant::now()));
+        Ok(actions)
+    }
+
+    /// Whether post lookup is ready: the operations and the signer are both cached and fresh.
+    /// Cache-only: it never contacts X, and an expired or missing cache is `false`.
+    pub async fn has_lookup_post(&self) -> bool {
+        self.action_ready(ActionMetadata::has_lookup_post)
+    }
+
+    /// Whether user lookup is ready. Cache-only, like `has_lookup_post`.
+    pub async fn has_lookup_user(&self) -> bool {
+        self.action_ready(ActionMetadata::has_lookup_user)
+    }
+
+    /// Whether like is ready. Cache-only, like `has_lookup_post`.
+    pub async fn has_like(&self) -> bool {
+        self.action_ready(ActionMetadata::has_like)
+    }
+
+    /// The resolved operations, unless they were never fetched or have expired.
+    fn cached_actions(&self) -> Option<ActionMetadata> {
+        let cached = self.actions.lock().unwrap_or_else(|e| e.into_inner());
+        let (actions, fetched) = cached.as_ref()?;
+        let ttl = actions_ttl(actions, self.transaction_ttl);
+        (fetched.elapsed() < ttl).then(|| actions.clone())
+    }
+
+    fn action_ready(&self, ready: fn(&ActionMetadata) -> bool) -> bool {
+        let cached = self.actions.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((actions, fetched)) = cached.as_ref() else {
+            return false;
+        };
+        let ttl = actions_ttl(actions, self.transaction_ttl);
+        fetched.elapsed() < ttl && ready(actions) && self.cached_transaction().is_some()
+    }
+
+    /// Reads one post. `Ok(None)` when X does not return it (deleted, hidden, unavailable).
+    pub async fn lookup_post(
+        &self,
+        twitter: &TwitterConfig,
+        meta: &ActionMetadata,
+        post_id: &str,
+    ) -> XResult<Option<PostInfo>> {
+        if !is_valid_post_id(post_id) {
+            return Err(XError::Malformed);
+        }
+        let operation = meta.tweet_detail.as_ref().ok_or(XError::Malformed)?;
+        let variables = json!({
+            "focalTweetId": post_id,
+            "referrer": "home",
+            "with_rux_injections": false,
+            "rankingMode": "Relevance",
+            "includePromotedContent": true,
+            "withCommunity": true,
+            "withQuickPromoteEligibilityTweetFields": true,
+            "withBirdwatchNotes": true,
+            "withVoice": true
+        });
+        let url = self.read_url("TweetDetail", operation, &variables)?;
+        let body = self.send_read(self.client.get(url), twitter).await?;
+        parse_tweet_detail(&body, post_id)
+    }
+
+    /// Reads one profile. `Ok(None)` when X does not return the account (suspended, removed).
+    pub async fn lookup_user(
+        &self,
+        twitter: &TwitterConfig,
+        meta: &ActionMetadata,
+        user_id: &str,
+    ) -> XResult<Option<UserProfile>> {
+        if !is_valid_user_id(user_id) {
+            return Err(XError::Malformed);
+        }
+        let operation = meta.user_by_rest_id.as_ref().ok_or(XError::Malformed)?;
+        let variables = json!({"userId": user_id, "withSafetyModeUserFields": true});
+        let url = self.read_url("UserByRestId", operation, &variables)?;
+        let body = self.send_read(self.client.get(url), twitter).await?;
+        parse_user_profile(&body, user_id)
+    }
+
+    /// Likes one post. Already liked is a success. A failure after the request was sent that
+    /// leaves the outcome unclear is `XError::Uncertain` and must not be retried automatically.
+    pub async fn like_post(
+        &self,
+        twitter: &TwitterConfig,
+        meta: &ActionMetadata,
+        post_id: &str,
+    ) -> XResult<LikeResult> {
+        if !is_valid_post_id(post_id) {
+            return Err(XError::Malformed);
+        }
+        let operation = meta.favorite_tweet.as_ref().ok_or(XError::Malformed)?;
+        let base = &self.endpoints.graphql_base;
+        let query_id = &operation.query_id;
+        let url = format!("{base}/{query_id}/FavoriteTweet");
+        let variables = json!({"tweet_id": post_id});
+        let payload = json!({"queryId": query_id, "variables": variables});
+        let request = self.client.post(url).json(&payload);
+        let response = self.dispatch(request, twitter).await?;
+        let status = response.status();
+        if status == StatusCode::FORBIDDEN {
+            // X has also answered an already favorited post with 403 and the same error code.
+            let body = read_body(response).await.unwrap_or_default();
+            return match parse_favorite(&body, post_id) {
+                Ok(result) if result.already_liked => Ok(result),
+                _ => Err(XError::Forbidden),
+            };
+        }
+        classify_write(status)?;
+        let body = unconfirmed(read_body(response).await)?;
+        unconfirmed(parse_favorite(&body, post_id))
+    }
+
+    /// Follows one account. Only X returning that account proves the follow. A protected account
+    /// leaves `following` false with `follow_request_sent` true. A failure after the request was
+    /// sent that leaves the outcome unclear is `XError::Uncertain` and must not be retried
+    /// automatically.
+    pub async fn follow_user(
+        &self,
+        twitter: &TwitterConfig,
+        user_id: &str,
+    ) -> XResult<FollowResult> {
+        if !is_valid_user_id(user_id) {
+            return Err(XError::Malformed);
+        }
+        let form = format!("user_id={user_id}&{FRIENDSHIPS_CREATE_FORM}");
+        let request = self
+            .client
+            .post(self.friendships_create_url())
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(form);
+        let body = self.send_write(request, twitter).await?;
+        unconfirmed(parse_friendship(&body, user_id))
+    }
+
+    /// The GraphQL GET URL of a read. The variables are built locally; only the query ID, the
+    /// feature flags and the field toggles come from the catalogue.
+    fn read_url(&self, name: &str, op: &ReadOperation, variables: &Value) -> XResult<Url> {
+        let base = &self.endpoints.graphql_base;
+        let raw = format!("{base}/{}/{name}", op.query_id);
+        let mut url = Url::parse(&raw).map_err(|_| XError::Malformed)?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("variables", &variables.to_string());
+            query.append_pair("features", &op.features.to_string());
+            if has_toggles(&op.field_toggles) {
+                query.append_pair("fieldToggles", &op.field_toggles.to_string());
+            }
+        }
+        Ok(url)
+    }
+
+    fn friendships_create_url(&self) -> String {
+        format!("{}/friendships/create.json", self.endpoints.api_base)
     }
 
     fn settings_url(&self) -> String {
@@ -664,6 +1404,57 @@ impl XApi {
         body
     }
 
+    /// Adds the session headers, the timeout and a fresh transaction ID. Nothing is built for
+    /// sending unless the generator is available.
+    async fn signed(&self, request: RequestBuilder, twitter: &TwitterConfig) -> XResult<Request> {
+        let request = request.timeout(self.action_timeout);
+        let mut request = with_session(request, twitter).build().map_err(transport)?;
+        let transaction = self.transaction().await?;
+        let id = transaction.generate(request.method().as_str(), request.url().path());
+        let id = HeaderValue::try_from(id).map_err(|_| XError::Malformed)?;
+        request.headers_mut().insert(TRANSACTION_HEADER, id);
+        Ok(request)
+    }
+
+    /// A request that changes nothing on X.
+    async fn send_read(
+        &self,
+        request: RequestBuilder,
+        twitter: &TwitterConfig,
+    ) -> XResult<Vec<u8>> {
+        let request = self.signed(request, twitter).await?;
+        let response = self.client.execute(request).await.map_err(transport)?;
+        let status = response.status();
+        tracing::debug!(status = status.as_u16(), "X response");
+        classify(status)?;
+        read_body(response).await
+    }
+
+    /// Sends a request that changes something on X and returns the response unjudged. Once it
+    /// is sent, a failure that does not say that X refused it is `XError::Uncertain`.
+    async fn dispatch(
+        &self,
+        request: RequestBuilder,
+        twitter: &TwitterConfig,
+    ) -> XResult<Response> {
+        let request = self.signed(request, twitter).await?;
+        let sent = self.client.execute(request).await;
+        let response = sent.map_err(write_transport)?;
+        tracing::debug!(status = response.status().as_u16(), "X response");
+        Ok(response)
+    }
+
+    /// A write whose answer must be a 2xx with a readable body.
+    async fn send_write(
+        &self,
+        request: RequestBuilder,
+        twitter: &TwitterConfig,
+    ) -> XResult<Vec<u8>> {
+        let response = self.dispatch(request, twitter).await?;
+        classify_write(response.status())?;
+        unconfirmed(read_body(response).await)
+    }
+
     /// Screen name of the logged-in account (`account/settings`).
     pub async fn screen_name(
         &self,
@@ -736,6 +1527,7 @@ impl XApi {
 mod tests {
     use super::*;
     use crate::transaction::fixture;
+    use crate::x_metadata::parse_actions;
     use axum::Router;
     use axum::body::{Body, Bytes};
     use axum::http::{HeaderMap, Method, Uri};
@@ -2115,6 +2907,1194 @@ mod tests {
             api.screen_name(&twitter).await.unwrap_err(),
             XError::Malformed
         );
+    }
+
+    // ---- lookup and action operations (synthetic fixtures only) ----------------
+
+    const ACTIONS: &str = include_str!("../tests/fixtures/machine-actions-metadata.json");
+    const DETAIL: &str = include_str!("../tests/fixtures/machine-tweet-detail.json");
+    const USER: &str = include_str!("../tests/fixtures/machine-user.json");
+    const ENTRIES: &str = "/data/threaded_conversation_with_injections_v2/instructions/0/entries";
+    const PARENT: &str = "1900000000000000001";
+    const FOCAL: &str = "1900000000000000002";
+    const QUOTED: &str = "1900000000000000003";
+    const REPLY: &str = "1900000000000000004";
+    const DETAIL_PATH: &str = "/i/api/graphql/synthetic-detail-1/TweetDetail";
+    const USER_PATH: &str = "/i/api/graphql/synthetic-user-1/UserByRestId";
+    const LIKE_PATH: &str = "/i/api/graphql/synthetic-like-1/FavoriteTweet";
+    const FOLLOW_PATH: &str = "/i/api/1.1/friendships/create.json";
+    const LIKED: &str = r#"{"data":{"favorite_tweet":"Done"}}"#;
+    const FOLLOWED: &str = r#"{"id_str":"2002","following":false,"follow_request_sent":true}"#;
+    const LEAK: &str = "SYNTHETIC-PRIVATE-UPSTREAM auth_token=AUTH-SECRET";
+
+    /// The tweet result of timeline entry `index` in the detail fixture: 0 is the parent post,
+    /// 1 the focal post (a reply that quotes another post).
+    fn result_at(index: usize) -> String {
+        format!("{ENTRIES}/{index}/content/itemContent/tweet_results/result")
+    }
+
+    fn load(source: &str) -> Value {
+        serde_json::from_str(source).unwrap()
+    }
+
+    fn dump(root: &Value) -> Vec<u8> {
+        root.to_string().into_bytes()
+    }
+
+    /// Sets the value at `path`; the parent object must exist.
+    fn put(root: &mut Value, path: &str, value: Value) {
+        let (parent, key) = path.rsplit_once('/').unwrap();
+        root.pointer_mut(parent).unwrap()[key] = value;
+    }
+
+    /// The fixture with one value replaced, as a response body.
+    fn edited(source: &str, path: &str, value: Value) -> Vec<u8> {
+        let mut root = load(source);
+        put(&mut root, path, value);
+        dump(&root)
+    }
+
+    fn read_post(body: &[u8], id: &str) -> PostInfo {
+        parse_tweet_detail(body, id).unwrap().unwrap()
+    }
+
+    fn read_profile(body: &[u8], id: &str) -> UserProfile {
+        parse_user_profile(body, id).unwrap().unwrap()
+    }
+
+    /// The path of a field of the user in the user fixture.
+    fn at(tail: &str) -> String {
+        format!("/data/user/result{tail}")
+    }
+
+    fn liked(already_liked: bool) -> LikeResult {
+        LikeResult {
+            post_id: "42".into(),
+            already_liked,
+        }
+    }
+
+    fn followed(following: Option<bool>, follow_request_sent: Option<bool>) -> FollowResult {
+        FollowResult {
+            user_id: "42".into(),
+            following,
+            follow_request_sent,
+        }
+    }
+
+    #[test]
+    fn tweet_detail_reports_only_what_x_stated() {
+        let post = read_post(DETAIL.as_bytes(), FOCAL);
+        let expected = PostInfo {
+            id: FOCAL.into(),
+            text: "hello <world> &amp; fixture".into(),
+            author_id: "2002".into(),
+            author_screen_name: "fixture_focal".into(),
+            conversation_id: PARENT.into(),
+            created_at: Some("2018-10-10T20:19:24Z".into()),
+            reply_to_post_id: Some(PARENT.into()),
+            reply_to_user_id: Some("2001".into()),
+            quoted_post_id: Some(QUOTED.into()),
+            quoted_author_id: Some("2003".into()),
+        };
+        assert_eq!(post, expected);
+    }
+
+    #[test]
+    fn tweet_detail_leaves_unstated_facts_unknown() {
+        let parent = read_post(DETAIL.as_bytes(), PARENT);
+        let expected = PostInfo {
+            id: PARENT.into(),
+            text: "parent text".into(),
+            author_id: "2001".into(),
+            author_screen_name: "fixture_parent".into(),
+            conversation_id: PARENT.into(),
+            created_at: Some("2018-10-09T10:00:00Z".into()),
+            reply_to_post_id: None,
+            reply_to_user_id: None,
+            quoted_post_id: None,
+            quoted_author_id: None,
+        };
+        assert_eq!(parent, expected);
+        // A post inside a conversation module, with no timestamp and a reply to the focal post.
+        let child = read_post(DETAIL.as_bytes(), REPLY);
+        assert_eq!(child.created_at, None);
+        assert_eq!(child.reply_to_post_id.as_deref(), Some(FOCAL));
+        assert_eq!(child.reply_to_user_id.as_deref(), Some("2002"));
+    }
+
+    #[test]
+    fn missing_deleted_and_hidden_posts_are_none() {
+        let body = DETAIL.as_bytes();
+        for id in ["1900000000000000005", "1900000000000000099"] {
+            assert!(parse_tweet_detail(body, id).unwrap().is_none(), "{id}");
+        }
+        let instructions = "/data/threaded_conversation_with_injections_v2/instructions";
+        let empty = edited(DETAIL, instructions, json!([]));
+        assert!(parse_tweet_detail(&empty, FOCAL).unwrap().is_none());
+        let nothing = parse_tweet_detail(br#"{"data":{}}"#, FOCAL);
+        assert!(nothing.unwrap().is_none());
+        let with_error = parse_tweet_detail(br#"{"data":{},"errors":[{"message":"x"}]}"#, FOCAL);
+        assert_eq!(with_error.unwrap_err(), XError::Malformed);
+        let author = format!("{}/core/user_results/result/__typename", result_at(1));
+        let hidden = edited(DETAIL, &author, json!("UserUnavailable"));
+        assert!(parse_tweet_detail(&hidden, FOCAL).unwrap().is_none());
+        let tombstone = format!("{}/__typename", result_at(1));
+        let removed = edited(DETAIL, &tombstone, json!("TweetTombstone"));
+        assert!(parse_tweet_detail(&removed, FOCAL).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_missing_post_next_to_errors_is_not_believed() {
+        let missing = "1900000000000000099";
+        let with_errors = edited(DETAIL, "/errors", json!([{"message": "x"}]));
+        assert!(parse_tweet_detail(&with_errors, FOCAL).unwrap().is_some());
+        let error = parse_tweet_detail(&with_errors, missing).unwrap_err();
+        assert_eq!(error, XError::Malformed);
+        let not_a_list = edited(DETAIL, "/errors", json!("boom"));
+        assert!(parse_tweet_detail(&not_a_list, missing).is_err());
+        let empty_list = edited(DETAIL, "/errors", json!([]));
+        assert!(parse_tweet_detail(&empty_list, missing).unwrap().is_none());
+    }
+
+    #[test]
+    fn unusable_detail_bodies_are_errors() {
+        let timeline = "/data/threaded_conversation_with_injections_v2";
+        let no_instructions = edited(DETAIL, timeline, json!({}));
+        let not_a_list = edited(DETAIL, timeline, json!({"instructions": {}}));
+        let no_data = edited(DETAIL, "/data", Value::Null);
+        for body in [no_instructions, not_a_list, no_data] {
+            let error = parse_tweet_detail(&body, FOCAL).unwrap_err();
+            assert_eq!(error, XError::Malformed);
+        }
+        for body in ["", "not json", "{", "{}", "[]", "null", "123"] {
+            let result = parse_tweet_detail(body.as_bytes(), FOCAL);
+            assert!(result.is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn contradicting_reply_and_quote_facts_become_unknown() {
+        let focal = result_at(1);
+        let stated = format!("{focal}/legacy/in_reply_to_user_id_str");
+        let parent_author = format!("{}/legacy/user_id_str", result_at(0));
+        let quoted_author = format!("{focal}/quoted_status_result/result/legacy/user_id_str");
+        let quoted_id = format!("{focal}/legacy/quoted_status_id_str");
+        let changed = |path: &str, value: Value| {
+            let body = edited(DETAIL, path, value);
+            read_post(&body, FOCAL)
+        };
+
+        for value in [json!("2999"), json!("abc"), json!(""), json!(2001)] {
+            let post = changed(&stated, value);
+            assert_eq!(post.reply_to_post_id.as_deref(), Some(PARENT));
+            assert_eq!(post.reply_to_user_id, None);
+        }
+        let only_the_parent = changed(&stated, Value::Null);
+        assert_eq!(only_the_parent.reply_to_user_id.as_deref(), Some("2001"));
+        let unconfirmed_parent = changed(&parent_author, json!("2999"));
+        assert_eq!(unconfirmed_parent.reply_to_user_id, None);
+
+        let post = changed(&quoted_author, json!("2999"));
+        assert_eq!(post.quoted_post_id.as_deref(), Some(QUOTED));
+        assert_eq!(post.quoted_author_id, None);
+        let post = changed(&quoted_id, json!("1900000000000000009"));
+        assert_eq!(post.quoted_post_id.as_deref(), Some("1900000000000000009"));
+        assert_eq!(post.quoted_author_id, None);
+        let post = changed(&quoted_id, json!("not-an-id"));
+        assert_eq!(post.quoted_post_id, None);
+        assert_eq!(post.quoted_author_id, None);
+        let post = changed(&format!("{focal}/quoted_status_result"), Value::Null);
+        assert_eq!(post.quoted_post_id.as_deref(), Some(QUOTED));
+        assert_eq!(post.quoted_author_id, None);
+    }
+
+    #[test]
+    fn an_unreadable_parent_leaves_only_the_stated_reply_user() {
+        let kind = format!("{}/__typename", result_at(0));
+        let mut root = load(DETAIL);
+        put(&mut root, &kind, json!("TweetTombstone"));
+        let post = read_post(&dump(&root), FOCAL);
+        assert_eq!(post.reply_to_post_id.as_deref(), Some(PARENT));
+        assert_eq!(post.reply_to_user_id.as_deref(), Some("2001"));
+        let stated = format!("{}/legacy/in_reply_to_user_id_str", result_at(1));
+        put(&mut root, &stated, Value::Null);
+        assert_eq!(read_post(&dump(&root), FOCAL).reply_to_user_id, None);
+    }
+
+    #[test]
+    fn a_post_whose_own_fields_contradict_each_other_is_an_error() {
+        let focal = result_at(1);
+        let author = format!("{focal}/core/user_results/result");
+        let reply_to = format!("{focal}/legacy/in_reply_to_status_id_str");
+        let cases = [
+            (format!("{focal}/legacy/user_id_str"), json!("2999")),
+            (format!("{focal}/legacy/user_id_str"), Value::Null),
+            (format!("{focal}/legacy"), Value::Null),
+            (format!("{focal}/legacy/full_text"), json!("")),
+            (format!("{focal}/legacy/full_text"), Value::Null),
+            (format!("{focal}/legacy/conversation_id_str"), Value::Null),
+            (format!("{focal}/legacy/conversation_id_str"), json!("12x")),
+            (reply_to, json!("abc")),
+            (format!("{author}/core/screen_name"), json!("bad name!")),
+            (format!("{author}/rest_id"), json!("12x")),
+            (format!("{author}/rest_id"), Value::Null),
+        ];
+        for (path, value) in cases {
+            let body = edited(DETAIL, &path, value);
+            let error = parse_tweet_detail(&body, FOCAL).unwrap_err();
+            assert_eq!(error, XError::Malformed, "{path}");
+        }
+    }
+
+    #[test]
+    fn post_text_prefers_long_form_decodes_once_and_is_bounded() {
+        let focal = result_at(1);
+        let note = format!("{focal}/note_tweet");
+        let long = json!({"note_tweet_results": {"result": {"text": "long &amp;lt; text"}}});
+        let body = edited(DETAIL, &note, long);
+        assert_eq!(read_post(&body, FOCAL).text, "long &lt; text");
+
+        let full_text = format!("{focal}/legacy/full_text");
+        let at_limit = "あ".repeat(MAX_POST_TEXT_CHARS);
+        let body = edited(DETAIL, &full_text, json!(at_limit));
+        let text = read_post(&body, FOCAL).text;
+        assert_eq!(text.chars().count(), MAX_POST_TEXT_CHARS);
+        let over_limit = "a".repeat(MAX_POST_TEXT_CHARS + 1);
+        let body = edited(DETAIL, &full_text, json!(over_limit));
+        assert!(parse_tweet_detail(&body, FOCAL).is_err());
+    }
+
+    #[test]
+    fn a_visibility_wrapped_post_reads_like_a_plain_one() {
+        let focal = result_at(1);
+        let plain = read_post(DETAIL.as_bytes(), FOCAL);
+        let mut root = load(DETAIL);
+        let inner = root.pointer(&focal).unwrap().clone();
+        let wrapped = json!({"__typename": "TweetWithVisibilityResults", "tweet": inner});
+        put(&mut root, &focal, wrapped);
+        assert_eq!(read_post(&dump(&root), FOCAL), plain);
+    }
+
+    #[test]
+    fn an_unparseable_timestamp_leaves_the_rest_of_the_post_intact() {
+        let created = format!("{}/legacy/created_at", result_at(1));
+        let plain = read_post(DETAIL.as_bytes(), FOCAL);
+        let invalid = [
+            json!("Wed Oct 10 20:19:24 +0100 2018"),
+            json!("Wed Feb 30 20:19:24 +0000 2018"),
+            json!("not a date"),
+            json!(""),
+            json!(1234),
+            Value::Null,
+        ];
+        for value in invalid {
+            let body = edited(DETAIL, &created, value);
+            let post = read_post(&body, FOCAL);
+            assert_eq!(post.created_at, None);
+            assert_eq!(post.text, plain.text);
+        }
+    }
+
+    #[test]
+    fn x_dates_are_parsed_strictly() {
+        let valid = [
+            ("Wed Oct 10 20:19:24 +0000 2018", "2018-10-10T20:19:24Z"),
+            ("Thu Feb 29 00:00:00 +0000 2024", "2024-02-29T00:00:00Z"),
+            ("Tue Feb 29 00:00:00 +0000 2000", "2000-02-29T00:00:00Z"),
+            ("Fri Dec 31 23:59:59 +0000 1999", "1999-12-31T23:59:59Z"),
+        ];
+        for (text, expected) in valid {
+            assert_eq!(parse_x_date(text).as_deref(), Some(expected), "{text}");
+        }
+        let invalid = [
+            "",
+            "not a date",
+            "Wed Oct 10 20:19:24 +0100 2018",
+            "Wed Oct 10 20:19:24 2018",
+            "Wed Oct 10 20:19:24 +0000 2018 extra",
+            "Xyz Oct 10 20:19:24 +0000 2018",
+            "Wed Foo 10 20:19:24 +0000 2018",
+            "Wed Oct 32 20:19:24 +0000 2018",
+            "Wed Oct 00 20:19:24 +0000 2018",
+            "Wed Oct 1 20:19:24 +0000 2018",
+            "Wed Feb 29 12:00:00 +0000 2023",
+            "Wed Feb 30 12:00:00 +0000 2024",
+            "Mon Feb 29 00:00:00 +0000 1900",
+            "Wed Oct 10 24:00:00 +0000 2018",
+            "Wed Oct 10 20:60:00 +0000 2018",
+            "Wed Oct 10 20:19:60 +0000 2018",
+            "Wed Oct 10 20:19 +0000 2018",
+            "Wed Oct 10 +0:19:24 +0000 2018",
+            "Wed Oct 10 20:19:24 +0000 +018",
+            "Wed  Oct 10 20:19:24 +0000 2018",
+        ];
+        for text in invalid {
+            assert_eq!(parse_x_date(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn user_profile_keeps_only_stated_facts() {
+        let profile = read_profile(USER.as_bytes(), "2002");
+        let expected = UserProfile {
+            user_id: "2002".into(),
+            screen_name: "fixture_user".into(),
+            name: Some("Fixture User".into()),
+            description: Some("Synthetic bio".into()),
+            created_at: Some("2017-01-02T03:04:05Z".into()),
+            automated_label: Some(true),
+            default_profile_image: Some(false),
+            is_protected: Some(false),
+            followers_count: Some(12),
+            following_count: Some(34),
+            posts_count: Some(56),
+            relation: UserRelation {
+                blocked_by: Some(false),
+                blocking: Some(false),
+                followed_by: Some(false),
+                following: Some(true),
+                follow_request_sent: Some(false),
+            },
+        };
+        assert_eq!(profile, expected);
+    }
+
+    #[test]
+    fn a_sparse_profile_has_no_invented_values() {
+        let user = json!({"rest_id": "7", "legacy": {"screen_name": "only_legacy"}});
+        let sparse = json!({"data": {"user": {"result": user}}});
+        let profile = read_profile(&dump(&sparse), "7");
+        let expected = UserProfile {
+            user_id: "7".into(),
+            screen_name: "only_legacy".into(),
+            name: None,
+            description: None,
+            created_at: None,
+            automated_label: None,
+            default_profile_image: None,
+            is_protected: None,
+            followers_count: None,
+            following_count: None,
+            posts_count: None,
+            relation: UserRelation::default(),
+        };
+        assert_eq!(profile, expected);
+    }
+
+    #[test]
+    fn profile_fallbacks_and_conflicts() {
+        let changed = |tail: &str, value: Value| {
+            let body = edited(USER, &at(tail), value);
+            read_profile(&body, "2002")
+        };
+        let profile = changed("/core/name", Value::Null);
+        assert_eq!(profile.name.as_deref(), Some("Legacy Name"));
+        let profile = changed("/profile_bio", Value::Null);
+        assert_eq!(profile.description.as_deref(), Some("legacy bio"));
+        let profile = changed("/core/created_at", json!("not a date"));
+        assert_eq!(profile.created_at.as_deref(), Some("2018-02-03T04:05:06Z"));
+
+        // Two sources that disagree make the fact unknown, not one of the two.
+        let profile = changed("/relationship_perspectives/following", json!(false));
+        assert_eq!(profile.relation.following, None);
+        assert_eq!(profile.relation.blocking, Some(false));
+        let profile = changed("/legacy/blocking", json!(true));
+        assert_eq!(profile.relation.blocking, None);
+        assert_eq!(profile.relation.following, Some(true));
+        let profile = changed("/privacy/protected", json!(true));
+        assert_eq!(profile.is_protected, None);
+    }
+
+    #[test]
+    fn profile_values_of_the_wrong_type_are_unknown() {
+        let changed = |tail: &str, value: Value| {
+            let body = edited(USER, &at(tail), value);
+            read_profile(&body, "2002")
+        };
+        let profile = changed("/legacy/default_profile_image", json!("false"));
+        assert_eq!(profile.default_profile_image, None);
+        let profile = changed("/legacy/follow_request_sent", json!(0));
+        assert_eq!(profile.relation.follow_request_sent, None);
+        let counts = [json!(-1), json!(1.5), json!("12"), Value::Null];
+        for value in counts {
+            let profile = changed("/legacy/followers_count", value);
+            assert_eq!(profile.followers_count, None);
+            assert_eq!(profile.following_count, Some(34));
+        }
+        let profile = changed("/legacy/statuses_count", json!(u64::MAX));
+        assert_eq!(profile.posts_count, Some(u64::MAX));
+        let profile = changed("/legacy/description", json!("x".repeat(5000)));
+        assert_eq!(profile.description.as_deref(), Some("Synthetic bio"));
+        let profile = changed("/profile_bio/description", json!("x".repeat(5000)));
+        assert_eq!(profile.description, None);
+    }
+
+    #[test]
+    fn the_automated_label_is_true_only_when_stated() {
+        let changed = |value: Value| {
+            let body = edited(USER, &at("/affiliates_highlighted_label"), value);
+            read_profile(&body, "2002").automated_label
+        };
+        let label = |kind: &str| json!({"label": {"userLabelType": kind}});
+        assert_eq!(changed(Value::Null), None);
+        assert_eq!(changed(json!({})), None);
+        assert_eq!(changed(json!(true)), None);
+        assert_eq!(changed(label("BusinessLabel")), None);
+        assert_eq!(changed(label("automatedlabel")), None);
+        assert_eq!(changed(label("AutomatedLabel")), Some(true));
+    }
+
+    #[test]
+    fn unavailable_accounts_are_none_and_other_accounts_are_errors() {
+        let user = |body: &str| parse_user_profile(body.as_bytes(), "2002");
+        let nothing = r#"{"data":{"user":{"result":null}},"errors":[]}"#;
+        for body in [r#"{"data":{"user":{}}}"#, r#"{"data":{}}"#, nothing] {
+            assert!(user(body).unwrap().is_none(), "{body}");
+        }
+        let suspended = edited(USER, &at("/__typename"), json!("UserUnavailable"));
+        assert!(parse_user_profile(&suspended, "2002").unwrap().is_none());
+
+        for body in [
+            r#"{"data":{"user":{}},"errors":[{"message":"x"}]}"#,
+            r#"{"data":{"user":{}},"errors":"boom"}"#,
+            r#"{"data":{},"errors":[{"message":"x"}]}"#,
+            r#"{"data":null}"#,
+            r#"{"data":{"user":[]}}"#,
+            "{}",
+            "[]",
+            "null",
+            "not json",
+            "",
+        ] {
+            assert!(user(body).is_err(), "{body}");
+        }
+        assert!(parse_user_profile(USER.as_bytes(), "2999").is_err());
+        let wrong_id = edited(USER, &at("/rest_id"), json!("2999"));
+        assert!(parse_user_profile(&wrong_id, "2002").is_err());
+        let bad_name = edited(USER, &at("/core/screen_name"), json!("bad name!"));
+        assert!(parse_user_profile(&bad_name, "2002").is_err());
+    }
+
+    #[test]
+    fn favorite_needs_x_confirmation_or_the_already_favorited_code() {
+        let like = |body: &str| parse_favorite(body.as_bytes(), "42");
+        assert_eq!(like(LIKED).unwrap(), liked(false));
+        let with_empty_errors = r#"{"errors":[],"data":{"favorite_tweet":"Done"}}"#;
+        assert_eq!(like(with_empty_errors).unwrap(), liked(false));
+
+        let already = [
+            r#"{"errors":[{"message":"x","code":139}],"data":{}}"#,
+            r#"{"errors":[{"message":"x","extensions":{"code":139}}]}"#,
+            r#"{"errors":[{"code":139,"extensions":{"code":139}}],"data":null}"#,
+            r#"{"errors":[{"code":139},{"code":139}]}"#,
+        ];
+        for body in already {
+            assert_eq!(like(body).unwrap(), liked(true), "{body}");
+        }
+        let not_confirmed = [
+            r#"{"errors":[{"message":"x","code":144}]}"#,
+            r#"{"errors":[{"code":139},{"code":144}]}"#,
+            r#"{"errors":[{"code":139,"extensions":{"code":140}}]}"#,
+            r#"{"errors":[{"message":"no code"}]}"#,
+            r#"{"errors":[{"code":"139"}]}"#,
+            r#"{"errors":[139]}"#,
+            r#"{"errors":"139"}"#,
+            r#"{"data":{}}"#,
+            r#"{"data":{"favorite_tweet":""}}"#,
+            r#"{"data":{"favorite_tweet":null}}"#,
+            r#"{"data":{"favorite_tweet":true}}"#,
+            "{}",
+            "[]",
+            "not json",
+            "",
+        ];
+        for body in not_confirmed {
+            assert_eq!(like(body).unwrap_err(), XError::Malformed, "{body}");
+        }
+    }
+
+    #[test]
+    fn follow_is_proved_only_by_the_requested_user_coming_back() {
+        let follow = |body: &str| parse_friendship(body.as_bytes(), "42");
+        let open = r#"{"id_str":"42","following":true,"follow_request_sent":false}"#;
+        assert_eq!(follow(open).unwrap(), followed(Some(true), Some(false)));
+        let gated = r#"{"id_str":"42","following":false,"follow_request_sent":true}"#;
+        assert_eq!(follow(gated).unwrap(), followed(Some(false), Some(true)));
+        let bare = r#"{"id_str":"42"}"#;
+        assert_eq!(follow(bare).unwrap(), followed(None, None));
+        let nulls = r#"{"id_str":"42","following":null,"follow_request_sent":null}"#;
+        assert_eq!(follow(nulls).unwrap(), followed(None, None));
+        let unreadable = r#"{"id_str":"42","following":"yes","follow_request_sent":1}"#;
+        assert_eq!(follow(unreadable).unwrap(), followed(None, None));
+
+        let unproven = [
+            r#"{"id_str":"43","following":true}"#,
+            r#"{"id_str":"042"}"#,
+            r#"{"id_str":42}"#,
+            r#"{"id":42}"#,
+            r#"{"user":{"id_str":"42"}}"#,
+            r#"{"id_str":"42","errors":[{"code":160,"message":"x"}]}"#,
+            r#"{"errors":[{"code":160,"message":"x"}]}"#,
+            "{}",
+            "[]",
+            "not json",
+            "",
+        ];
+        for body in unproven {
+            assert_eq!(follow(body).unwrap_err(), XError::Malformed, "{body}");
+        }
+    }
+
+    #[test]
+    fn every_parser_rejects_bodies_that_are_not_objects() {
+        for body in ["", "null", "[]", "123", "true", "{", "{}"] {
+            let bytes = body.as_bytes();
+            let detail = parse_tweet_detail(bytes, FOCAL);
+            let user = parse_user_profile(bytes, "2002");
+            let favorite = parse_favorite(bytes, "42");
+            let friendship = parse_friendship(bytes, "42");
+            assert!(detail.is_err(), "detail {body}");
+            assert!(user.is_err(), "user {body}");
+            assert!(favorite.is_err(), "favorite {body}");
+            assert!(friendship.is_err(), "friendship {body}");
+        }
+    }
+
+    #[test]
+    fn partial_action_metadata_is_retried_sooner() {
+        let complete = parse_actions(ACTIONS).unwrap();
+        assert_eq!(actions_ttl(&complete, TRANSACTION_TTL), TRANSACTION_TTL);
+        let catalogue = ACTIONS.replace("FavoriteTweet", "Gone");
+        let partial = parse_actions(&catalogue).unwrap();
+        assert_eq!(actions_ttl(&partial, TRANSACTION_TTL), PARTIAL_ACTIONS_TTL);
+        let none = ActionMetadata::default();
+        assert_eq!(actions_ttl(&none, TRANSACTION_TTL), PARTIAL_ACTIONS_TTL);
+        let short = Duration::from_secs(1);
+        assert_eq!(actions_ttl(&partial, short), short);
+        assert_eq!(actions_ttl(&complete, short), short);
+    }
+
+    /// An `XApi` whose cached state expires after `ttl`.
+    fn expiring(base: &str, ttl: Duration) -> XApi {
+        let transaction = Some(fixture::transaction());
+        XApi::build(endpoints(base), transaction, Duration::from_secs(5), ttl)
+    }
+
+    async fn readiness(api: &XApi) -> [bool; 3] {
+        let post = api.has_lookup_post().await;
+        let user = api.has_lookup_user().await;
+        let like = api.has_like().await;
+        [post, user, like]
+    }
+
+    /// A local stand-in for the catalogue and the four operations.
+    fn action_site(log: &Log) -> Router {
+        recording(Arc::clone(log), |seen| match seen.path.as_str() {
+            "/catalogue.json" => reply(200, ACTIONS),
+            DETAIL_PATH => reply(200, DETAIL),
+            USER_PATH => reply(200, USER),
+            LIKE_PATH => reply(200, LIKED),
+            FOLLOW_PATH => reply(200, FOLLOWED),
+            _ => reply(404, "not found"),
+        })
+    }
+
+    async fn never_answers() -> &'static str {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        "late"
+    }
+
+    /// The JSON value of a query parameter the client sent.
+    fn query_json(seen: &Seen, key: &str) -> Option<Value> {
+        use std::collections::HashMap;
+
+        let url = Url::parse(&format!("http://localhost/?{}", seen.query)).unwrap();
+        let pairs: HashMap<String, String> = url.query_pairs().into_owned().collect();
+        pairs.get(key).map(|raw| serde_json::from_str(raw).unwrap())
+    }
+
+    #[tokio::test]
+    async fn action_requests_are_built_locally_and_signed() {
+        let log = Log::default();
+        let server = serve(action_site(&log)).await;
+        let api = injected(&server.base);
+        let twitter = twitter();
+
+        let meta = api.prepare_actions().await.unwrap();
+        assert!(meta.is_complete());
+        let post = api.lookup_post(&twitter, &meta, FOCAL).await.unwrap();
+        assert_eq!(post.unwrap().author_id, "2002");
+        let profile = api.lookup_user(&twitter, &meta, "2002").await.unwrap();
+        assert_eq!(profile.unwrap().screen_name, "fixture_user");
+        let like = api.like_post(&twitter, &meta, "42").await.unwrap();
+        assert_eq!(like, liked(false));
+        let result = api.follow_user(&twitter, "2002").await.unwrap();
+        let expected = FollowResult {
+            user_id: "2002".into(),
+            following: Some(false),
+            follow_request_sent: Some(true),
+        };
+        assert_eq!(result, expected);
+
+        let seen = log.lock().unwrap();
+        let routes: Vec<String> = seen
+            .iter()
+            .map(|s| format!("{} {}", s.method, s.path))
+            .collect();
+        assert_eq!(
+            routes,
+            [
+                "GET /catalogue.json",
+                "GET /i/api/graphql/synthetic-detail-1/TweetDetail",
+                "GET /i/api/graphql/synthetic-user-1/UserByRestId",
+                "POST /i/api/graphql/synthetic-like-1/FavoriteTweet",
+                "POST /i/api/1.1/friendships/create.json",
+            ]
+        );
+        for name in CREDENTIAL_HEADERS {
+            assert!(!seen[0].headers.contains_key(name), "catalogue {name}");
+        }
+        for request in &seen[1..] {
+            let headers = &request.headers;
+            assert_eq!(headers["x-csrf-token"], "CT0-SECRET");
+            assert_eq!(headers["cookie"], "auth_token=AUTH-SECRET; ct0=CT0-SECRET");
+            assert_eq!(headers["x-twitter-auth-type"], "OAuth2Session");
+            assert_eq!(headers["user-agent"], BROWSER_USER_AGENT);
+            assert_valid_id(request);
+        }
+
+        // Only the query ID, features and field toggles come from the catalogue.
+        let variables = query_json(&seen[1], "variables").unwrap();
+        assert_eq!(variables["focalTweetId"], FOCAL);
+        assert!(variables.get("catalogue_only_variable").is_none());
+        let features = query_json(&seen[1], "features").unwrap();
+        let flags = json!({"synthetic_detail_feature": true, "synthetic_other_feature": false});
+        assert_eq!(features, flags);
+        let toggles = query_json(&seen[1], "fieldToggles").unwrap();
+        assert_eq!(toggles, json!({"synthetic_detail_toggle": false}));
+        assert!(seen[1].body.is_empty());
+
+        let variables = query_json(&seen[2], "variables").unwrap();
+        assert_eq!(variables["userId"], "2002");
+        assert!(variables.get("catalogue_only_variable").is_none());
+        let features = query_json(&seen[2], "features").unwrap();
+        assert_eq!(features, json!({"synthetic_user_feature": true}));
+        assert!(query_json(&seen[2], "fieldToggles").is_none());
+
+        let content_type = seen[3].headers["content-type"].to_str().unwrap();
+        assert_eq!(content_type, "application/json");
+        assert!(seen[3].query.is_empty());
+        let body: Value = serde_json::from_str(&seen[3].body).unwrap();
+        let expected = json!({"queryId": "synthetic-like-1", "variables": {"tweet_id": "42"}});
+        assert_eq!(body, expected);
+
+        assert!(seen[4].query.is_empty());
+        assert_eq!(
+            seen[4].headers["content-type"],
+            "application/x-www-form-urlencoded"
+        );
+        let pairs: Vec<&str> = seen[4].body.split('&').collect();
+        assert!(pairs.contains(&"user_id=2002"));
+        assert!(pairs.contains(&"skip_status=1"));
+        let ids = pairs.iter().filter(|p| p.starts_with("user_id=")).count();
+        assert_eq!(ids, 1);
+    }
+
+    #[tokio::test]
+    async fn production_action_endpoints_are_pinned() {
+        let api = XApi::new();
+        let meta = parse_actions(ACTIONS).unwrap();
+        let operation = meta.tweet_detail.unwrap();
+        let variables = json!({"focalTweetId": "1"});
+        let url = api.read_url("TweetDetail", &operation, &variables).unwrap();
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("x.com"));
+        assert_eq!(url.port(), None);
+        assert_eq!(url.path(), "/i/api/graphql/synthetic-detail-1/TweetDetail");
+        assert_eq!(
+            api.friendships_create_url(),
+            "https://x.com/i/api/1.1/friendships/create.json"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_actions_is_anonymous_cached_and_resolves_each_operation_alone() {
+        let log = Log::default();
+        let server = serve(action_site(&log)).await;
+        let api = injected(&server.base);
+        let first = api.prepare_actions().await.unwrap();
+        let second = api.prepare_actions().await.unwrap();
+        assert!(first.is_complete() && second.is_complete());
+        assert_eq!(count(&log, "/catalogue.json"), 1, "cached");
+        let first_headers = log.lock().unwrap()[0].headers.clone();
+        for name in CREDENTIAL_HEADERS {
+            assert!(!first_headers.contains_key(name), "{name}");
+        }
+
+        let partial_log = Log::default();
+        let body = Arc::new(ACTIONS.replace("UserByRestId", "Gone"));
+        let respond = move |_: &Seen| reply(200, body.as_str());
+        let server = serve(recording(Arc::clone(&partial_log), respond)).await;
+        let api = injected(&server.base);
+        let meta = api.prepare_actions().await.unwrap();
+        assert!(meta.has_lookup_post());
+        assert!(meta.has_like());
+        assert!(!meta.has_lookup_user());
+        api.prepare_actions().await.unwrap();
+        assert_eq!(count(&partial_log, "/catalogue.json"), 1);
+    }
+
+    #[tokio::test]
+    async fn prepare_actions_failures_are_not_cached() {
+        let log = Log::default();
+        let catalogue = Arc::new(Mutex::new((503, String::new())));
+        let served = Arc::clone(&catalogue);
+        let app = recording(Arc::clone(&log), move |_| {
+            let (status, body) = served.lock().unwrap().clone();
+            reply(status, body)
+        });
+        let server = serve(app).await;
+        let api = injected(&server.base);
+
+        let error = api.prepare_actions().await.unwrap_err();
+        assert_eq!(error, XError::Status(503));
+        *catalogue.lock().unwrap() = (200, LEAK.to_string());
+        let error = api.prepare_actions().await.unwrap_err();
+        assert_eq!(error, XError::Malformed);
+        *catalogue.lock().unwrap() = (200, ACTIONS.to_string());
+        assert!(api.prepare_actions().await.unwrap().is_complete());
+        assert_eq!(count(&log, "/catalogue.json"), 3);
+    }
+
+    #[tokio::test]
+    async fn readiness_is_cache_only_and_never_contacts_x() {
+        let log = Log::default();
+        let server = serve(action_site(&log)).await;
+        let api = injected(&server.base);
+        assert_eq!(readiness(&api).await, [false, false, false]);
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "nothing is fetched to answer"
+        );
+
+        api.prepare_actions().await.unwrap();
+        let sent = log.lock().unwrap().len();
+        for _ in 0..3 {
+            assert_eq!(readiness(&api).await, [true, true, true]);
+        }
+        assert_eq!(log.lock().unwrap().len(), sent, "readiness asks no one");
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_each_operation_alone() {
+        let cases = [
+            ("TweetDetail", [false, true, true]),
+            ("UserByRestId", [true, false, true]),
+            ("FavoriteTweet", [true, true, false]),
+        ];
+        for (name, expected) in cases {
+            let log = Log::default();
+            let body = Arc::new(ACTIONS.replace(name, "Gone"));
+            let respond = move |_: &Seen| reply(200, body.as_str());
+            let server = serve(recording(Arc::clone(&log), respond)).await;
+            let api = injected(&server.base);
+            assert_eq!(readiness(&api).await, [false, false, false], "{name}");
+            api.prepare_actions().await.unwrap();
+            assert_eq!(readiness(&api).await, expected, "{name}");
+            assert_eq!(count(&log, "/catalogue.json"), 1, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_is_false_when_the_catalogue_or_the_signer_fails() {
+        let log = Log::default();
+        let server = serve(recording(Arc::clone(&log), |_| reply(200, "{}"))).await;
+        let api = injected(&server.base);
+        api.prepare_actions().await.unwrap();
+        assert_eq!(readiness(&api).await, [false, false, false]);
+
+        let server = serve(recording(Log::default(), |_| reply(200, LEAK))).await;
+        let api = injected(&server.base);
+        assert!(api.prepare_actions().await.is_err());
+        assert_eq!(readiness(&api).await, [false, false, false]);
+
+        let server = serve(action_site(&Log::default())).await;
+        let api = bootstrapping(&server.base, Duration::from_secs(5));
+        assert!(api.prepare_actions().await.is_err());
+        assert_eq!(readiness(&api).await, [false, false, false]);
+    }
+
+    #[tokio::test]
+    async fn readiness_expires_with_the_cache_and_returns_after_a_refresh() {
+        let log = Log::default();
+        let server = serve(action_site(&log)).await;
+        let api = expiring(&server.base, Duration::from_millis(300));
+        api.prepare_actions().await.unwrap();
+        assert_eq!(readiness(&api).await, [true, true, true]);
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(readiness(&api).await, [false, false, false]);
+        assert_eq!(count(&log, "/catalogue.json"), 1, "expiry fetches nothing");
+
+        // A refresh reads the catalogue again. The stub site has no page to rebuild the expired
+        // signer from, so it fails and nothing becomes ready.
+        assert!(api.prepare_actions().await.is_err());
+        assert_eq!(count(&log, "/catalogue.json"), 2);
+        assert_eq!(readiness(&api).await, [false, false, false]);
+    }
+
+    #[tokio::test]
+    async fn readiness_needs_a_live_signer_too() {
+        let log = Log::default();
+        let server = serve(action_site(&log)).await;
+        let api = expiring(&server.base, Duration::from_millis(500));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        api.prepare_actions().await.unwrap();
+        assert_eq!(readiness(&api).await, [true, true, true]);
+
+        // The signer was built 600ms ago and has expired; the operations are 300ms old.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(readiness(&api).await, [false, false, false]);
+    }
+
+    #[tokio::test]
+    async fn readiness_does_not_wait_for_a_refresh_in_flight() {
+        let server = serve(Router::new().fallback(never_answers)).await;
+        let mut api = injected(&server.base);
+        api.action_timeout = Duration::from_millis(600);
+        let refresh = api.prepare_actions();
+        let probe = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let started = Instant::now();
+            let ready = api.has_lookup_post().await;
+            (ready, started.elapsed())
+        };
+        let (refreshed, (ready, waited)) = tokio::join!(refresh, probe);
+        assert_eq!(refreshed.unwrap_err(), XError::Transport);
+        assert!(!ready);
+        assert!(waited < Duration::from_millis(300), "{waited:?}");
+    }
+
+    #[tokio::test]
+    async fn prepare_actions_needs_the_signer_and_is_bounded_in_time() {
+        let log = Log::default();
+        let server = serve(action_site(&log)).await;
+        let api = bootstrapping(&server.base, Duration::from_secs(5));
+        let twitter = twitter();
+        // The page that carries the signer is missing, so nothing is prepared or sent.
+        let prepared = api.prepare_actions().await;
+        let follow = api.follow_user(&twitter, "2002").await;
+        assert_eq!(prepared.unwrap_err(), XError::Status(404));
+        assert_eq!(follow.unwrap_err(), XError::Status(404));
+        let paths: Vec<String> = log.lock().unwrap().iter().map(|s| s.path.clone()).collect();
+        let allowed = ["/catalogue.json", "/home"];
+        for path in &paths {
+            assert!(allowed.contains(&path.as_str()), "{path}");
+        }
+
+        let server = serve(Router::new().fallback(never_answers)).await;
+        let mut api = injected(&server.base);
+        api.action_timeout = Duration::from_millis(200);
+        let started = Instant::now();
+        let error = api.prepare_actions().await.unwrap_err();
+        assert_eq!(error, XError::Transport);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn missing_operations_fail_closed_one_at_a_time_without_sending() {
+        let log = Log::default();
+        let server = serve(action_site(&log)).await;
+        let api = injected(&server.base);
+        let twitter = twitter();
+
+        let none = ActionMetadata::default();
+        let post = api.lookup_post(&twitter, &none, FOCAL).await;
+        let user = api.lookup_user(&twitter, &none, "2002").await;
+        let like = api.like_post(&twitter, &none, "42").await;
+        assert_eq!(post.unwrap_err(), XError::Malformed);
+        assert_eq!(user.unwrap_err(), XError::Malformed);
+        assert_eq!(like.unwrap_err(), XError::Malformed);
+        assert!(log.lock().unwrap().is_empty());
+
+        // Without the user operation, the others still work.
+        let catalogue = ACTIONS.replace("UserByRestId", "Gone");
+        let meta = parse_actions(&catalogue).unwrap();
+        let user = api.lookup_user(&twitter, &meta, "2002").await;
+        assert_eq!(user.unwrap_err(), XError::Malformed);
+        let post = api.lookup_post(&twitter, &meta, FOCAL).await.unwrap();
+        assert!(post.is_some());
+        let like = api.like_post(&twitter, &meta, "42").await.unwrap();
+        assert_eq!(like, liked(false));
+        assert_eq!(count(&log, USER_PATH), 0);
+        assert_eq!(count(&log, DETAIL_PATH), 1);
+        assert_eq!(count(&log, LIKE_PATH), 1);
+
+        // Without the like operation, reads and follow still work.
+        let catalogue = ACTIONS.replace("FavoriteTweet", "Gone");
+        let meta = parse_actions(&catalogue).unwrap();
+        let like = api.like_post(&twitter, &meta, "42").await;
+        assert_eq!(like.unwrap_err(), XError::Malformed);
+        assert_eq!(count(&log, LIKE_PATH), 1);
+        let user = api.lookup_user(&twitter, &meta, "2002").await.unwrap();
+        assert!(user.is_some());
+        assert!(api.follow_user(&twitter, "2002").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn invalid_ids_never_reach_the_network() {
+        let log = Log::default();
+        let server = serve(action_site(&log)).await;
+        let api = injected(&server.base);
+        let meta = api.prepare_actions().await.unwrap();
+        let twitter = twitter();
+        let before = log.lock().unwrap().len();
+        let too_long = "1".repeat(MAX_USER_ID_LEN + 1);
+        let bad = [
+            "",
+            "abc",
+            "12a",
+            "1/2",
+            "1&user_id=2",
+            "../1",
+            " 1",
+            "1\n2",
+            "\u{ff11}\u{ff12}",
+            too_long.as_str(),
+        ];
+        for id in bad {
+            let post = api.lookup_post(&twitter, &meta, id).await;
+            let user = api.lookup_user(&twitter, &meta, id).await;
+            let like = api.like_post(&twitter, &meta, id).await;
+            let follow = api.follow_user(&twitter, id).await;
+            assert_eq!(post.unwrap_err(), XError::Malformed, "{id:?}");
+            assert_eq!(user.unwrap_err(), XError::Malformed, "{id:?}");
+            assert_eq!(like.unwrap_err(), XError::Malformed, "{id:?}");
+            assert_eq!(follow.unwrap_err(), XError::Malformed, "{id:?}");
+        }
+        assert_eq!(log.lock().unwrap().len(), before);
+        let longest = "1".repeat(MAX_USER_ID_LEN);
+        let result = api.lookup_user(&twitter, &meta, &longest).await;
+        assert!(result.is_err());
+        assert_eq!(count(&log, USER_PATH), 1, "the longest id is sent");
+    }
+
+    #[tokio::test]
+    async fn read_failures_are_categorised_and_never_echo_the_body() {
+        let cases = [
+            (401, XError::Unauthorized),
+            (403, XError::Forbidden),
+            (429, XError::RateLimited),
+            (404, XError::Status(404)),
+            (500, XError::Status(500)),
+            (200, XError::Malformed),
+        ];
+        let meta = parse_actions(ACTIONS).unwrap();
+        for (status, expected) in cases {
+            let server = serve(recording(Log::default(), move |_| reply(status, LEAK))).await;
+            let api = injected(&server.base);
+            let post = api.lookup_post(&twitter(), &meta, FOCAL).await;
+            let user = api.lookup_user(&twitter(), &meta, "2002").await;
+            assert_eq!(post.unwrap_err(), expected, "post {status}");
+            assert_eq!(user.unwrap_err(), expected, "user {status}");
+            let shown = format!("{expected} {expected:?}");
+            assert!(!shown.contains("SYNTHETIC"));
+            assert!(!shown.contains("SECRET"));
+        }
+    }
+
+    #[tokio::test]
+    async fn write_failures_are_certain_only_when_x_refused_the_request() {
+        let cases = [
+            (401, XError::Unauthorized),
+            (403, XError::Forbidden),
+            (429, XError::RateLimited),
+            (400, XError::Status(400)),
+            (404, XError::Status(404)),
+            (409, XError::Status(409)),
+            (500, XError::Uncertain),
+            (502, XError::Uncertain),
+            (503, XError::Uncertain),
+            (302, XError::Uncertain),
+            (200, XError::Uncertain),
+        ];
+        let meta = parse_actions(ACTIONS).unwrap();
+        for (status, expected) in cases {
+            let log = Log::default();
+            let server = serve(recording(Arc::clone(&log), move |_| reply(status, LEAK))).await;
+            let api = injected(&server.base);
+            let like = api.like_post(&twitter(), &meta, "42").await;
+            let follow = api.follow_user(&twitter(), "2002").await;
+            assert_eq!(like.unwrap_err(), expected, "like {status}");
+            assert_eq!(follow.unwrap_err(), expected, "follow {status}");
+            assert_eq!(count(&log, LIKE_PATH), 1, "{status} is not retried");
+            assert_eq!(count(&log, FOLLOW_PATH), 1, "{status} is not retried");
+            let shown = format!("{expected} {expected:?}");
+            assert!(!shown.contains("SYNTHETIC"));
+            assert!(!shown.contains("SECRET"));
+        }
+        assert!(!XError::Uncertain.is_fatal());
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_proves_nothing_is_uncertain_not_a_failure() {
+        let meta = parse_actions(ACTIONS).unwrap();
+        let like_bodies = [
+            r#"{"errors":[{"message":"x","code":144}],"data":{}}"#,
+            r#"{"data":{}}"#,
+            "{}",
+            "not json",
+        ];
+        for body in like_bodies {
+            let server = serve(recording(Log::default(), move |_| reply(200, body))).await;
+            let api = injected(&server.base);
+            let like = api.like_post(&twitter(), &meta, "42").await;
+            assert_eq!(like.unwrap_err(), XError::Uncertain, "{body}");
+        }
+        let follow_bodies = [
+            r#"{"id_str":"999","following":true}"#,
+            r#"{"errors":[{"code":160,"message":"x"}]}"#,
+            "{}",
+            "not json",
+        ];
+        for body in follow_bodies {
+            let server = serve(recording(Log::default(), move |_| reply(200, body))).await;
+            let api = injected(&server.base);
+            let follow = api.follow_user(&twitter(), "2002").await;
+            assert_eq!(follow.unwrap_err(), XError::Uncertain, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_already_favorited_post_is_a_success() {
+        let meta = parse_actions(ACTIONS).unwrap();
+        let body = r#"{"errors":[{"message":"x","code":139}],"data":{}}"#;
+        for status in [200, 403] {
+            let log = Log::default();
+            let server = serve(recording(Arc::clone(&log), move |_| reply(status, body))).await;
+            let api = injected(&server.base);
+            let result = api.like_post(&twitter(), &meta, "42").await.unwrap();
+            assert_eq!(result, liked(true), "{status}");
+            assert_eq!(count(&log, LIKE_PATH), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forbidden_like_is_forbidden_unless_x_says_already_favorited() {
+        let meta = parse_actions(ACTIONS).unwrap();
+        let bodies = [
+            LEAK,
+            "",
+            LIKED,
+            r#"{"errors":[{"code":144}]}"#,
+            r#"{"errors":[{"code":139},{"code":226}]}"#,
+        ];
+        for body in bodies {
+            let server = serve(recording(Log::default(), move |_| reply(403, body))).await;
+            let api = injected(&server.base);
+            let like = api.like_post(&twitter(), &meta, "42").await;
+            assert_eq!(like.unwrap_err(), XError::Forbidden, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_action_responses_are_rejected() {
+        let size = MAX_RESPONSE_BYTES + 1;
+        let app = recording(Log::default(), move |_| reply(200, "a".repeat(size)));
+        let server = serve(app).await;
+        let api = injected(&server.base);
+        let meta = parse_actions(ACTIONS).unwrap();
+        let post = api.lookup_post(&twitter(), &meta, FOCAL).await;
+        let user = api.lookup_user(&twitter(), &meta, "2002").await;
+        let like = api.like_post(&twitter(), &meta, "42").await;
+        let follow = api.follow_user(&twitter(), "2002").await;
+        assert_eq!(post.unwrap_err(), XError::Malformed);
+        assert_eq!(user.unwrap_err(), XError::Malformed);
+        assert_eq!(like.unwrap_err(), XError::Uncertain);
+        assert_eq!(follow.unwrap_err(), XError::Uncertain);
+    }
+
+    #[tokio::test]
+    async fn slow_responses_time_out_and_a_slow_write_is_uncertain() {
+        let server = serve(Router::new().fallback(never_answers)).await;
+        let mut api = injected(&server.base);
+        api.action_timeout = Duration::from_millis(200);
+        let meta = parse_actions(ACTIONS).unwrap();
+        let started = Instant::now();
+        let post = api.lookup_post(&twitter(), &meta, FOCAL).await;
+        let user = api.lookup_user(&twitter(), &meta, "2002").await;
+        let like = api.like_post(&twitter(), &meta, "42").await;
+        let follow = api.follow_user(&twitter(), "2002").await;
+        assert_eq!(post.unwrap_err(), XError::Transport);
+        assert_eq!(user.unwrap_err(), XError::Transport);
+        assert_eq!(like.unwrap_err(), XError::Uncertain);
+        assert_eq!(follow.unwrap_err(), XError::Uncertain);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_unsent_but_a_dropped_one_is_uncertain() {
+        use tokio::io::AsyncReadExt;
+
+        let meta = parse_actions(ACTIONS).unwrap();
+        let closed = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let api = injected(&closed);
+        let post = api.lookup_post(&twitter(), &meta, FOCAL).await;
+        let like = api.like_post(&twitter(), &meta, "42").await;
+        let follow = api.follow_user(&twitter(), "2002").await;
+        assert_eq!(post.unwrap_err(), XError::Transport);
+        assert_eq!(like.unwrap_err(), XError::Transport);
+        assert_eq!(follow.unwrap_err(), XError::Transport);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer).await;
+            }
+        });
+        let server = TestServer { base, task };
+        let api = injected(&server.base);
+        let post = api.lookup_post(&twitter(), &meta, FOCAL).await;
+        let like = api.like_post(&twitter(), &meta, "42").await;
+        let follow = api.follow_user(&twitter(), "2002").await;
+        assert_eq!(post.unwrap_err(), XError::Transport);
+        assert_eq!(like.unwrap_err(), XError::Uncertain);
+        assert_eq!(follow.unwrap_err(), XError::Uncertain);
+    }
+
+    #[tokio::test]
+    async fn action_requests_never_follow_redirects() {
+        let sink_log = Log::default();
+        let sink = serve(recording(Arc::clone(&sink_log), |_| reply(200, "{}"))).await;
+        let location = format!("{}/elsewhere", sink.base);
+        let redirect = {
+            let location = location.clone();
+            move |_: &Seen| (StatusCode::FOUND, [("location", location.clone())]).into_response()
+        };
+        let server = serve(recording(Log::default(), redirect)).await;
+        let api = injected(&server.base);
+        let meta = parse_actions(ACTIONS).unwrap();
+
+        let prepared = api.prepare_actions().await;
+        assert_eq!(prepared.unwrap_err(), XError::Status(302));
+        let post = api.lookup_post(&twitter(), &meta, FOCAL).await;
+        let user = api.lookup_user(&twitter(), &meta, "2002").await;
+        let like = api.like_post(&twitter(), &meta, "42").await;
+        let follow = api.follow_user(&twitter(), "2002").await;
+        assert_eq!(post.unwrap_err(), XError::Status(302));
+        assert_eq!(user.unwrap_err(), XError::Status(302));
+        assert_eq!(like.unwrap_err(), XError::Uncertain);
+        assert_eq!(follow.unwrap_err(), XError::Uncertain);
+        assert!(sink_log.lock().unwrap().is_empty());
     }
 
     /// 実際の x.com へ Cookie なしで 1 回だけ bootstrap する手動確認。`cargo test -- --ignored`。

@@ -419,6 +419,10 @@ describe('deleting an account', () => {
 })
 
 describe('account machine permission isolation', () => {
+  const POST = 'APIからの投稿・返信を許可'
+  const LIKE = 'APIからのいいねを許可'
+  const FOLLOW = 'APIからのフォローを許可'
+
   it('drops unsaved permission state when switching accounts', async () => {
     window.location.hash = '#/default/settings'
     mockApi({
@@ -428,7 +432,7 @@ describe('account machine permission isolation', () => {
       'GET /api/accounts/work/settings': () => json(settings({ machine_post_enabled: true })),
     })
     render(<App />)
-    const name = 'APIからの投稿・返信を許可'
+    const name = POST
     const toggle = await screen.findByRole('switch', { name })
     expect(toggle).not.toBeChecked()
     await userEvent.click(toggle)
@@ -438,5 +442,33 @@ describe('account machine permission isolation', () => {
     expect(screen.getByRole('switch', { name })).toBeChecked()
     window.location.hash = '#/default/settings'
     await waitFor(() => expect(screen.getByRole('switch', { name })).not.toBeChecked())
+  })
+
+  it('does not leak unsaved like and follow state between accounts', async () => {
+    window.location.hash = '#/default/settings'
+    mockApi({
+      [LIST]: () => json({ accounts: [account('default'), account('work')] }),
+      ...quietAccount('default'),
+      ...quietAccount('work'),
+      'GET /api/accounts/work/settings': () =>
+        json(settings({ machine_like_enabled: true, machine_follow_enabled: false })),
+    })
+    render(<App />)
+    const like = await screen.findByRole('switch', { name: LIKE })
+    const follow = screen.getByRole('switch', { name: FOLLOW })
+    expect(like).not.toBeChecked()
+    expect(follow).not.toBeChecked()
+    await userEvent.click(follow)
+    expect(follow).toBeChecked()
+
+    window.location.hash = '#/work/settings'
+    await waitFor(() => expect(screen.getByRole('switch', { name: LIKE })).not.toBe(like))
+    expect(screen.getByRole('switch', { name: LIKE })).toBeChecked()
+    expect(screen.getByRole('switch', { name: FOLLOW })).not.toBeChecked()
+    expect(screen.getByRole('switch', { name: POST })).not.toBeChecked()
+
+    window.location.hash = '#/default/settings'
+    await waitFor(() => expect(screen.getByRole('switch', { name: LIKE })).not.toBeChecked())
+    expect(screen.getByRole('switch', { name: FOLLOW })).not.toBeChecked()
   })
 })

@@ -30,8 +30,14 @@ Twitter/X  ──push──▶  Mozilla AutoPush Server  ◀──WebSocket─�
 ### Important Notes
 
 - **Data source**: All notification data is received from Mozilla's Web Push server (`push.services.mozilla.com`). Angelic Angel does not access Twitter/X directly for notification data.
-- **Minimal API usage**: The Twitter/X API is only called during the initial push subscription registration (`register` command, or the automatic registration of the first `listen` with credentials in the environment) and when you explicitly start the WebUI's bulk notification operation. No API calls are made while listening for notifications.
-- **No scraping**: This tool does not perform any web scraping. It uses the standard W3C Push API flow, the same mechanism browsers use to deliver push notifications.
+- **Minimal API usage**: Notification reception uses Web Push. Initial registration, explicit WebUI operations and the optional machine API contact X; account/readiness listings do not.
+- **Web Push**: Notification delivery uses the standard W3C Push API flow. Explicit X operations also obtain public bootstrap/signature metadata; retrieved JavaScript is parsed, never executed.
+
+### Optional machine API (v0.5)
+
+`serve` can additionally expose a dedicated Bearer-authenticated listener (default `127.0.0.1:8081`), completely separate from the local management UI on port 8080. It supports scoped account/readiness/identity reads, text posts/replies, and durable operation result queries. Cookies and webhook secrets never leave Angel through this API. It is disabled when `MACHINE_SERVICE_TOKEN` is absent; empty tokens and incomplete scopes are rejected. `listen` and all existing CLI commands retain their existing behavior; the machine API is enabled only by `serve`.
+
+Configure a new service token, `MACHINE_CLIENT_ID`, `MACHINE_ACCOUNTS` and `MACHINE_OPERATIONS`, then enable “APIからの投稿・返信を許可” for the selected account in the local WebUI Settings and save. Posting is OFF by default, including existing/legacy configurations and environment-only `default` accounts. The account toggle does not override token scopes or the account allowlist. Start `angelic-angel --config /config/angelic-angel.toml serve` to access these settings. See [Machine API](docs/machine-api.md) for the complete configuration, request format, revision checks, indefinite idempotency retention and `unknown` recovery rules. Lookup, likes, follows, media and quotes are not provided; this does not yet eliminate the Bot's other Cookie dependencies.
 
 ## Requirements
 
@@ -119,6 +125,7 @@ ct0 = "..."
 
 [[accounts]]
 id = "shop"
+machine_post_enabled = false
 webhook_endpoint = "https://example.com/hook-shop"
 webhook_secret = "..."
 
@@ -150,6 +157,8 @@ A config file in the earlier single-account layout (top-level `[twitter]`, `regi
 ### WebUI operations
 
 The WebUI (`angelic-angel serve`) has three screens: Notifications, Settings and Status. Every screen works on one account at a time: Notifications, Settings, Status, the receiver registration and the bulk notification job are all per account. Besides the Cookie and Webhook settings, it offers:
+
+- **Machine API posting permission**: “APIからの投稿・返信を許可” controls text posts and replies for the selected account. Changes apply after saving; omitted `machine_post_enabled` means OFF. Saved credentials, token account allowlists and scopes are still required. The toggle is editable with environment credentials and while registered. During a machine preflight/send the save returns busy; disabling is not cancellation of an in-flight send. Existing idempotency/result queries remain available while OFF.
 
 - **Accounts** (header): the switcher in the header chooses the account the screens show. "Add account" asks for an id (same rule as above) and creates an empty account; then enter its cookies and webhook in Settings and register it. Deleting an account asks for confirmation; it unregisters the account (as the `unregister` command does) if it is registered, stops its receiving, removes its entry from the config file and deletes its notification history database. If the unregistration fails, the account is kept and the error is shown. Exceptions: while both cookie [environment variables](#environment-variables) are set, `default` cannot be deleted (409 `account_from_environment`); unset them and restart the process first. If only the deletion of the history database fails after the entry has been removed, the error is a 500 `history_cleanup_failed`: the account is already gone from the config file, and the leftover history database file has to be deleted by hand; until then, creating an account with the same id is refused (409 `history_cleanup_required`) so that it does not inherit that history. The address is `#/<id>/<screen>`; an old address such as `#/settings` opens the `default` account (or the first account when there is none named `default`). Operations of one account never block another account's: a bulk notification job running for one account does not stop you from registering or editing another.
 - **Webhook** (Settings screen): the endpoint and the secret of the selected account. The secret is write-only: the screen never shows the saved value, only whether one is set.

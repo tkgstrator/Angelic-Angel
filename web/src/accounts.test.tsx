@@ -417,3 +417,26 @@ describe('deleting an account', () => {
     expect(requests(fetchMock, DELETE)).toBe(1)
   })
 })
+
+describe('account machine permission isolation', () => {
+  it('drops unsaved permission state when switching accounts', async () => {
+    window.location.hash = '#/default/settings'
+    mockApi({
+      [LIST]: () => json({ accounts: [account('default'), account('work')] }),
+      ...quietAccount('default'),
+      ...quietAccount('work'),
+      'GET /api/accounts/work/settings': () => json(settings({ machine_post_enabled: true })),
+    })
+    render(<App />)
+    const name = 'APIからの投稿・返信を許可'
+    const toggle = await screen.findByRole('switch', { name })
+    expect(toggle).not.toBeChecked()
+    await userEvent.click(toggle)
+    expect(toggle).toBeChecked()
+    window.location.hash = '#/work/settings'
+    await waitFor(() => expect(screen.getByRole('switch', { name })).not.toBe(toggle))
+    expect(screen.getByRole('switch', { name })).toBeChecked()
+    window.location.hash = '#/default/settings'
+    await waitFor(() => expect(screen.getByRole('switch', { name })).not.toBeChecked())
+  })
+})

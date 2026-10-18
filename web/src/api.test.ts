@@ -109,3 +109,25 @@ describe('notification_filter at the API boundary', () => {
     expect((await api.getNotifications('default')).notification_filter).toEqual(filter)
   })
 })
+
+describe('machine permission at the API boundary', () => {
+  it.each([undefined, null, 'true', 'false', 1, {}])(
+    'rejects invalid permission %s',
+    async (value) => {
+      mockApi({
+        'GET /api/accounts/default/settings': () =>
+          json({ ...settings(), machine_post_enabled: value }),
+        'PUT /api/accounts/default/settings': () =>
+          json({ ...settings(), machine_post_enabled: value }),
+      })
+      await expect(api.getSettings('default')).rejects.toMatchObject({ code: 'bad_response' })
+      await expect(
+        api.putSettings('default', {
+          webhook_endpoint: '',
+          notification_filter: allowAll,
+          machine_post_enabled: false,
+        }),
+      ).rejects.toMatchObject({ code: 'bad_response' })
+    },
+  )
+})

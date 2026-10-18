@@ -3,6 +3,8 @@ mod cli;
 mod config;
 mod error;
 mod listener;
+mod machine;
+mod machine_ledger;
 mod notifications;
 #[cfg(unix)]
 mod privileges;
@@ -12,6 +14,7 @@ mod transaction;
 mod tweet_lookup;
 mod twitter;
 mod web;
+mod x_metadata;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};

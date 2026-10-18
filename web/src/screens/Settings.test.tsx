@@ -52,6 +52,7 @@ describe('Settings', () => {
       'Cookie',
       '転送先',
       '通知フィルター',
+      'Machine API',
       '受信先の登録',
       'フォロー中の全員の投稿通知をオン',
     ])
@@ -114,6 +115,7 @@ describe('Settings', () => {
     await save()
     expect(await screen.findByText('保存しました。')).toBeInTheDocument()
     expect(body).toEqual({
+      machine_post_enabled: false,
       auth_token: null,
       ct0: null,
       webhook_secret: null,
@@ -443,6 +445,7 @@ describe('Settings notification filter', () => {
     await save()
     await screen.findByText('保存しました。')
     expect(body).toEqual({
+      machine_post_enabled: false,
       auth_token: null,
       ct0: null,
       webhook_secret: null,
@@ -907,5 +910,95 @@ describe('Settings with a server that omits the filter', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('サーバーでエラーが発生しました。')
     expect(screen.getByRole('button', { name: '再試行' })).toBeInTheDocument()
     expect(screen.queryByRole('checkbox')).not.toBeInTheDocument()
+  })
+})
+
+describe('machine posting permission', () => {
+  const label = 'APIからの投稿・返信を許可'
+
+  it('defaults off and only applies after save, keeping the returned value', async () => {
+    const bodies: Record<string, unknown>[] = []
+    mockApi({
+      ...settingsRoutes(),
+      [PUT]: (init) => {
+        const body = JSON.parse(String(init.body))
+        bodies.push(body)
+        return json(settings({ machine_post_enabled: body.machine_post_enabled }))
+      },
+    })
+    render(<Settings accountId="default" />)
+    const toggle = await screen.findByRole('switch', { name: label })
+    expect(toggle).not.toBeChecked()
+    expect(screen.getByText(/変更は保存後に反映/)).toBeInTheDocument()
+    await userEvent.click(toggle)
+    expect(toggle).toBeChecked()
+    expect(bodies).toHaveLength(0)
+    await save()
+    await screen.findByText('保存しました。')
+    expect(bodies[0]?.machine_post_enabled).toBe(true)
+    expect(toggle).toBeChecked()
+    await userEvent.click(toggle)
+    await save()
+    await waitFor(() => expect(bodies).toHaveLength(2))
+    expect(bodies[1]?.machine_post_enabled).toBe(false)
+    expect(toggle).not.toBeChecked()
+  })
+
+  it('preserves the unsaved toggle after a busy save failure and can retry', async () => {
+    const attempts: unknown[] = []
+    mockApi({
+      ...settingsRoutes(),
+      [PUT]: (init) => {
+        attempts.push(JSON.parse(String(init.body)))
+        return attempts.length === 1
+          ? apiError(409, 'busy', '送信処理中です。')
+          : json(settings({ machine_post_enabled: false }))
+      },
+      'GET /api/accounts/default/settings': () => json(settings({ machine_post_enabled: true })),
+    })
+    render(<Settings accountId="default" />)
+    const toggle = await screen.findByRole('switch', { name: label })
+    expect(toggle).toBeChecked()
+    await userEvent.click(toggle)
+    await save()
+    await screen.findByText(/送信処理中です。/)
+    expect(toggle).not.toBeChecked()
+    expect(screen.queryByText('保存しました。')).not.toBeInTheDocument()
+    await save()
+    await screen.findByText('保存しました。')
+    expect(attempts).toHaveLength(2)
+  })
+
+  it('is editable even when registered and using environment credentials', async () => {
+    mockApi({
+      ...settingsRoutes(),
+      'GET /api/accounts/default/settings': () =>
+        json(settings({ credentials_locked: true, webhook_source: 'environment' })),
+    })
+    render(<Settings accountId="default" />)
+    const toggle = await screen.findByRole('switch', { name: label })
+    expect(toggle).toBeEnabled()
+    expect(screen.getByLabelText(/auth_token/)).toBeDisabled()
+    await userEvent.click(toggle)
+    expect(toggle).toBeChecked()
+  })
+
+  it('disables the toggle while saving without hiding it', async () => {
+    const pending: { resolve?: (response: Response) => void } = {}
+    mockApi({
+      ...settingsRoutes(),
+      [PUT]: () =>
+        new Promise<Response>((resolve) => {
+          pending.resolve = resolve
+        }),
+    })
+    render(<Settings accountId="default" />)
+    const toggle = await screen.findByRole('switch', { name: label })
+    await userEvent.click(toggle)
+    await save()
+    expect(toggle).toBeDisabled()
+    pending.resolve?.(json(settings({ machine_post_enabled: true })))
+    await screen.findByText('保存しました。')
+    expect(toggle).toBeEnabled()
   })
 })

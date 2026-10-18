@@ -192,6 +192,7 @@ impl Environment {
 
 #[derive(Debug, Serialize, PartialEq)]
 pub struct SettingsDto {
+    pub machine_post_enabled: bool,
     pub configured: bool,
     pub auth_token_set: bool,
     pub ct0_set: bool,
@@ -258,6 +259,9 @@ pub struct AccountListDto {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsUpdate {
+    /// Omission keeps the saved permission; new accounts default to disabled.
+    #[serde(default)]
+    pub machine_post_enabled: Option<bool>,
     #[serde(default)]
     pub auth_token: Option<String>,
     #[serde(default)]
@@ -308,6 +312,7 @@ fn settings_dto(env: &Environment, account: &Account) -> SettingsDto {
         env.webhook(&account.id, account.webhook_endpoint.as_deref());
     let (secret, _) = env.webhook_secret(&account.id, account.webhook_secret.as_deref());
     SettingsDto {
+        machine_post_enabled: account.machine_post_enabled,
         configured: has_credentials(&twitter),
         auth_token_set: !twitter.auth_token.is_empty(),
         ct0_set: !twitter.ct0.is_empty(),
@@ -543,6 +548,10 @@ impl<B: Backend> Service<B> {
         let guard = self.receiver.lock().await;
         self.ensure_live()?;
         Ok(guard)
+    }
+
+    pub(crate) fn machine_post_enabled(&self) -> std::result::Result<bool, ApiError> {
+        Ok(self.load()?.machine_post_enabled)
     }
 
     pub(crate) fn machine_credentials(
@@ -880,6 +889,9 @@ impl<B: Backend> Service<B> {
                     "following_job_active",
                     "Wait for the bulk notification job to finish before changing the credentials.",
                 ));
+            }
+            if let Some(enabled) = update.machine_post_enabled {
+                account.machine_post_enabled = enabled;
             }
             account.twitter = twitter;
             if !endpoint_from_env {
@@ -1549,6 +1561,7 @@ mod tests {
 
     fn first_setup() -> SettingsUpdate {
         SettingsUpdate {
+            machine_post_enabled: None,
             auth_token: Some("auth-secret".into()),
             ct0: Some("ct0-secret".into()),
             webhook_secret: None,
@@ -1577,6 +1590,7 @@ mod tests {
         service.update_settings(first_setup()).await.unwrap();
         service
             .update_settings(SettingsUpdate {
+                machine_post_enabled: None,
                 auth_token: None,
                 ct0: Some(String::new()),
                 webhook_secret: None,
@@ -1593,6 +1607,7 @@ mod tests {
         for bad in ["ftp://x/y", "not a url", "javascript:alert(1)"] {
             let err = service
                 .update_settings(SettingsUpdate {
+                    machine_post_enabled: None,
                     auth_token: None,
                     ct0: None,
                     webhook_secret: None,
@@ -1605,6 +1620,7 @@ mod tests {
         }
         let err = service
             .update_settings(SettingsUpdate {
+                machine_post_enabled: None,
                 auth_token: Some("a b".into()),
                 ct0: None,
                 webhook_secret: None,
@@ -1632,6 +1648,7 @@ mod tests {
         // Credential changes are locked while registered; webhook-only is fine.
         let err = service
             .update_settings(SettingsUpdate {
+                machine_post_enabled: None,
                 auth_token: Some("other".into()),
                 ct0: None,
                 webhook_secret: None,
@@ -1643,6 +1660,7 @@ mod tests {
         assert_eq!(err.code, "credentials_locked");
         service
             .update_settings(SettingsUpdate {
+                machine_post_enabled: None,
                 auth_token: Some("auth-secret".into()),
                 ct0: None,
                 webhook_secret: None,
@@ -1861,6 +1879,7 @@ mod tests {
 
         let err = service
             .update_settings(SettingsUpdate {
+                machine_post_enabled: None,
                 auth_token: Some("other".into()),
                 ct0: None,
                 webhook_secret: None,
@@ -1876,6 +1895,7 @@ mod tests {
         );
         service
             .update_settings(SettingsUpdate {
+                machine_post_enabled: None,
                 auth_token: None,
                 ct0: None,
                 webhook_secret: None,
@@ -1890,6 +1910,7 @@ mod tests {
         wait_settled(&service).await;
         service
             .update_settings(SettingsUpdate {
+                machine_post_enabled: None,
                 auth_token: Some("other".into()),
                 ct0: None,
                 webhook_secret: None,
@@ -2010,6 +2031,7 @@ mod tests {
         // 省略した更新は保存済みのフィルターを変えない。
         let dto = service
             .update_settings(SettingsUpdate {
+                machine_post_enabled: None,
                 auth_token: None,
                 ct0: None,
                 webhook_secret: None,
@@ -2034,6 +2056,7 @@ mod tests {
 
         let dto = service
             .update_settings(SettingsUpdate {
+                machine_post_enabled: None,
                 auth_token: None,
                 ct0: None,
                 webhook_secret: None,
@@ -2056,6 +2079,7 @@ mod tests {
         service.register().await.unwrap();
         tokio::task::yield_now().await;
         let update = |filter| SettingsUpdate {
+            machine_post_enabled: None,
             auth_token: None,
             ct0: None,
             webhook_secret: None,
@@ -2087,6 +2111,7 @@ mod tests {
 
         service
             .update_settings(SettingsUpdate {
+                machine_post_enabled: None,
                 auth_token: None,
                 ct0: None,
                 webhook_secret: None,
@@ -2107,6 +2132,7 @@ mod tests {
         assert_eq!(rest.items.len(), 1);
         service
             .update_settings(SettingsUpdate {
+                machine_post_enabled: None,
                 auth_token: None,
                 ct0: None,
                 webhook_secret: None,
@@ -2145,6 +2171,7 @@ mod tests {
 
         let dto = service
             .update_settings(SettingsUpdate {
+                machine_post_enabled: None,
                 auth_token: None,
                 ct0: None,
                 webhook_secret: None,
@@ -2190,6 +2217,7 @@ mod tests {
             page.items.into_iter().map(|item| item.id).collect()
         };
         let update = |quote, quote_self, reply| SettingsUpdate {
+            machine_post_enabled: None,
             auth_token: None,
             ct0: None,
             webhook_secret: None,
@@ -2393,6 +2421,7 @@ mod tests {
         assert_eq!(fake.active_receivers.load(Ordering::SeqCst), 1);
         service
             .update_settings(SettingsUpdate {
+                machine_post_enabled: None,
                 auth_token: None,
                 ct0: None,
                 webhook_secret: None,
@@ -2412,6 +2441,7 @@ mod tests {
 
     fn with_cookies(auth: &str, webhook: &str) -> SettingsUpdate {
         SettingsUpdate {
+            machine_post_enabled: None,
             auth_token: Some(auth.into()),
             ct0: Some(format!("ct0-of-{auth}")),
             webhook_secret: None,
@@ -2422,6 +2452,7 @@ mod tests {
 
     fn keep_everything() -> SettingsUpdate {
         SettingsUpdate {
+            machine_post_enabled: None,
             auth_token: None,
             ct0: None,
             webhook_secret: None,
@@ -3797,5 +3828,107 @@ mod tests {
         }
         assert!(json.contains("\"auth_token_set\":true"));
         assert!(json.contains("\"webhook_secret_set\":true"));
+    }
+
+    fn permission_update(enabled: Option<bool>) -> SettingsUpdate {
+        SettingsUpdate {
+            machine_post_enabled: enabled,
+            ..keep_everything()
+        }
+    }
+
+    #[tokio::test]
+    async fn machine_permission_is_independent_persistent_and_kept_when_omitted() {
+        let (_, accounts, path) = rig();
+        let one = account(&accounts, "one");
+        let two = account(&accounts, "two");
+        one.update_settings(first_setup()).await.unwrap();
+        two.update_settings(first_setup()).await.unwrap();
+        assert!(!one.settings().unwrap().machine_post_enabled);
+        let revision = Config::load(&path)
+            .unwrap()
+            .account("one")
+            .unwrap()
+            .credential_revision
+            .clone();
+        assert!(
+            one.update_settings(permission_update(Some(true)))
+                .await
+                .unwrap()
+                .machine_post_enabled
+        );
+        assert!(
+            one.update_settings(permission_update(None))
+                .await
+                .unwrap()
+                .machine_post_enabled
+        );
+        assert!(!two.settings().unwrap().machine_post_enabled);
+        assert_eq!(
+            Config::load(&path)
+                .unwrap()
+                .account("one")
+                .unwrap()
+                .credential_revision,
+            revision
+        );
+        one.register().await.unwrap();
+        assert!(
+            !one.update_settings(permission_update(Some(false)))
+                .await
+                .unwrap()
+                .machine_post_enabled
+        );
+        assert!(
+            !Config::load(&path)
+                .unwrap()
+                .account("one")
+                .unwrap()
+                .machine_post_enabled
+        );
+        one.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn environment_only_machine_permission_is_off_and_editable_while_registered() {
+        let (_, accounts, path) = rig_with(env_with_cookies(), fast_following());
+        let service = accounts.get("default").unwrap();
+        assert!(!service.settings().unwrap().machine_post_enabled);
+        assert!(
+            service.update_settings(permission_update(Some(true)))
+                .await
+                .unwrap()
+                .machine_post_enabled
+        );
+        let stored = config::test_default_account(&path);
+        assert!(stored.machine_post_enabled);
+        assert!(stored.twitter.is_empty());
+        let revision = stored.credential_revision;
+        service.register().await.unwrap();
+        assert!(
+            !service.update_settings(permission_update(Some(false)))
+                .await
+                .unwrap()
+                .machine_post_enabled
+        );
+        assert_eq!(
+            config::test_default_account(&path).credential_revision,
+            revision
+        );
+        assert!(config::test_default_account(&path).twitter.is_empty());
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn machine_permission_save_failures_do_not_report_success() {
+        let (_, service, path) = setup();
+        service.update_settings(first_setup()).await.unwrap();
+        std::fs::write(&path, "synthetic = [invalid toml").unwrap();
+        assert!(
+            service
+                .update_settings(permission_update(Some(true)))
+                .await
+                .is_err()
+        );
     }
 }

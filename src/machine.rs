@@ -346,13 +346,17 @@ async fn account_readiness<B: Backend, X: MachineBackend>(
         .map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE, "accounts_unavailable"))?;
     let configured = !twitter.auth_token.is_empty() && !twitter.ct0.is_empty();
     let metadata_ready = state.x.ready().await;
+    let post_allowed = state.settings.operations.contains("post")
+        && service
+            .machine_post_enabled()
+            .map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE, "accounts_unavailable"))?;
     Ok(
         json!({"id": id, "registered": status.registered, "receiver_state": status.state,
         "credential_revision": revision, "credentials_configured": configured,
-        "metadata_ready": metadata_ready, "post_ready": configured && metadata_ready,
+        "metadata_ready": metadata_ready, "post_ready": configured && metadata_ready && post_allowed,
         "capabilities": {"identity": state.settings.operations.contains("identity"),
-            "text_post": state.settings.operations.contains("post"),
-            "reply": state.settings.operations.contains("post")}}),
+            "text_post": configured && metadata_ready && post_allowed,
+            "reply": configured && metadata_ready && post_allowed}}),
     )
 }
 
@@ -471,6 +475,21 @@ async fn create<B: Backend, X: MachineBackend>(
         .machine_lock()
         .await
         .map_err(|_| failure(StatusCode::NOT_FOUND, "account_not_found"))?;
+    // A concurrent winner may have reserved this key while this request waited for the lock.
+    // Existing results remain readable after the account permission is disabled.
+    if let Some(operation) = state
+        .ledger
+        .existing(&id, &state.settings.client, key, &hash)
+        .map_err(storage)?
+    {
+        return Ok(Json(operation));
+    }
+    if !service
+        .machine_post_enabled()
+        .map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE, "accounts_unavailable"))?
+    {
+        return Err(failure(StatusCode::FORBIDDEN, "account_post_disabled"));
+    }
     let (twitter, incarnation) = service
         .machine_credentials()
         .map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE, "credentials_unavailable"))?;
@@ -511,6 +530,23 @@ async fn create<B: Backend, X: MachineBackend>(
             return Ok(Json(operation));
         },
     };
+    // Re-read permission immediately before the durable dispatch marker, under the same lock.
+    // Read failures also fail closed; a reserved key must never become eligible for replay.
+    if !service.machine_post_enabled().unwrap_or(false) {
+        state
+            .ledger
+            .transition(
+                &operation.operation_id,
+                "accepted",
+                "failed",
+                None,
+                Some("account_post_disabled"),
+            )
+            .map_err(storage)?;
+        operation.state = "failed".into();
+        operation.error = Some("account_post_disabled".into());
+        return Ok(Json(operation));
+    }
     // The account lock is still held: update_settings/delete cannot change this snapshot.
     state
         .ledger

@@ -1982,4 +1982,47 @@ mod tests {
             .unwrap();
         assert_eq!(created.status(), 201);
     }
+
+    #[tokio::test]
+    async fn management_settings_owns_machine_post_permission_and_validates_boolean() {
+        let h = harness(true).await;
+        h.req(reqwest::Method::PUT, "/api/accounts/default/settings")
+            .json(&setup_body())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        for enabled in [true, false] {
+            let response = h
+                .req(reqwest::Method::PUT, "/api/accounts/default/settings")
+                .json(&json!({"webhook_endpoint":"", "machine_post_enabled":enabled}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let text = response.text().await.unwrap();
+            assert!(!text.contains("SECRET"));
+            let dto: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(dto["machine_post_enabled"], enabled);
+            let dto: Value = h
+                .req(reqwest::Method::GET, "/api/accounts/default/settings")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(dto["machine_post_enabled"], enabled);
+        }
+        for invalid in [json!("true"), json!(1), json!({})] {
+            let response = h
+                .req(reqwest::Method::PUT, "/api/accounts/default/settings")
+                .json(&json!({"webhook_endpoint":"", "machine_post_enabled":invalid}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400);
+        }
+    }
 }

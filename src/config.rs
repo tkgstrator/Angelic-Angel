@@ -71,6 +71,9 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,
+    /// Explicit opt-in for machine text posts and replies. Missing always means disabled.
+    #[serde(default)]
+    pub machine_post_enabled: bool,
     /// Opaque incarnation/revision, never derived from a credential in public responses.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub credential_revision: String,
@@ -90,6 +93,7 @@ impl Account {
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
+            machine_post_enabled: false,
             credential_revision: uuid::Uuid::new_v4().to_string(),
             twitter: TwitterConfig::default(),
             registration: None,
@@ -129,6 +133,7 @@ impl TryFrom<RawConfig> for Config {
             (Some(accounts), false) => accounts,
             (None, true) => vec![Account {
                 id: DEFAULT_ACCOUNT_ID.to_string(),
+                machine_post_enabled: false,
                 credential_revision: String::new(),
                 twitter: raw.twitter.unwrap_or_default(),
                 registration: raw.registration,
@@ -1772,5 +1777,42 @@ tweet = false
         assert_eq!(r, (Some("cfg".into()), WebhookSource::Config));
         let r = resolve_webhook_secret_with("work", Some("env"), None);
         assert_eq!(r, (None, WebhookSource::None));
+    }
+
+    #[test]
+    fn machine_post_permission_defaults_off_and_roundtrips_without_revision_changes() {
+        assert!(!Account::new("default").machine_post_enabled);
+        assert!(!default_of(LEGACY).machine_post_enabled);
+        assert!(!default_of("[[accounts]]\nid='default'\n").machine_post_enabled);
+        let path = temp_dir().join("permission.toml");
+        let original = account("default", "synthetic-auth");
+        Config {
+            accounts: vec![original, Account::new("other")],
+        }
+        .save(&path)
+        .unwrap();
+        let revision = test_default_account(&path).credential_revision;
+        for enabled in [true, false] {
+            Config::modify_account::<_, AngelicAngelError>(&path, "default", |current| {
+                let mut account = current.unwrap();
+                account.machine_post_enabled = enabled;
+                Ok((Some(account), ()))
+            })
+            .unwrap();
+            let saved = test_default_account(&path);
+            assert_eq!(saved.machine_post_enabled, enabled);
+            assert_eq!(saved.credential_revision, revision);
+            assert!(
+                !Config::load(&path)
+                    .unwrap()
+                    .account("other")
+                    .unwrap()
+                    .machine_post_enabled
+            );
+        }
+        let invalid = toml::from_str::<Config>(
+            "[[accounts]]\nid='default'\nmachine_post_enabled='true'\n",
+        );
+        assert!(invalid.is_err());
     }
 }

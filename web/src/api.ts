@@ -19,6 +19,7 @@ export const notificationFilterSchema = z.object({
 export type NotificationFilter = z.infer<typeof notificationFilterSchema>
 
 export interface Settings {
+  machine_post_enabled: boolean
   configured: boolean
   auth_token_set: boolean
   ct0_set: boolean
@@ -30,6 +31,7 @@ export interface Settings {
 }
 
 export interface SettingsUpdate {
+  machine_post_enabled?: boolean
   auth_token?: string | null
   ct0?: string | null
   webhook_secret?: string | null
@@ -238,6 +240,13 @@ function verifyFilter<T extends { notification_filter: NotificationFilter }>(val
   }
 }
 
+function verifySettings(value: Settings): Settings {
+  return {
+    ...verifyFilter(value),
+    machine_post_enabled: z.boolean().parse(value.machine_post_enabled),
+  }
+}
+
 export const api = {
   listAccounts: async () => {
     const list = await request<{ accounts: Account[] }>('GET', '/api/accounts', undefined, (v) =>
@@ -249,9 +258,9 @@ export const api = {
     request<Account>('POST', '/api/accounts', { id }, (v) => accountSchema.parse(v)),
   deleteAccount: (accountId: string) => requestEmpty('DELETE', accountPath(accountId)),
   getSettings: (accountId: string) =>
-    request<Settings>('GET', `${accountPath(accountId)}/settings`, undefined, verifyFilter),
+    request<Settings>('GET', `${accountPath(accountId)}/settings`, undefined, verifySettings),
   putSettings: (accountId: string, update: SettingsUpdate) =>
-    request<Settings>('PUT', `${accountPath(accountId)}/settings`, update, verifyFilter),
+    request<Settings>('PUT', `${accountPath(accountId)}/settings`, update, verifySettings),
   validateSettings: (accountId: string) =>
     request<CredentialCheck>('POST', `${accountPath(accountId)}/settings/validate`),
   getRegistration: (accountId: string) =>

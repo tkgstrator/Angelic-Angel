@@ -2025,4 +2025,104 @@ mod tests {
             assert_eq!(response.status(), 400);
         }
     }
+
+    #[tokio::test]
+    async fn management_settings_owns_machine_action_permissions_and_validates_boolean() {
+        let h = harness(true).await;
+        h.req(reqwest::Method::PUT, "/api/accounts/default/settings")
+            .json(&setup_body())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let initial: Value = h
+            .req(reqwest::Method::GET, "/api/accounts/default/settings")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(initial["machine_like_enabled"], false);
+        assert_eq!(initial["machine_follow_enabled"], false);
+        for like in [false, true] {
+            for follow in [false, true] {
+                let mut body = json!({"webhook_endpoint":""});
+                body["machine_like_enabled"] = json!(like);
+                body["machine_follow_enabled"] = json!(follow);
+                let response = h
+                    .req(reqwest::Method::PUT, "/api/accounts/default/settings")
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 200);
+                let text = response.text().await.unwrap();
+                assert!(!text.contains("SECRET"));
+                let dto: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(dto["machine_like_enabled"], like);
+                assert_eq!(dto["machine_follow_enabled"], follow);
+                assert_eq!(dto["machine_post_enabled"], false);
+                let dto: Value = h
+                    .req(reqwest::Method::GET, "/api/accounts/default/settings")
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert_eq!(dto["machine_like_enabled"], like);
+                assert_eq!(dto["machine_follow_enabled"], follow);
+            }
+        }
+        // Reset every permission to OFF first: the loop above ends with like and follow ON.
+        h.req(reqwest::Method::PUT, "/api/accounts/default/settings")
+            .json(&json!({
+                "webhook_endpoint": "",
+                "machine_like_enabled": false,
+                "machine_follow_enabled": false,
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        // Omitting a key keeps the saved value for that permission only.
+        let keep_like = json!({"webhook_endpoint":"", "machine_like_enabled":true});
+        let keep_post = json!({"webhook_endpoint":"", "machine_post_enabled":true});
+        for body in [keep_like, keep_post] {
+            h.req(reqwest::Method::PUT, "/api/accounts/default/settings")
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+        }
+        let dto: Value = h
+            .req(reqwest::Method::GET, "/api/accounts/default/settings")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(dto["machine_like_enabled"], true);
+        assert_eq!(dto["machine_follow_enabled"], false);
+        assert_eq!(dto["machine_post_enabled"], true);
+        for key in ["machine_like_enabled", "machine_follow_enabled"] {
+            for invalid in [json!("true"), json!(1), json!({})] {
+                let mut body = json!({"webhook_endpoint":""});
+                body[key] = invalid;
+                let response = h
+                    .req(reqwest::Method::PUT, "/api/accounts/default/settings")
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 400);
+            }
+        }
+    }
 }

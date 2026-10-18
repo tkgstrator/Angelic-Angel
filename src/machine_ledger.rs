@@ -1,6 +1,7 @@
 //! Private, durable at-most-once dispatch ledger. Tombstones are retained indefinitely.
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Mutex;
@@ -20,12 +21,17 @@ impl From<rusqlite::Error> for Error {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// `kind` is `post`, `like` or `follow`. Posts keep `post_id`; likes and follows store their
+/// result object in `result` (absent for posts and while no result exists).
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Operation {
     pub operation_id: String,
+    pub kind: String,
     pub state: String,
     pub post_id: Option<String>,
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
 }
 
 pub struct Ledger(Mutex<Connection>);
@@ -76,7 +82,46 @@ impl Ledger {
             UPDATE operations SET state='unknown', error='process_interrupted'
                 WHERE state IN ('accepted', 'dispatching');",
         )?;
+        // Additive migration only: databases written by earlier versions keep every row, and rows
+        // without a kind are posts.
+        Self::add_column(&connection, "kind", "TEXT NOT NULL DEFAULT 'post'")?;
+        Self::add_column(&connection, "result", "TEXT")?;
         Ok(Self(Mutex::new(connection)))
+    }
+
+    fn add_column(connection: &Connection, name: &str, definition: &str) -> Result<(), Error> {
+        let present: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('operations') WHERE name=?1",
+            [name],
+            |row| row.get(0),
+        )?;
+        if present == 0 {
+            let sql = format!("ALTER TABLE operations ADD COLUMN {name} {definition}");
+            connection.execute_batch(&sql)?;
+        }
+        Ok(())
+    }
+
+    fn read(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Operation> {
+        let text: Option<String> = row.get(first + 5)?;
+        let result = text
+            .map(|text| serde_json::from_str(&text))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    first + 5,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        Ok(Operation {
+            operation_id: row.get(first)?,
+            kind: row.get(first + 1)?,
+            state: row.get(first + 2)?,
+            post_id: row.get(first + 3)?,
+            error: row.get(first + 4)?,
+            result,
+        })
     }
 
     #[cfg(test)]
@@ -129,20 +174,10 @@ impl Ledger {
     ) -> Result<Option<Operation>, Error> {
         let found: Option<(String, Operation)> = connection
             .query_row(
-                "SELECT request_hash, operation_id, state, post_id, error FROM operations
-                WHERE account=?1 AND client=?2 AND key=?3",
+                "SELECT request_hash, operation_id, kind, state, post_id, error, result
+                FROM operations WHERE account=?1 AND client=?2 AND key=?3",
                 params![account, client, key],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        Operation {
-                            operation_id: row.get(1)?,
-                            state: row.get(2)?,
-                            post_id: row.get(3)?,
-                            error: row.get(4)?,
-                        },
-                    ))
-                },
+                |row| Ok((row.get(0)?, Self::read(row, 1)?)),
             )
             .optional()?;
         match found {
@@ -161,19 +196,39 @@ impl Ledger {
         hash: &str,
         revision: &str,
     ) -> Result<(Operation, bool), Error> {
+        self.reserve_as("post", account, client, key, hash, revision)
+    }
+
+    /// Like [`Ledger::reserve`] for an explicit operation kind. The caller includes the kind in
+    /// the content hash, so the same key with another kind or target is an idempotency conflict.
+    pub fn reserve_as(
+        &self,
+        kind: &str,
+        account: &str,
+        client: &str,
+        key: &str,
+        hash: &str,
+        revision: &str,
+    ) -> Result<(Operation, bool), Error> {
         let connection = self.0.lock().map_err(|_| Error::Storage)?;
         if let Some(operation) = Self::find(&connection, account, client, key, hash)? {
             return Ok((operation, false));
         }
         let operation = Operation {
             operation_id: Uuid::new_v4().to_string(),
+            kind: kind.into(),
             state: "accepted".into(),
             post_id: None,
             error: None,
+            result: None,
         };
-        connection.execute("INSERT INTO operations
-            (operation_id,account,client,key,request_hash,revision,state) VALUES(?1,?2,?3,?4,?5,?6,'accepted')",
-            params![operation.operation_id, account, client, key, hash, revision])?;
+        let id = &operation.operation_id;
+        connection.execute(
+            "INSERT INTO operations
+            (operation_id,account,client,key,request_hash,revision,state,kind)
+            VALUES(?1,?2,?3,?4,?5,?6,'accepted',?7)",
+            params![id, account, client, key, hash, revision, kind],
+        )?;
         Ok((operation, true))
     }
 
@@ -181,17 +236,10 @@ impl Ledger {
         let connection = self.0.lock().map_err(|_| Error::Storage)?;
         Ok(connection
             .query_row(
-                "SELECT operation_id,state,post_id,error FROM operations
+                "SELECT operation_id,kind,state,post_id,error,result FROM operations
             WHERE account=?1 AND client=?2 AND operation_id=?3",
                 params![account, client, id],
-                |row| {
-                    Ok(Operation {
-                        operation_id: row.get(0)?,
-                        state: row.get(1)?,
-                        post_id: row.get(2)?,
-                        error: row.get(3)?,
-                    })
-                },
+                |row| Self::read(row, 0),
             )
             .optional()?)
     }
@@ -209,6 +257,31 @@ impl Ledger {
             "UPDATE operations SET state=?1,post_id=?2,error=?3
             WHERE operation_id=?4 AND state=?5",
             params![state, post, error, id, from],
+        )? != 1
+        {
+            return Err(Error::Storage);
+        }
+        Ok(())
+    }
+
+    /// Like [`Ledger::transition`], recording a like/follow result object instead of a post ID.
+    pub fn transition_result(
+        &self,
+        id: &str,
+        from: &str,
+        state: &str,
+        result: Option<&Value>,
+        error: Option<&str>,
+    ) -> Result<(), Error> {
+        let text = result
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|_| Error::Storage)?;
+        let connection = self.0.lock().map_err(|_| Error::Storage)?;
+        if connection.execute(
+            "UPDATE operations SET state=?1,result=?2,error=?3
+            WHERE operation_id=?4 AND state=?5",
+            params![state, text, error, id, from],
         )? != 1
         {
             return Err(Error::Storage);
@@ -382,5 +455,99 @@ mod tests {
         assert!(
             Ledger::open(Path::new("/nonexistent-machine-fixture/operations.sqlite3")).is_err()
         );
+    }
+
+    #[test]
+    fn kinds_and_results_are_stored_replayed_and_conflict_across_kinds() {
+        let ledger = memory();
+        let (post, _) = ledger.reserve("a", "b", "post-key", "h1", "r").unwrap();
+        assert_eq!(post.kind, "post");
+        let (like, fresh) = ledger
+            .reserve_as("like", "a", "b", "like-key", "h2", "r")
+            .unwrap();
+        assert!(fresh);
+        assert_eq!(like.kind, "like");
+        assert!(like.result.is_none());
+        ledger
+            .transition(&like.operation_id, "accepted", "dispatching", None, None)
+            .unwrap();
+        let result = serde_json::json!({"postId": "1", "alreadyLiked": true});
+        ledger
+            .transition_result(
+                &like.operation_id,
+                "dispatching",
+                "succeeded",
+                Some(&result),
+                None,
+            )
+            .unwrap();
+        let saved = ledger.get("a", "b", &like.operation_id).unwrap().unwrap();
+        assert_eq!(saved.kind, "like");
+        assert_eq!(saved.state, "succeeded");
+        assert_eq!(saved.post_id, None);
+        assert_eq!(saved.result, Some(result));
+        let (replayed, fresh) = ledger
+            .reserve_as("like", "a", "b", "like-key", "h2", "r")
+            .unwrap();
+        assert!(!fresh);
+        assert_eq!(replayed, saved);
+        assert!(matches!(
+            ledger.reserve_as("follow", "a", "b", "like-key", "h3", "r"),
+            Err(Error::Conflict)
+        ));
+        let value = serde_json::to_value(&saved).unwrap();
+        assert_eq!(value["kind"], "like");
+        assert_eq!(value["result"]["alreadyLiked"], true);
+        let value = serde_json::to_value(&post).unwrap();
+        assert_eq!(value["kind"], "post");
+        assert!(value.get("result").is_none());
+        // A transition only applies from the expected state, and never twice.
+        assert!(
+            ledger
+                .transition_result(&like.operation_id, "dispatching", "failed", None, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_databases_gain_kind_columns_without_losing_rows() {
+        let directory = crate::config::test_temp_dir();
+        let path = directory.join("legacy.sqlite3");
+        drop(Ledger::open(&path).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE operations;
+                CREATE TABLE operations (
+                    operation_id TEXT PRIMARY KEY, account TEXT NOT NULL, client TEXT NOT NULL,
+                    key TEXT NOT NULL, request_hash TEXT NOT NULL, revision TEXT NOT NULL,
+                    state TEXT NOT NULL, post_id TEXT, error TEXT,
+                    UNIQUE(account, client, key));
+                INSERT INTO operations
+                    VALUES('old-id','a','b','old-key','old-hash','rev','succeeded','99',NULL);",
+            )
+            .unwrap();
+        drop(connection);
+        for _ in 0..2 {
+            let ledger = Ledger::open(&path).unwrap();
+            let saved = ledger.get("a", "b", "old-id").unwrap().unwrap();
+            assert_eq!(saved.kind, "post");
+            assert_eq!(saved.state, "succeeded");
+            assert_eq!(saved.post_id.as_deref(), Some("99"));
+            assert!(saved.result.is_none());
+            let (replayed, fresh) = ledger
+                .reserve("a", "b", "old-key", "old-hash", "rev")
+                .unwrap();
+            assert!(!fresh);
+            assert_eq!(replayed.operation_id, "old-id");
+            assert!(matches!(
+                ledger.reserve("a", "b", "old-key", "different", "rev"),
+                Err(Error::Conflict)
+            ));
+            let (like, _) = ledger
+                .reserve_as("like", "a", "b", "new-key", "new-hash", "rev")
+                .unwrap();
+            assert_eq!(like.kind, "like");
+        }
     }
 }

@@ -20,6 +20,8 @@ export type NotificationFilter = z.infer<typeof notificationFilterSchema>
 
 export interface Settings {
   machine_post_enabled: boolean
+  machine_like_enabled: boolean
+  machine_follow_enabled: boolean
   configured: boolean
   auth_token_set: boolean
   ct0_set: boolean
@@ -32,6 +34,8 @@ export interface Settings {
 
 export interface SettingsUpdate {
   machine_post_enabled?: boolean
+  machine_like_enabled?: boolean
+  machine_follow_enabled?: boolean
   auth_token?: string | null
   ct0?: string | null
   webhook_secret?: string | null
@@ -244,6 +248,8 @@ function verifySettings(value: Settings): Settings {
   return {
     ...verifyFilter(value),
     machine_post_enabled: z.boolean().parse(value.machine_post_enabled),
+    machine_like_enabled: z.boolean().parse(value.machine_like_enabled),
+    machine_follow_enabled: z.boolean().parse(value.machine_follow_enabled),
   }
 }
 

@@ -1,0 +1,42 @@
+{
+  "data": {
+    "user": {
+      "result": {
+        "__typename": "User",
+        "rest_id": "2002",
+        "core": {
+          "created_at": "Mon Jan 02 03:04:05 +0000 2017",
+          "name": "Fixture User",
+          "screen_name": "fixture_user"
+        },
+        "legacy": {
+          "created_at": "Tue Feb 03 04:05:06 +0000 2018",
+          "name": "Legacy Name",
+          "screen_name": "legacy_user",
+          "description": "legacy bio",
+          "default_profile_image": false,
+          "followers_count": 12,
+          "friends_count": 34,
+          "statuses_count": 56,
+          "protected": false,
+          "following": true,
+          "followed_by": false,
+          "blocking": false,
+          "blocked_by": false,
+          "follow_request_sent": false
+        },
+        "privacy": { "protected": false },
+        "profile_bio": { "description": "Synthetic bio" },
+        "relationship_perspectives": {
+          "following": true,
+          "followed_by": false,
+          "blocking": false,
+          "blocked_by": false
+        },
+        "affiliates_highlighted_label": {
+          "label": { "userLabelType": "AutomatedLabel", "description": "Automated" }
+        }
+      }
+    }
+  }
+}

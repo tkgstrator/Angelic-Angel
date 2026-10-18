@@ -27,6 +27,24 @@ const SOURCE_LABEL = {
   none: '未設定',
 } as const
 
+type MachineKey = 'machine_post_enabled' | 'machine_like_enabled' | 'machine_follow_enabled'
+type MachinePermissions = Record<MachineKey, boolean>
+
+/** アカウント別に許可する Machine API の操作。3つは互いに独立して保存する。 */
+const MACHINE_SWITCHES: readonly { key: MachineKey; id: string; label: string }[] = [
+  { key: 'machine_post_enabled', id: 'machine-post', label: 'APIからの投稿・返信を許可' },
+  { key: 'machine_like_enabled', id: 'machine-like', label: 'APIからのいいねを許可' },
+  { key: 'machine_follow_enabled', id: 'machine-follow', label: 'APIからのフォローを許可' },
+]
+
+function machinePermissions(settings: SettingsDto): MachinePermissions {
+  return {
+    machine_post_enabled: settings.machine_post_enabled,
+    machine_like_enabled: settings.machine_like_enabled,
+    machine_follow_enabled: settings.machine_follow_enabled,
+  }
+}
+
 type FilterKey = keyof NotificationFilter
 type FilterLeaf = { key: FilterKey; label: string }
 /** 子を持つ項目は、キーを持たず子の状態をまとめて表す。 */
@@ -133,7 +151,7 @@ function Indicator({ set }: { set: boolean }) {
 }
 
 const TITLE = '設定'
-const DESCRIPTION = 'Cookie、通知の転送先、APIからの投稿許可、受信先の登録を設定します。'
+const DESCRIPTION = 'Cookie、通知の転送先、Machine APIの許可、受信先の登録を設定します。'
 const SCREEN_NAME = /^[A-Za-z0-9_]{1,15}$/
 
 type Check =
@@ -256,7 +274,7 @@ function SettingsForm({
   const [webhook, setWebhook] = useState(settings.webhook_endpoint ?? '')
   const [webhookSecret, setWebhookSecret] = useState('')
   const [filter, setFilter] = useState(settings.notification_filter)
-  const [machinePostEnabled, setMachinePostEnabled] = useState(settings.machine_post_enabled)
+  const [machine, setMachine] = useState(() => machinePermissions(settings))
   const [errors, setErrors] = useState<SettingsErrors>({})
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null)
   const [check, setCheck] = useState<Check>({ kind: 'none' })
@@ -307,7 +325,7 @@ function SettingsForm({
           webhook_secret: webhookSecret.trim() || null,
           webhook_endpoint: envLocked ? (settings.webhook_endpoint ?? '') : webhook.trim(),
           notification_filter: filter,
-          machine_post_enabled: machinePostEnabled,
+          ...machine,
         })
       } catch (err) {
         setResult({ ok: false, text: errorText(err) })
@@ -318,7 +336,7 @@ function SettingsForm({
       setWebhookSecret('')
       setWebhook(saved.webhook_endpoint ?? '')
       setFilter(saved.notification_filter)
-      setMachinePostEnabled(saved.machine_post_enabled)
+      setMachine(machinePermissions(saved))
       onSaved(saved)
       setResult({ ok: true, text: '保存しました。' })
       if (saved.configured) await runCheck()
@@ -506,19 +524,22 @@ function SettingsForm({
         <Separator />
         <Section
           title="Machine API"
-          description="このアカウントへのAPI投稿・返信を許可します。サービストークン側の許可も必要です。変更は保存後に反映されます。"
+          description="このアカウントに対するAPIからの投稿・返信、いいね、フォローを、操作ごとに許可します。サービストークン側の許可も必要です。変更は保存後に反映されます。"
           disabled={busy}
         >
-          <div className="flex items-center gap-3">
-            <Switch
-              id={`${id}-machine-post`}
-              checked={machinePostEnabled}
-              onCheckedChange={setMachinePostEnabled}
-            />
-            <Label htmlFor={`${id}-machine-post`}>APIからの投稿・返信を許可</Label>
-          </div>
+          {MACHINE_SWITCHES.map(({ key, id: switchId, label }) => (
+            <div key={key} className="flex items-center gap-3">
+              <Switch
+                id={`${id}-${switchId}`}
+                checked={machine[key]}
+                onCheckedChange={(checked) => setMachine((prev) => ({ ...prev, [key]: checked }))}
+              />
+              <Label htmlFor={`${id}-${switchId}`}>{label}</Label>
+            </div>
+          ))}
           <p className="text-sm text-muted-foreground">
-            送信処理中は保存できません。無効化しても開始済みの送信は取り消せません。
+            送信やいいね・フォローの処理中は保存できません（409
+            busy）。無効化しても、開始済みの処理は取り消せません。
           </p>
         </Section>
         <SectionActions>

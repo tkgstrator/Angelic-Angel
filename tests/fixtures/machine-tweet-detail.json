@@ -1,0 +1,162 @@
+{
+  "data": {
+    "threaded_conversation_with_injections_v2": {
+      "instructions": [
+        {
+          "type": "TimelineAddEntries",
+          "entries": [
+            {
+              "entryId": "tweet-1900000000000000001",
+              "content": {
+                "entryType": "TimelineTimelineItem",
+                "itemContent": {
+                  "itemType": "TimelineTweet",
+                  "tweet_results": {
+                    "result": {
+                      "__typename": "Tweet",
+                      "rest_id": "1900000000000000001",
+                      "core": {
+                        "user_results": {
+                          "result": {
+                            "__typename": "User",
+                            "rest_id": "2001",
+                            "core": { "screen_name": "fixture_parent", "name": "Parent" }
+                          }
+                        }
+                      },
+                      "legacy": {
+                        "user_id_str": "2001",
+                        "conversation_id_str": "1900000000000000001",
+                        "created_at": "Tue Oct 09 10:00:00 +0000 2018",
+                        "full_text": "parent text"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "entryId": "tweet-1900000000000000002",
+              "content": {
+                "entryType": "TimelineTimelineItem",
+                "itemContent": {
+                  "itemType": "TimelineTweet",
+                  "tweet_results": {
+                    "result": {
+                      "__typename": "Tweet",
+                      "rest_id": "1900000000000000002",
+                      "core": {
+                        "user_results": {
+                          "result": {
+                            "__typename": "User",
+                            "rest_id": "2002",
+                            "core": { "screen_name": "fixture_focal", "name": "Focal" },
+                            "legacy": { "screen_name": "legacy_focal" }
+                          }
+                        }
+                      },
+                      "legacy": {
+                        "user_id_str": "2002",
+                        "conversation_id_str": "1900000000000000001",
+                        "created_at": "Wed Oct 10 20:19:24 +0000 2018",
+                        "full_text": "hello &lt;world&gt; &amp;amp; fixture",
+                        "in_reply_to_status_id_str": "1900000000000000001",
+                        "in_reply_to_user_id_str": "2001",
+                        "quoted_status_id_str": "1900000000000000003"
+                      },
+                      "quoted_status_result": {
+                        "result": {
+                          "__typename": "Tweet",
+                          "rest_id": "1900000000000000003",
+                          "core": {
+                            "user_results": {
+                              "result": {
+                                "__typename": "User",
+                                "rest_id": "2003",
+                                "core": { "screen_name": "fixture_quoted", "name": "Quoted" }
+                              }
+                            }
+                          },
+                          "legacy": {
+                            "user_id_str": "2003",
+                            "conversation_id_str": "1900000000000000003",
+                            "full_text": "quoted text"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "entryId": "conversationthread-1900000000000000004",
+              "content": {
+                "entryType": "TimelineTimelineModule",
+                "items": [
+                  {
+                    "entryId": "conversationthread-1900000000000000004-tweet-1900000000000000004",
+                    "item": {
+                      "itemContent": {
+                        "itemType": "TimelineTweet",
+                        "tweet_results": {
+                          "result": {
+                            "__typename": "Tweet",
+                            "rest_id": "1900000000000000004",
+                            "core": {
+                              "user_results": {
+                                "result": {
+                                  "__typename": "User",
+                                  "rest_id": "2004",
+                                  "core": { "screen_name": "fixture_reply", "name": "Reply" }
+                                }
+                              }
+                            },
+                            "legacy": {
+                              "user_id_str": "2004",
+                              "conversation_id_str": "1900000000000000001",
+                              "full_text": "reply text",
+                              "in_reply_to_status_id_str": "1900000000000000002",
+                              "in_reply_to_user_id_str": "2002"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "entryId": "tweet-1900000000000000005",
+              "content": {
+                "entryType": "TimelineTimelineItem",
+                "itemContent": {
+                  "itemType": "TimelineTweet",
+                  "tweet_results": {
+                    "result": {
+                      "__typename": "TweetTombstone",
+                      "tombstone": { "text": { "text": "This post was deleted." } }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "entryId": "cursor-bottom-1",
+              "content": {
+                "entryType": "TimelineTimelineItem",
+                "itemContent": {
+                  "itemType": "TimelineTimelineCursor",
+                  "cursorType": "Bottom",
+                  "value": "synthetic-cursor"
+                }
+              }
+            }
+          ]
+        },
+        { "type": "TimelineTerminateTimeline", "direction": "Top" }
+      ]
+    }
+  }
+}

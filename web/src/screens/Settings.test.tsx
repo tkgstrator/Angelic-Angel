@@ -116,6 +116,8 @@ describe('Settings', () => {
     expect(await screen.findByText('保存しました。')).toBeInTheDocument()
     expect(body).toEqual({
       machine_post_enabled: false,
+      machine_like_enabled: false,
+      machine_follow_enabled: false,
       auth_token: null,
       ct0: null,
       webhook_secret: null,
@@ -446,6 +448,8 @@ describe('Settings notification filter', () => {
     await screen.findByText('保存しました。')
     expect(body).toEqual({
       machine_post_enabled: false,
+      machine_like_enabled: false,
+      machine_follow_enabled: false,
       auth_token: null,
       ct0: null,
       webhook_secret: null,
@@ -913,8 +917,37 @@ describe('Settings with a server that omits the filter', () => {
   })
 })
 
+const POST_LABEL = 'APIからの投稿・返信を許可'
+const LIKE_LABEL = 'APIからのいいねを許可'
+const FOLLOW_LABEL = 'APIからのフォローを許可'
+const MACHINE_LABELS = [POST_LABEL, LIKE_LABEL, FOLLOW_LABEL] as const
+
+type MachineBody = {
+  machine_post_enabled?: boolean
+  machine_like_enabled?: boolean
+  machine_follow_enabled?: boolean
+}
+
+/** PUT の本文をそのまま返す保存先。保存済みの3値はサーバー側の状態として保持する。 */
+function savingRoutes(bodies: MachineBody[]) {
+  return {
+    ...settingsRoutes(),
+    [PUT]: (init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as MachineBody
+      bodies.push(body)
+      return json(
+        settings({
+          machine_post_enabled: body.machine_post_enabled,
+          machine_like_enabled: body.machine_like_enabled,
+          machine_follow_enabled: body.machine_follow_enabled,
+        }),
+      )
+    },
+  }
+}
+
 describe('machine posting permission', () => {
-  const label = 'APIからの投稿・返信を許可'
+  const label = POST_LABEL
 
   it('defaults off and only applies after save, keeping the returned value', async () => {
     const bodies: Record<string, unknown>[] = []
@@ -1000,5 +1033,171 @@ describe('machine posting permission', () => {
     pending.resolve?.(json(settings({ machine_post_enabled: true })))
     await screen.findByText('保存しました。')
     expect(toggle).toBeEnabled()
+  })
+})
+
+describe('machine like and follow permissions', () => {
+  it('lists the three switches in the Machine API section, all off by default', async () => {
+    mockApi(settingsRoutes())
+    render(<Settings accountId="default" />)
+    await screen.findByRole('switch', { name: POST_LABEL })
+    for (const name of MACHINE_LABELS) {
+      expect(screen.getByRole('switch', { name })).not.toBeChecked()
+    }
+    const section = screen.getByRole('group', { name: 'Machine API' })
+    expect(within(section).getAllByRole('switch')).toHaveLength(3)
+    expect(screen.getByText(/サービストークン側の許可も必要/)).toBeInTheDocument()
+    expect(screen.getByText(/処理中は保存できません（409 busy）/)).toBeInTheDocument()
+    expect(screen.getByText(/開始済みの処理は取り消せません/)).toBeInTheDocument()
+  })
+
+  it('shows the saved state of each switch independently', async () => {
+    mockApi({
+      ...settingsRoutes(),
+      'GET /api/accounts/default/settings': () => json(settings({ machine_like_enabled: true })),
+    })
+    render(<Settings accountId="default" />)
+    expect(await screen.findByRole('switch', { name: LIKE_LABEL })).toBeChecked()
+    expect(screen.getByRole('switch', { name: POST_LABEL })).not.toBeChecked()
+    expect(screen.getByRole('switch', { name: FOLLOW_LABEL })).not.toBeChecked()
+  })
+
+  it('saves like and follow independently of posting, and only after save', async () => {
+    const bodies: MachineBody[] = []
+    mockApi(savingRoutes(bodies))
+    render(<Settings accountId="default" />)
+    const like = await screen.findByRole('switch', { name: LIKE_LABEL })
+    const follow = screen.getByRole('switch', { name: FOLLOW_LABEL })
+    const post = screen.getByRole('switch', { name: POST_LABEL })
+
+    await userEvent.click(like)
+    expect(like).toBeChecked()
+    expect(post).not.toBeChecked()
+    expect(follow).not.toBeChecked()
+    expect(bodies).toHaveLength(0)
+    await save()
+    await screen.findByText('保存しました。')
+    expect(bodies[0]).toMatchObject({
+      machine_post_enabled: false,
+      machine_like_enabled: true,
+      machine_follow_enabled: false,
+    })
+
+    await userEvent.click(follow)
+    await save()
+    await waitFor(() => expect(bodies).toHaveLength(2))
+    expect(bodies[1]).toMatchObject({
+      machine_post_enabled: false,
+      machine_like_enabled: true,
+      machine_follow_enabled: true,
+    })
+
+    await userEvent.click(like)
+    await userEvent.click(post)
+    await save()
+    await waitFor(() => expect(bodies).toHaveLength(3))
+    expect(bodies[2]).toMatchObject({
+      machine_post_enabled: true,
+      machine_like_enabled: false,
+      machine_follow_enabled: true,
+    })
+    expect(like).not.toBeChecked()
+    expect(follow).toBeChecked()
+    expect(post).toBeChecked()
+  })
+
+  it('keeps unsaved like and follow changes after a failed save and retries them', async () => {
+    const attempts: MachineBody[] = []
+    mockApi({
+      ...settingsRoutes(),
+      [PUT]: (init) => {
+        const body = JSON.parse(String(init.body)) as MachineBody
+        attempts.push(body)
+        return attempts.length === 1
+          ? apiError(409, 'busy', '処理中です。')
+          : json(
+              settings({
+                machine_post_enabled: body.machine_post_enabled,
+                machine_like_enabled: body.machine_like_enabled,
+                machine_follow_enabled: body.machine_follow_enabled,
+              }),
+            )
+      },
+      'GET /api/accounts/default/settings': () => json(settings({ machine_like_enabled: true })),
+    })
+    render(<Settings accountId="default" />)
+    const like = await screen.findByRole('switch', { name: LIKE_LABEL })
+    const follow = screen.getByRole('switch', { name: FOLLOW_LABEL })
+    await userEvent.click(like)
+    await userEvent.click(follow)
+    expect(like).not.toBeChecked()
+    expect(follow).toBeChecked()
+    await save()
+    await screen.findByText(/処理中です。/)
+    expect(screen.queryByText('保存しました。')).not.toBeInTheDocument()
+    expect(like).not.toBeChecked()
+    expect(follow).toBeChecked()
+    await save()
+    await screen.findByText('保存しました。')
+    expect(attempts).toHaveLength(2)
+    expect(attempts[1]).toMatchObject({
+      machine_like_enabled: false,
+      machine_follow_enabled: true,
+    })
+    expect(attempts[1]).toEqual(attempts[0])
+  })
+
+  it('reflects the value the server returned, not the value that was sent', async () => {
+    mockApi({
+      ...settingsRoutes(),
+      [PUT]: () => json(settings({ machine_follow_enabled: false, machine_like_enabled: true })),
+    })
+    render(<Settings accountId="default" />)
+    const follow = await screen.findByRole('switch', { name: FOLLOW_LABEL })
+    await userEvent.click(follow)
+    expect(follow).toBeChecked()
+    await save()
+    await screen.findByText('保存しました。')
+    expect(follow).not.toBeChecked()
+    expect(screen.getByRole('switch', { name: LIKE_LABEL })).toBeChecked()
+  })
+
+  it('disables all three switches while saving without hiding them', async () => {
+    const pending: { resolve?: (response: Response) => void } = {}
+    mockApi({
+      ...settingsRoutes(),
+      [PUT]: () =>
+        new Promise<Response>((resolve) => {
+          pending.resolve = resolve
+        }),
+    })
+    render(<Settings accountId="default" />)
+    await userEvent.click(await screen.findByRole('switch', { name: LIKE_LABEL }))
+    await save()
+    for (const name of MACHINE_LABELS) {
+      expect(screen.getByRole('switch', { name })).toBeDisabled()
+    }
+    pending.resolve?.(json(settings({ machine_like_enabled: true })))
+    await screen.findByText('保存しました。')
+    for (const name of MACHINE_LABELS) {
+      expect(screen.getByRole('switch', { name })).toBeEnabled()
+    }
+    expect(screen.getByRole('switch', { name: LIKE_LABEL })).toBeChecked()
+  })
+
+  it('does not show a switch as on when the saved response is invalid', async () => {
+    mockApi({
+      ...settingsRoutes(),
+      [PUT]: () =>
+        json({ ...settings({ machine_follow_enabled: true }), machine_like_enabled: 'true' }),
+    })
+    render(<Settings accountId="default" />)
+    const follow = await screen.findByRole('switch', { name: FOLLOW_LABEL })
+    await userEvent.click(follow)
+    await save()
+    expect(await screen.findByRole('alert')).toBeInTheDocument()
+    expect(screen.queryByText('保存しました。')).not.toBeInTheDocument()
+    expect(screen.getByRole('switch', { name: LIKE_LABEL })).not.toBeChecked()
+    expect(follow).toBeChecked()
   })
 })

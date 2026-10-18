@@ -2,7 +2,9 @@
 //! or webhook, set its permissions, delete it. Cookies are write-only: nothing here returns, logs
 //! or formats one. Only accounts this principal created (`machine_owner`) can be managed, and any
 //! other account answers with the same 404 as one that does not exist.
-use super::{Api, Failure, Machine, MachineBackend, PREFIX, Shared, TIMEOUT, failure, require_json};
+use super::{
+    Api, Failure, Machine, MachineBackend, PREFIX, Shared, TIMEOUT, failure, require_json,
+};
 use crate::config::{Account, TwitterConfig};
 use crate::listener::checked_webhook_url;
 use crate::twitter::{Identity, XError};

@@ -136,7 +136,12 @@ pub(super) async fn create<B: Backend, X: MachineBackend>(
     let service = match state.accounts.get(&request.id) {
         Ok(service) => service,
         Err(error) if error.is_account_not_found() => return Err(vanished()),
-        Err(_) => return Err(failure(StatusCode::INTERNAL_SERVER_ERROR, "rollback_failed")),
+        Err(_) => {
+            return Err(failure(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "rollback_failed",
+            ));
+        },
     };
     let Ok(mut slot) = service.machine_lock().await else {
         return Err(vanished());

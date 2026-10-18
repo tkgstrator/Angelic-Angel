@@ -10,8 +10,7 @@ mod math;
 mod tests;
 
 pub use discovery::{
-    asset_url, entry_script_urls, is_signer_url, module_import_urls, module_priority,
-    ondemand_file_hash,
+    entry_script_urls, is_signer_url, module_import_urls, module_priority, ondemand_file_hash,
 };
 
 use animation::{animation_key, forgiving_base64_decode, parse_key_byte_indices};

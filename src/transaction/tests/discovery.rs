@@ -88,11 +88,11 @@ fn entry_scripts_match_the_upstream_html_variants() {
     let cases: Vec<(String, Vec<&str>)> = vec![
         (
             format!(r#"<script type="module" src="{e}"></script>"#),
-            vec![e]
+            vec![e],
         ),
         (
             format!("<SCRIPT TYPE=\"module\" SRC='{e}'></SCRIPT>"),
-            vec![e]
+            vec![e],
         ),
         (format!(r#"<script src  =  "{e}" async></script>"#), vec![e]),
         (format!(r#"<script data-src="{e}"></script>"#), vec![e]),
@@ -100,7 +100,7 @@ fn entry_scripts_match_the_upstream_html_variants() {
         (format!("<script src={e}></script>"), vec![]),
         (
             r#"<script src="/x-web/x-web/entry-client-rel.js"></script>"#.into(),
-            vec![]
+            vec![],
         ),
         (
             r#"<script src="x-web/x-web/entry-client-dot.js"></script>"#.into(),

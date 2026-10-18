@@ -1086,7 +1086,10 @@ mod tests {
         for damaged in ["[[accounts]\nbroken", "accounts = 'not-an-array'\n"] {
             let path = temp_dir().join("repair.toml");
             Config {
-                accounts: vec![account("default", "fixture-a"), account("work", "fixture-b")],
+                accounts: vec![
+                    account("default", "fixture-a"),
+                    account("work", "fixture-b"),
+                ],
             }
             .save(&path)
             .unwrap();
